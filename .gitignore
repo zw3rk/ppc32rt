@@ -1,0 +1,7 @@
+_build/
+result
+.direnv/
+__pycache__/
+*.py[cod]
+/result
+_sysroot/
