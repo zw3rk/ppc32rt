@@ -23,13 +23,13 @@ Implement, verify, and harden **`ppc32rt`** — a zero-dependency, static-PIE (`
 
 ### Phase E — Pre-Implementation Empirical Experiments (`RC-E`)
 Read [`docs/lanes/phase-e.md`](docs/lanes/phase-e.md) and run concurrent experiment lanes `E01..E06`:
-- [ ] **E01 (PPC32 `sc` Syscall `CR0.SO` Error Flag & 64-Bit Pair Alignment)**: Verify `sc` return convention (`CR0.SO=0/1`, `r3=+errno`) and 64-bit register pair alignment under `qemu-ppc`. (`experiments/E01/FINDINGS.md`)
-- [ ] **E02 (Rotate-and-Mask (`rlwinm`/`rlwimi`) Wrap-Around (`MB > ME`) & `XER.CA`)**: Verify all edge cases of `rlwinm[.]`, `rlwimi[.]`, `srawi[.]`, and `addze`/`subfze` carry propagation against `qemu-ppc`. (`experiments/E02/FINDINGS.md`)
-- [ ] **E03 (`.gnu.attributes` Parsing & Classic FPU vs `e500v2` SPE Dispatch)**: Verify ELF `.gnu.attributes` (`Tag_GNU_Power_ABI_FP`) and SPE `ev*`/`efs*`/`efd*` upper-word `gpr_hi[32]` behavior under `qemu-ppc -cpu e500v2`. (`experiments/E03/FINDINGS.md`)
-- [ ] **E04 (PPC32 `ucontext_t` / `mcontext_t` (992 B) & SPE `evr[32]` Overlay)**: Compile a target C probe dumping `sizeof`/`offsetof` for `ucontext_t`, `mcontext_t` (`0x1d0` `mc_vregs`), and `stat64`. (`experiments/E04/FINDINGS.md`)
-- [ ] **E05 (Big-Endian String/Multiple Loads (`lmw`/`stmw`, `lswi`/`stswi`, `*brx`))**: Verify `lmw`/`stmw`, `lswi`/`stswi`, and byte-reversed load/store instructions against `qemu-ppc`. (`experiments/E05/FINDINGS.md`)
-- [ ] **E06 (TLS (`r2` Thread Pointer) & `lwarx`/`stwcx.` Reservation Semantics)**: Verify `CLONE_SETTLS` (`r2`), `set_tid_address`, and `lwarx`/`stwcx.` atomic sequences under `qemu-ppc`. (`experiments/E06/FINDINGS.md`)
-- [ ] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-ppc (with -cpu 750 and -cpu e500v2)` ground-truth verification.
+- [x] **E01 (PPC32 `sc` Syscall `CR0.SO` Error Flag & 64-Bit Pair Alignment)**: Verify `sc` return convention (`CR0.SO=0/1`, `r3=+errno`) and 64-bit register pair alignment under `qemu-ppc`. (`experiments/E01/FINDINGS.md`)
+- [x] **E02 (Rotate-and-Mask (`rlwinm`/`rlwimi`) Wrap-Around (`MB > ME`) & `XER.CA`)**: Verify all edge cases of `rlwinm[.]`, `rlwimi[.]`, `srawi[.]`, and `addze`/`subfze` carry propagation against `qemu-ppc`. (`experiments/E02/FINDINGS.md`)
+- [x] **E03 (`.gnu.attributes` Parsing & Classic FPU vs `e500v2` SPE Dispatch)**: Verify ELF `.gnu.attributes` (`Tag_GNU_Power_ABI_FP`) and SPE `ev*`/`efs*`/`efd*` upper-word `gpr_hi[32]` behavior under `qemu-ppc -cpu e500v2`. (`experiments/E03/FINDINGS.md`)
+- [x] **E04 (PPC32 `ucontext_t` / `mcontext_t` (992 B) & SPE `evr[32]` Overlay)**: Compile a target C probe dumping `sizeof`/`offsetof` for `ucontext_t`, `mcontext_t` (`0x1d0` `mc_vregs`), and `stat64`. (`experiments/E04/FINDINGS.md`)
+- [x] **E05 (Big-Endian String/Multiple Loads (`lmw`/`stmw`, `lswi`/`stswi`, `*brx`))**: Verify `lmw`/`stmw`, `lswi`/`stswi`, and byte-reversed load/store instructions against `qemu-ppc`. (`experiments/E05/FINDINGS.md`)
+- [x] **E06 (TLS (`r2` Thread Pointer) & `lwarx`/`stwcx.` Reservation Semantics)**: Verify `CLONE_SETTLS` (`r2`), `set_tid_address`, and `lwarx`/`stwcx.` atomic sequences under `qemu-ppc`. (`experiments/E06/FINDINGS.md`)
+- [x] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-ppc (with -cpu 750 and -cpu e500v2)` ground-truth verification.
 
 ### Phase 0 — Repository Scaffold, Frozen Headers & Substrate Copy (`RC0`)
 Read [`docs/lanes/phase-0.md`](docs/lanes/phase-0.md) and run lanes `L0a..L0b`:
