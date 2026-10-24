@@ -1,0 +1,369 @@
+/*
+ * src/dbt/cache.c — Translation-cache storage for the AArch64 DBT
+ *
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Direct-mapped cache of 1024 translated blocks keyed by guest NIP
+ * (identity key, no T bit). Each block owns one executable mapping:
+ * emitted RW into a staging copy, then mprotect(PROT_READ|PROT_EXEC)
+ * plus __builtin___clear_cache before first execution (W^X: the mapping
+ * is never writable and executable at the same time, and guest data
+ * pages are never PROT_EXEC). Eviction munmaps immediately; every
+ * invalidation path severs IBTC/RAS/slot pointers first so no emitted
+ * chaining jump can observe a dangling code pointer.
+ *
+ * Invalidation is page-versioned: every guest page carries a version
+ * bumped by ppc32_cache_invalidate_range; a cached block records the
+ * version sampled at install and misses when it disagrees. Range
+ * invalidation additionally evicts overlapping blocks eagerly (so slots
+ * are reusable) and severs every ctx IBTC/RAS entry whose key falls in
+ * [start, end). invalidate_all bumps the global epoch instead, which
+ * retires every emitted epoch check at once.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include "dbt/dbt.h"
+
+#ifndef MAP_ANONYMOUS
+#ifdef MAP_ANON
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
+
+/* One version word per guest page (1M pages over the 4 GiB window). */
+#define PPC32_DBT_NPAGES (0x100000000ULL / 4096ULL)
+
+static ppc32_block_t *s_table[PPC32_DBT_HT_SIZE];
+static uint32_t s_page_ver[PPC32_DBT_NPAGES];
+static uint32_t g_cache_epoch = 1U;
+
+uint32_t *ppc32_cache_epoch_ptr(void)
+{
+    return &g_cache_epoch;
+}
+
+static uint32_t cache_index(uint32_t pc)
+{
+    return (pc >> 2U) & (PPC32_DBT_HT_SIZE - 1U);
+}
+
+/* Fill the ctx IBTC slot for pc from a live cache entry (also heals a
+ * slot collided by an unrelated block). */
+static void ibtc_fill(ppc32_ctx_t *ctx, uint32_t pc, ppc32_block_t *e)
+{
+    ppc32_ibtc_entry_t *slot;
+
+    if (ctx == NULL || e == NULL) {
+        return;
+    }
+    slot = &ctx->ibtc[ppc32_ibtc_hash(pc)];
+    slot->key = pc;
+    slot->epoch = g_cache_epoch;
+    slot->host_code = e->host_code;
+    slot->entry = e->entry;
+    slot->pad = 0U;
+}
+
+/* Sever every link that can reach entry `victim`: direct-chain slots
+ * and call fallthroughs across the whole table. */
+static void sever_links_to(ppc32_block_t *victim)
+{
+    size_t i;
+    unsigned s;
+
+    for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
+        ppc32_block_t *e = s_table[i];
+
+        if (e == NULL || e == victim) {
+            continue;
+        }
+        for (s = 0U; s < 8U; s++) {
+            if (e->slot_entry[s] == victim) {
+                e->slot_entry[s] = NULL;
+            }
+        }
+        if (e->ret_entry == victim) {
+            e->ret_entry = NULL;
+        }
+    }
+}
+
+/* Sever ctx IBTC/RAS entries whose key lies in [start, end). */
+static void sever_ctx_range(ppc32_ctx_t *ctx, uint32_t start, uint32_t end)
+{
+    size_t i;
+
+    if (ctx == NULL) {
+        return;
+    }
+    for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
+        ppc32_ibtc_entry_t *s = &ctx->ibtc[i];
+
+        if (s->key >= start && s->key < end) {
+            s->host_code = NULL;
+            s->entry = NULL;
+        }
+    }
+    for (i = 0U; i < PPC32_RAS_SIZE; i++) {
+        ppc32_ibtc_entry_t *s = &ctx->ras[i];
+
+        if (s->key >= start && s->key < end) {
+            s->host_code = NULL;
+            s->entry = NULL;
+        }
+    }
+}
+
+static void block_free(ppc32_block_t *e)
+{
+    if (e == NULL) {
+        return;
+    }
+    if (e->host_code != NULL) {
+        /* Install records the whole-page span in pad0[0]. */
+        size_t len = (size_t)e->pad0[0];
+
+        if (len != 0U) {
+            (void)munmap(e->host_code, len);
+        }
+    }
+    free(e);
+}
+
+static ppc32_block_t *lookup_valid(uint32_t pc)
+{
+    ppc32_block_t *e = s_table[cache_index(pc)];
+
+    if (e == NULL || !e->occupied || e->guest_pc != pc) {
+        return NULL;
+    }
+    if (e->pagever != s_page_ver[pc >> 12U]) {
+        return NULL;
+    }
+    if ((uint32_t)(e->keyepoch >> 32U) != g_cache_epoch) {
+        return NULL;
+    }
+    if (e->host_code == NULL || e->entry == NULL) {
+        return NULL;
+    }
+    return e;
+}
+
+ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc)
+{
+    ppc32_block_t *e = lookup_valid(pc);
+
+    if (e != NULL) {
+        ibtc_fill(ctx, pc, e);
+    }
+    return e;
+}
+
+/* Resolve a pc to a live entry without translating (slots/ret fill). */
+static ppc32_block_t *lookup_nofill(uint32_t pc)
+{
+    return lookup_valid(pc);
+}
+
+ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
+    const uint32_t *words, size_t nwords, const uint32_t *slot_pcs,
+    unsigned nslots, bool is_call, uint32_t ret_pc)
+{
+    uint32_t idx = cache_index(pc);
+    ppc32_block_t *old = s_table[idx];
+    ppc32_block_t *e;
+    size_t span;
+    size_t pagesz;
+    void *code;
+    unsigned s;
+    size_t i;
+
+    if (words == NULL || nwords == 0U) {
+        return NULL;
+    }
+    if (nslots > 8U) {
+        nslots = 8U;
+    }
+    e = (ppc32_block_t *)calloc(1, sizeof(*e));
+    if (e == NULL) {
+        return NULL;
+    }
+    pagesz = (size_t)sysconf(_SC_PAGESIZE);
+    if (pagesz == 0U) {
+        pagesz = 4096U;
+    }
+    span = ((nwords * sizeof(uint32_t)) + pagesz - 1U) & ~(pagesz - 1U);
+    code = mmap(NULL, span, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) {
+        free(e);
+        return NULL;
+    }
+    memcpy(code, words, nwords * sizeof(uint32_t));
+    /* W^X flip before any host fetch: drop WRITE, add EXEC, then flush
+     * the I-cache over the exact emitted span. */
+    if (mprotect(code, span, PROT_READ | PROT_EXEC) != 0) {
+        (void)munmap(code, span);
+        free(e);
+        return NULL;
+    }
+    __builtin___clear_cache((char *)code,
+        (char *)code + nwords * sizeof(uint32_t));
+
+    /* Evict the collided occupant first so no live link can reach freed
+     * code; sever cross-links and ctx entries by key. */
+    if (old != NULL) {
+        uint32_t old_pc = old->guest_pc;
+
+        sever_links_to(old);
+        s_table[idx] = NULL;
+        block_free(old);
+        sever_ctx_range(ctx, old_pc, old_pc + 4U);
+    }
+
+    e->keyepoch = (uint64_t)pc | ((uint64_t)g_cache_epoch << 32U);
+    e->host_code = code;
+    e->entry = code;
+    e->pad0[0] = (uint64_t)span;
+    e->ret_entry = NULL;
+    e->guest_pc = pc;
+    e->pagever = s_page_ver[pc >> 12U];
+    e->slot_count = nslots;
+    e->ret_pc = is_call ? ret_pc : 0U;
+    e->occupied = true;
+    for (s = 0U; s < 8U; s++) {
+        ppc32_block_t *t;
+
+        if (s < nslots && slot_pcs != NULL) {
+            e->slot_pc[s] = slot_pcs[s];
+            t = lookup_nofill(slot_pcs[s]);
+            e->slot_entry[s] = (t != NULL) ? (void *)t : NULL;
+        } else {
+            e->slot_pc[s] = 0U;
+            e->slot_entry[s] = NULL;
+        }
+    }
+    if (is_call) {
+        ppc32_block_t *t = lookup_nofill(ret_pc);
+
+        if (t != NULL) {
+            e->ret_entry = (void *)t;
+        }
+    }
+    s_table[idx] = e;
+
+    /* Backfill: earlier blocks waiting on this pc (chain slots and call
+     * fallthroughs) link up now that the target exists. */
+    for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
+        ppc32_block_t *o = s_table[i];
+
+        if (o == NULL || o == e || !o->occupied) {
+            continue;
+        }
+        if (o->pagever != s_page_ver[o->guest_pc >> 12U]) {
+            continue;
+        }
+        for (s = 0U; s < o->slot_count && s < 8U; s++) {
+            if (o->slot_pc[s] == pc) {
+                o->slot_entry[s] = (void *)e;
+            }
+        }
+        if (o->ret_pc == pc && o->ret_entry == NULL) {
+            o->ret_entry = (void *)e;
+        }
+    }
+
+    ibtc_fill(ctx, pc, e);
+    if (ctx != NULL) {
+        ctx->blocks_compiled++;
+    }
+    return e;
+}
+
+void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
+    uint32_t end)
+{
+    uint32_t pg;
+
+    if (start >= end) {
+        return;
+    }
+    /* Bump every covered page version first: blocks that survive the
+     * eager sweep below still miss on lookup. */
+    for (pg = start >> 12U; pg < (end >> 12U) + 1U; pg++) {
+        if (pg < PPC32_DBT_NPAGES) {
+            s_page_ver[pg]++;
+        }
+        if (pg == 0xFFFFFU) {
+            break;
+        }
+    }
+    for (uint32_t i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
+        ppc32_block_t *e = s_table[i];
+
+        if (e == NULL || !e->occupied) {
+            continue;
+        }
+        if (e->guest_pc >= start && e->guest_pc < end) {
+            sever_links_to(e);
+            s_table[i] = NULL;
+            block_free(e);
+        }
+    }
+    /* Sweep links that referenced evicted entries from surviving blocks
+     * whose slot lists were recorded before eviction (sever_links_to
+     * already NULLed them entry-side; belt and braces for ret_entry). */
+    for (uint32_t i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
+        ppc32_block_t *e = s_table[i];
+
+        if (e != NULL && e->ret_pc >= start && e->ret_pc < end &&
+            e->ret_entry != NULL) {
+            ppc32_block_t *t = lookup_nofill(e->ret_pc);
+
+            if (t == NULL) {
+                e->ret_entry = NULL;
+            }
+        }
+    }
+    sever_ctx_range(ctx, start, end);
+    if (ctx != NULL) {
+        ctx->icache_flushes++;
+    }
+}
+
+void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx)
+{
+    uint32_t i;
+
+    for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
+        block_free(s_table[i]);
+        s_table[i] = NULL;
+    }
+    /* Retire every emitted epoch check at once. */
+    g_cache_epoch++;
+    if (g_cache_epoch == 0U) {
+        g_cache_epoch = 1U;
+    }
+    if (ctx != NULL) {
+        for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
+            ctx->ibtc[i].key = 0U;
+            ctx->ibtc[i].epoch = 0U;
+            ctx->ibtc[i].host_code = NULL;
+            ctx->ibtc[i].entry = NULL;
+            ctx->ibtc[i].pad = 0U;
+        }
+        for (i = 0U; i < PPC32_RAS_SIZE; i++) {
+            ctx->ras[i].key = 0U;
+            ctx->ras[i].epoch = 0U;
+            ctx->ras[i].host_code = NULL;
+            ctx->ras[i].entry = NULL;
+            ctx->ras[i].pad = 0U;
+        }
+        ctx->ras_top = 0U;
+    }
+}
