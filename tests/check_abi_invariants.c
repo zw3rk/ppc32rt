@@ -6,12 +6,8 @@
  *
  * Compile-time (_Static_assert) + runtime (offsetof/sizeof) checks for
  * every field offset and struct size in src/os/sigframe_ppc32.h
- * (SPEC §2.3, E04) and the SPEC §2.1 ppc32_ctx_t layout.
- *
- * NOTE (PENDING-L0a): src/ppc32rt.h does not exist yet on master, so the
- * ctx expectations below are defined locally from SPEC §2.1 numbers.
- * After lane L0a merges, rewire the ctx section against the real
- * ppc32_ctx_t and drop the replica.
+ * (SPEC §2.3, E04) and the SPEC §2.1 ppc32_ctx_t locked prefix in
+ * src/ppc32rt.h (RC0 coordinator rewire; no local replica).
  */
 
 #include <stddef.h>
@@ -19,26 +15,7 @@
 #include <stdio.h>
 
 #include "os/sigframe_ppc32.h"
-
-/* ---- PENDING-L0a: local SPEC §2.1 replica (rewire to ppc32_ctx_t) ---- */
-typedef struct {
-    uint32_t gpr[32];    /* 0x000 */
-    uint32_t gpr_hi[32]; /* 0x080 */
-    uint32_t nip;        /* 0x100 */
-    uint32_t lr;         /* 0x104 */
-    uint32_t ctr;        /* 0x108 */
-    uint32_t cr;         /* 0x10c */
-    uint32_t xer;        /* 0x110 */
-    uint32_t fpscr;      /* 0x114 */
-    uint32_t spefscr;    /* 0x118 */
-    uint64_t acc;        /* 0x120 */
-    uint64_t fpr[32];    /* 0x128 */
-    uint64_t guest_base; /* 0x228 */
-    uint32_t res_addr;   /* 0x230 */
-    uint32_t res_val;    /* 0x234 */
-    uint8_t res_valid;   /* 0x238 */
-    uint8_t is_spe;      /* 0x239 */
-} ppc32_ctx_expect_t;
+#include "ppc32rt.h"
 
 /* ---- compile-time pins: sigframe/stat structs ---- */
 _Static_assert(offsetof(ppc32_mcontext_t, mc_gregs) == 0x0, "mc_gregs@0x0");
@@ -109,24 +86,23 @@ _Static_assert(offsetof(ppc32_stat64_t, __unused4) == 0x60, "st64 un4@0x60");
 _Static_assert(offsetof(ppc32_stat64_t, __unused5) == 0x64, "st64 un5@0x64");
 _Static_assert(sizeof(ppc32_stat64_t) == 104, "ppc32 stat64 104 B");
 
-/* ---- compile-time pins: SPEC §2.1 ctx replica (PENDING-L0a) ---- */
-_Static_assert(offsetof(ppc32_ctx_expect_t, gpr) == 0x0, "ctx gpr@0x0");
-_Static_assert(offsetof(ppc32_ctx_expect_t, gpr_hi) == 0x80, "ctx gpr_hi@0x80");
-_Static_assert(offsetof(ppc32_ctx_expect_t, nip) == 0x100, "ctx nip@0x100");
-_Static_assert(offsetof(ppc32_ctx_expect_t, lr) == 0x104, "ctx lr@0x104");
-_Static_assert(offsetof(ppc32_ctx_expect_t, ctr) == 0x108, "ctx ctr@0x108");
-_Static_assert(offsetof(ppc32_ctx_expect_t, cr) == 0x10c, "ctx cr@0x10c");
-_Static_assert(offsetof(ppc32_ctx_expect_t, xer) == 0x110, "ctx xer@0x110");
-_Static_assert(offsetof(ppc32_ctx_expect_t, fpscr) == 0x114, "ctx fpscr@0x114");
-_Static_assert(offsetof(ppc32_ctx_expect_t, spefscr) == 0x118, "ctx spefscr");
-_Static_assert(offsetof(ppc32_ctx_expect_t, acc) == 0x120, "ctx acc@0x120");
-_Static_assert(offsetof(ppc32_ctx_expect_t, fpr) == 0x128, "ctx fpr@0x128");
-_Static_assert(offsetof(ppc32_ctx_expect_t, guest_base) == 0x228, "ctx G@0x228");
-_Static_assert(offsetof(ppc32_ctx_expect_t, res_addr) == 0x230, "ctx ra@0x230");
-_Static_assert(offsetof(ppc32_ctx_expect_t, res_val) == 0x234, "ctx rv@0x234");
-_Static_assert(offsetof(ppc32_ctx_expect_t, res_valid) == 0x238, "ctx rvld");
-_Static_assert(offsetof(ppc32_ctx_expect_t, is_spe) == 0x239, "ctx spe@0x239");
-_Static_assert(sizeof(ppc32_ctx_expect_t) == 0x240, "ctx sizeof 0x240");
+/* ---- compile-time pins: SPEC §2.1 ctx locked prefix (real ppc32_ctx_t) ---- */
+_Static_assert(offsetof(ppc32_ctx_t, gpr) == 0x0, "ctx gpr@0x0");
+_Static_assert(offsetof(ppc32_ctx_t, gpr_hi) == 0x80, "ctx gpr_hi@0x80");
+_Static_assert(offsetof(ppc32_ctx_t, nip) == 0x100, "ctx nip@0x100");
+_Static_assert(offsetof(ppc32_ctx_t, lr) == 0x104, "ctx lr@0x104");
+_Static_assert(offsetof(ppc32_ctx_t, ctr) == 0x108, "ctx ctr@0x108");
+_Static_assert(offsetof(ppc32_ctx_t, cr) == 0x10c, "ctx cr@0x10c");
+_Static_assert(offsetof(ppc32_ctx_t, xer) == 0x110, "ctx xer@0x110");
+_Static_assert(offsetof(ppc32_ctx_t, fpscr) == 0x114, "ctx fpscr@0x114");
+_Static_assert(offsetof(ppc32_ctx_t, spefscr) == 0x118, "ctx spefscr");
+_Static_assert(offsetof(ppc32_ctx_t, acc) == 0x120, "ctx acc@0x120");
+_Static_assert(offsetof(ppc32_ctx_t, fpr) == 0x128, "ctx fpr@0x128");
+_Static_assert(offsetof(ppc32_ctx_t, guest_base) == 0x228, "ctx G@0x228");
+_Static_assert(offsetof(ppc32_ctx_t, res_addr) == 0x230, "ctx ra@0x230");
+_Static_assert(offsetof(ppc32_ctx_t, res_val) == 0x234, "ctx rv@0x234");
+_Static_assert(offsetof(ppc32_ctx_t, res_valid) == 0x238, "ctx rvld");
+_Static_assert(offsetof(ppc32_ctx_t, is_spe) == 0x239, "ctx spe@0x239");
 
 static int fails = 0;
 
@@ -196,17 +172,15 @@ int main(void)
     check_off("st64.mtime", offsetof(ppc32_stat64_t, st_mtime), 0x50u);
     check_off("st64.ctime", offsetof(ppc32_stat64_t, st_ctime), 0x58u);
 
-    /* PENDING-L0a replica cross-check (SPEC §2.1 numbers). */
-    check_size("ctx(replica)", sizeof(ppc32_ctx_expect_t), 0x240u);
-    check_off("ctx.gpr", offsetof(ppc32_ctx_expect_t, gpr), 0x0u);
-    check_off("ctx.gpr_hi", offsetof(ppc32_ctx_expect_t, gpr_hi), 0x80u);
-    check_off("ctx.nip", offsetof(ppc32_ctx_expect_t, nip), 0x100u);
-    check_off("ctx.acc", offsetof(ppc32_ctx_expect_t, acc), 0x120u);
-    check_off("ctx.fpr", offsetof(ppc32_ctx_expect_t, fpr), 0x128u);
-    check_off("ctx.G", offsetof(ppc32_ctx_expect_t, guest_base), 0x228u);
-    check_off("ctx.res_valid", offsetof(ppc32_ctx_expect_t, res_valid), 0x238u);
-    check_off("ctx.is_spe", offsetof(ppc32_ctx_expect_t, is_spe), 0x239u);
-    printf("ctx checks are PENDING-L0a: rewire against src/ppc32rt.h\n");
+    /* SPEC §2.1 locked prefix, checked against the real ppc32_ctx_t. */
+    check_off("ctx.gpr", offsetof(ppc32_ctx_t, gpr), 0x0u);
+    check_off("ctx.gpr_hi", offsetof(ppc32_ctx_t, gpr_hi), 0x80u);
+    check_off("ctx.nip", offsetof(ppc32_ctx_t, nip), 0x100u);
+    check_off("ctx.acc", offsetof(ppc32_ctx_t, acc), 0x120u);
+    check_off("ctx.fpr", offsetof(ppc32_ctx_t, fpr), 0x128u);
+    check_off("ctx.G", offsetof(ppc32_ctx_t, guest_base), 0x228u);
+    check_off("ctx.res_valid", offsetof(ppc32_ctx_t, res_valid), 0x238u);
+    check_off("ctx.is_spe", offsetof(ppc32_ctx_t, is_spe), 0x239u);
 
     if (PPC32_MC_NIP != 32 || PPC32_MC_MSR != 33 || PPC32_MC_CTR != 35 ||
         PPC32_MC_LINK != 36 || PPC32_MC_XER != 37 || PPC32_MC_CCR != 38 ||

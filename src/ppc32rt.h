@@ -51,7 +51,7 @@
 /* Architectural limits, cache capacities, page/window constants. */
 #define PPC32_MAX_REGIONS    512U
 #define PPC32_RAS_SIZE       64U
-#define PPC32_IBTC_SIZE      1024U
+#define PPC32_IBTC_SIZE      4096U /* SPEC §3: 4096-entry per-thread IBTC */
 #define PPC32_PAGE_SIZE      4096U
 #define PPC32_TASK_SIZE_TOP  0xC0000000U /* ppc32 TASK_SIZE (SPEC 1.1) */
 #define PPC32_STACK_TOP      0xBFFF0000U /* initial stack top (SPEC 1.1) */
@@ -242,8 +242,8 @@ _Static_assert(offsetof(ppc32_ctx_t, res_addr) == 0x230, "res_addr must be at of
 _Static_assert(offsetof(ppc32_ctx_t, res_val) == 0x234, "res_val must be at offset 0x234");
 _Static_assert(offsetof(ppc32_ctx_t, res_valid) == 0x238, "res_valid must be at offset 0x238");
 _Static_assert(offsetof(ppc32_ctx_t, is_spe) == 0x239, "is_spe must be at offset 0x239");
-_Static_assert(sizeof(ppc32_ibtc_entry_t) * PPC32_IBTC_SIZE == 32768,
-               "IBTC array must span 32768 bytes");
+_Static_assert(sizeof(ppc32_ibtc_entry_t) * PPC32_IBTC_SIZE == 131072,
+               "IBTC array must span 131072 bytes");
 
 static inline void ppc32_spin_lock(_Atomic uint32_t *lock)
 {
