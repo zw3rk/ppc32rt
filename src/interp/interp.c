@@ -32,6 +32,7 @@
 
 #include "ppc32rt.h"
 #include "interp/interp.h"
+#include "interp/fp.h"
 
 /* Internal helpers (guest memory, branches, traps) live in
  * interp.h as static inline so both engines share one copy. */
@@ -551,6 +552,10 @@ void interp_step(ppc32_ctx_t *ctx)
             case 269U:
                 ctx->gpr[insn.rt] = 0U;
                 break;
+            case PPC32_SPR_PVR: /* mfpvr: glibc IFUNC dispatch reads it */
+                ctx->gpr[insn.rt] = (ctx->profile == PPC32_PROFILE_SPE) ?
+                    PPC32_PVR_E500V2 : PPC32_PVR_750;
+                break;
             default:
                 ctx->exit_reason = PPC32_EXIT_UNDEF;
                 break;
@@ -589,8 +594,10 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t aa = (raw >> 1U) & 1U;
         uint32_t target = (aa != 0U) ? (uint32_t)insn.bd
                                      : ctx->nip + (uint32_t)insn.bd;
+        /* NOTE: branch_cond decrements CTR; evaluate exactly once. */
+        bool take = branch_cond(ctx, insn.bo, insn.bi);
 
-        if (branch_cond(ctx, insn.bo, insn.bi)) {
+        if (take) {
             branch_to(ctx, target, (uint8_t)(raw & 1U));
         } else {
             if ((raw & 1U) != 0U) {
@@ -602,8 +609,10 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     case PPC32_OP_BCLR: {
         uint32_t target = ctx->lr;
+        /* NOTE: branch_cond decrements CTR; evaluate exactly once. */
+        bool take = branch_cond(ctx, insn.bo, insn.bi);
 
-        if (branch_cond(ctx, insn.bo, insn.bi)) {
+        if (take) {
             branch_to(ctx, target, (uint8_t)(raw & 1U));
         } else {
             if ((raw & 1U) != 0U) {
@@ -615,8 +624,11 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     case PPC32_OP_BCCTR: {
         uint32_t target = ctx->ctr;
+        /* NOTE: branch_cond decrements CTR; evaluate exactly once. */
+        bool take =
+            branch_cond(ctx, (uint8_t)(insn.bo | 4U), insn.bi);
 
-        if (branch_cond(ctx, (uint8_t)(insn.bo | 4U), insn.bi)) {
+        if (take) {
             branch_to(ctx, target, (uint8_t)(raw & 1U));
         } else {
             if ((raw & 1U) != 0U) {
@@ -833,6 +845,17 @@ void interp_step(ppc32_ctx_t *ctx)
         ctx->nip += 4U;
         break;
     }
+    /* ---- classic-FPU data moves (RC2 subset in interp/fp.c) --------- */
+    case PPC32_OP_LFS:
+    case PPC32_OP_LFSU:
+    case PPC32_OP_LFD:
+    case PPC32_OP_LFDU:
+    case PPC32_OP_STFS:
+    case PPC32_OP_STFSU:
+    case PPC32_OP_STFD:
+    case PPC32_OP_STFDU:
+        ppc32_fp_step(ctx, &insn);
+        break;
     default:
         ctx->exit_reason = PPC32_EXIT_UNDEF;
         break;

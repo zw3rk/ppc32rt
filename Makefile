@@ -36,12 +36,14 @@ endif
 # pick up src/interp, src/os, src/dbt automatically.
 SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
         $(wildcard src/os/*.c) $(wildcard src/dbt/*.c)
+ASMS := $(wildcard src/dbt/*.S)
 HDRS := src/ppc32rt.h include/a32host.h src/os/syscall_nr.h \
         $(wildcard src/rt32/*.h) $(wildcard src/interp/*.h) \
-        $(wildcard src/os/*.h)
+        $(wildcard src/os/*.h) $(wildcard src/dbt/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
-OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS)) \
+              $(patsubst src/%.S,$(OBJ_DIR)/%.o,$(ASMS))
 PPC32RT_BIN := $(BUILD_DIR)/ppc32rt
 
 help: ## Show available build and verification targets
@@ -58,6 +60,10 @@ $(PPC32RT_BIN): $(OBJS)
 	@ln -sf ppc32rt $(BUILD_DIR)/ppc32rt-binfmt-p
 
 $(OBJ_DIR)/%.o: src/%.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/%.o: src/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 

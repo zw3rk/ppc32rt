@@ -8,7 +8,8 @@
  * rlwinm/rlwimi/rlwnm (incl. the MB > ME wrap case, E02), b/bc/bl/blr/
  * bctr/bdnz loop, a bctr stub in the last word before a PROT_NONE page
  * (page_end - 4), lwarx/stwcx. atomic increment, and unaligned lwz/stw
- * (plus BE byte order via lbz).
+ * (plus BE byte order via lbz), and update-form stores with source ==
+ * base (stwu rs==ra: access before base update).
  *
  * Target path (#ifdef __powerpc__): pure .text assembly, _start entry,
  * raw sc syscalls (sc = 0x44000002, nr in r0, args in r3..r8, E01).
@@ -458,6 +459,69 @@ __asm__(
 "    li 4,0x78\n"
 "    li 5,47\n"
 "    bl check_eq\n"
+/* ---- sites 48-49: stwu with rs == ra (access before base update) ---- */
+"    addi 9,1,48\n"
+"    mr 10,9\n"
+"    stwu 9,-4(9)\n"
+"    lwz 4,0(9)\n"
+"    mr 3,4\n"
+"    mr 4,10\n"
+"    li 5,48\n"
+"    bl check_eq\n"
+"    mr 3,9\n"
+"    addi 4,10,-4\n"
+"    li 5,49\n"
+"    bl check_eq\n"
+/* ---- sites 50-51: subfe B>=A with CA=1: 5-3+1-1 -> 2, CA=1 ---- */
+"    li 3,-1\n"
+"    li 4,1\n"
+"    addc 5,3,4\n"
+"    li 3,5\n"
+"    li 4,3\n"
+"    subfe 5,4,3\n"
+"    mr 3,5\n"
+"    li 4,2\n"
+"    li 5,50\n"
+"    bl check_eq\n"
+"    adde 6,0,0\n"
+"    mr 3,6\n"
+"    li 4,1\n"
+"    li 5,51\n"
+"    bl check_eq\n"
+/* ---- sites 52-53: subfe B<A with CA=0: 3-5+0-1 -> -3, CA=0 ---- */
+"    li 3,1\n"
+"    li 4,0\n"
+"    subfc 5,3,4\n"
+"    li 3,3\n"
+"    li 4,5\n"
+"    subfe 5,4,3\n"
+"    mr 3,5\n"
+"    li 4,-3\n"
+"    li 5,52\n"
+"    bl check_eq\n"
+"    adde 6,0,0\n"
+"    mr 3,6\n"
+"    li 4,0\n"
+"    li 5,53\n"
+"    bl check_eq\n"
+/* ---- sites 54-55: addic/subfe zero-test idiom with Y=0 (RC2:
+ * subfe left CA=1 when the first sub borrowed): 0-(-1)+0-1 -> 0,
+ * CA=0 ---- */
+"    li 3,0\n"
+"    li 4,1\n"
+"    subfc 5,4,3\n"
+"    li 7,0\n"
+"    addic 8,7,-1\n"
+"    subfe 5,8,7\n"
+"    mr 3,5\n"
+"    li 4,0\n"
+"    li 5,54\n"
+"    bl check_eq\n"
+"    adde 6,0,0\n"
+"    mr 3,6\n"
+"    li 4,0\n"
+"    li 5,55\n"
+"    bl check_eq\n"
 /* ---- PASS + exit(0) ---- */
 "    addi 3,31,s_pass-getpc\n"
 "    li 4,5\n"
@@ -731,6 +795,16 @@ skip:
         0x12345678u);
     TEST("be_first", ubuf[1], 0x12u);
     TEST("be_last", ubuf[4], 0x78u);
+    /* Update-form store with rs == ra: access uses the old value,
+     * then the base updates (interp_exec_dform_mem order). */
+    {
+        uint32_t rs_ra = 0x1000u;
+        uint32_t ea = rs_ra - 4u;
+        uint32_t mem = rs_ra;
+        rs_ra = ea;
+        TEST("stwu_overlap_mem", mem, 0x1000u);
+        TEST("stwu_overlap_base", rs_ra, 0x0FFCu);
+    }
 
     if (failures != 0) {
         printf("FAILURES %d\n", failures);

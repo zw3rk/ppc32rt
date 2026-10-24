@@ -226,12 +226,15 @@ static inline void ei_xer_ca_from_c(a64_buf_t *b)
     ei_ctx_st(b, EI_X, (uint32_t)offsetof(ppc32_ctx_t, xer));
 }
 
-/* XER.CA = 0/1 value already in `bit`. */
+/* XER.CA = 0/1 value already in `bit`. The mask must NOT live in EI_B:
+ * every caller passes bit==EI_B, so loading the mask there destroys the
+ * value (RC2: srawi CA stuck at 0). TMP3 (x21) is scratch (see
+ * ei_epoch_bump) and safe here. */
 static inline void ei_xer_ca_reg(a64_buf_t *b, unsigned bit)
 {
     ei_ctx_ld(b, EI_X, (uint32_t)offsetof(ppc32_ctx_t, xer));
-    a64_emit_mov_imm32(b, EI_B, EI_XER_CA);
-    a64_emit_bic_reg_w(b, false, EI_X, EI_X, EI_B, A64_SHIFT_LSL, 0U);
+    a64_emit_mov_imm32(b, A64_TMP3, EI_XER_CA);
+    a64_emit_bic_reg_w(b, false, EI_X, EI_X, A64_TMP3, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, EI_X, EI_X, bit, A64_SHIFT_LSL, 29U);
     ei_ctx_st(b, EI_X, (uint32_t)offsetof(ppc32_ctx_t, xer));
 }
@@ -240,8 +243,8 @@ static inline void ei_xer_ca_reg(a64_buf_t *b, unsigned bit)
 static inline void ei_xer_ov_reg(a64_buf_t *b, unsigned ov)
 {
     ei_ctx_ld(b, EI_X, (uint32_t)offsetof(ppc32_ctx_t, xer));
-    a64_emit_mov_imm32(b, EI_B, EI_XER_OV);
-    a64_emit_bic_reg_w(b, false, EI_X, EI_X, EI_B, A64_SHIFT_LSL, 0U);
+    a64_emit_mov_imm32(b, A64_TMP3, EI_XER_OV);
+    a64_emit_bic_reg_w(b, false, EI_X, EI_X, A64_TMP3, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, EI_X, EI_X, ov, A64_SHIFT_LSL, 30U);
     a64_emit_orr_reg_w(b, EI_X, EI_X, ov, A64_SHIFT_LSL, 31U);
     ei_ctx_st(b, EI_X, (uint32_t)offsetof(ppc32_ctx_t, xer));
@@ -579,8 +582,14 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x)
     } else {
         ei_ea_d(b, in->ra, (uint32_t)in->d);
     }
-    /* Interp order: base update first, then the access (matters when
-     * rt/rs == ra). The access reloads rs fresh for the same reason. */
+    /* Interp (interp_exec_dform_mem) accesses BEFORE the base update, so
+     * a store with rs == ra must capture the source first (RC2: stwu
+     * r1,-32(r1) stored EA instead of the old value). Loads keep EA in
+     * w22 across the update, so only the overlapping store needs this. */
+    bool overlap = !load && ei_is_update(in->op) && in->rs == in->ra;
+    if (overlap) {
+        ei_ld(b, EI_B, in->rs);
+    }
     if (ei_is_update(in->op)) {
         a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
     }
@@ -604,7 +613,9 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x)
         ei_st(b, EI_B, in->rt);
         return PPC32_EMIT_NEXT;
     }
-    ei_ld(b, EI_B, in->rs);
+    if (!overlap) {
+        ei_ld(b, EI_B, in->rs);
+    }
     if (width == 2U) {
         if (swap == 2U) {
             a64_emit_rev_w(b, EI_B, EI_B);

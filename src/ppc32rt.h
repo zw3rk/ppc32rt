@@ -31,6 +31,10 @@
 #define PPC32_SPR_XER 1U
 #define PPC32_SPR_LR  8U
 #define PPC32_SPR_CTR 9U
+#define PPC32_SPR_PVR 287U
+/* PVR values reported per profile (match the qemu-ppc oracle CPUs). */
+#define PPC32_PVR_750    0x00080301U /* 750_v3.1 */
+#define PPC32_PVR_E500V2 0x80210022U /* e500v2_v22 */
 #define PPC32_SPR_TB  268U
 #define PPC32_SPR_TBU 269U
 

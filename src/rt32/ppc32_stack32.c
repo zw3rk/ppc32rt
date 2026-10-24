@@ -95,6 +95,35 @@ int ppc32_stack_setup(ppc32_ctx_t *ctx, const ppc32_elf_info_t *elf_info,
     if (at_platform_va == 0U) {
         return -1;
     }
+    uint32_t at_execfn_va = push_cstring(ctx, &sp,
+        (guest_argv != NULL && guest_argv[0] != NULL) ? guest_argv[0] : "ppc32rt");
+    if (at_execfn_va == 0U) {
+        return -1;
+    }
+    /* AT_RANDOM: 16 bytes from the host RNG, 16-byte aligned. */
+    uint8_t rand_bytes[16];
+    {
+        FILE *rf = fopen("/dev/urandom", "rb");
+        size_t got = 0U;
+
+        if (rf != NULL) {
+            got = fread(rand_bytes, 1U, sizeof(rand_bytes), rf);
+            fclose(rf);
+        }
+        if (got != sizeof(rand_bytes)) {
+            uint32_t seed = 0x9E3779B9U ^ (uint32_t)(uintptr_t)ctx;
+
+            for (size_t ri = 0U; ri < sizeof(rand_bytes); ri++) {
+                seed = seed * 1664525U + 1013904223U;
+                rand_bytes[ri] = (uint8_t)(seed >> 24);
+            }
+        }
+    }
+    sp &= ~0xFU;
+    uint32_t at_random_va = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
+    if (at_random_va == 0U) {
+        return -1;
+    }
 
     uint32_t env_ptrs[512];
     uint32_t arg_ptrs[512];
@@ -108,13 +137,47 @@ int ppc32_stack_setup(ppc32_ctx_t *ctx, const ppc32_elf_info_t *elf_info,
 
     sp &= ~0xFU;
 
-    /* Phase 0 minimal auxv: AT_NULL only. The Phase 2 os lane extends this
-     * with AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/AT_UID/AT_PLATFORM/AT_RANDOM
-     * and the vDSO pair once the vDSO/sigtramp mapping lands. */
-    uint32_t auxv[2];
-    auxv[0] = 0U; /* AT_NULL */
-    auxv[1] = 0U;
-    size_t aux_idx = 2U;
+    /* RC2 full auxv (Phase 2 L2a scope): static glibc startup walks
+     * AT_PHDR (TLS/relro), reads AT_RANDOM (pointer guard), and dispatches
+     * IFUNCs off AT_HWCAP. HWCAP bits per arch/powerpc uapi cputable.h. */
+    uint32_t auxv[40];
+    size_t aux_idx = 0U;
+
+    auxv[aux_idx++] = 3U; /* AT_PHDR */
+    auxv[aux_idx++] = elf_info->phdr_vaddr;
+    auxv[aux_idx++] = 4U; /* AT_PHENT */
+    auxv[aux_idx++] = elf_info->phent;
+    auxv[aux_idx++] = 5U; /* AT_PHNUM */
+    auxv[aux_idx++] = elf_info->phnum;
+    auxv[aux_idx++] = 6U; /* AT_PAGESZ */
+    auxv[aux_idx++] = 4096U;
+    auxv[aux_idx++] = 8U; /* AT_FLAGS */
+    auxv[aux_idx++] = 0U;
+    auxv[aux_idx++] = 9U; /* AT_ENTRY */
+    auxv[aux_idx++] = elf_info->entry;
+    auxv[aux_idx++] = 11U; /* AT_UID */
+    auxv[aux_idx++] = (uint32_t)getuid();
+    auxv[aux_idx++] = 12U; /* AT_EUID */
+    auxv[aux_idx++] = (uint32_t)geteuid();
+    auxv[aux_idx++] = 13U; /* AT_GID */
+    auxv[aux_idx++] = (uint32_t)getgid();
+    auxv[aux_idx++] = 14U; /* AT_EGID */
+    auxv[aux_idx++] = (uint32_t)getegid();
+    auxv[aux_idx++] = 15U; /* AT_PLATFORM */
+    auxv[aux_idx++] = at_platform_va;
+    auxv[aux_idx++] = 16U; /* AT_HWCAP */
+    auxv[aux_idx++] = (ctx->profile == PPC32_PROFILE_SPE) ?
+        0x80E00002U : 0x8000000AU;
+    auxv[aux_idx++] = 17U; /* AT_CLKTCK */
+    auxv[aux_idx++] = 100U;
+    auxv[aux_idx++] = 25U; /* AT_RANDOM */
+    auxv[aux_idx++] = at_random_va;
+    auxv[aux_idx++] = 26U; /* AT_HWCAP2 */
+    auxv[aux_idx++] = 0U;
+    auxv[aux_idx++] = 31U; /* AT_EXECFN */
+    auxv[aux_idx++] = at_execfn_va;
+    auxv[aux_idx++] = 0U; /* AT_NULL */
+    auxv[aux_idx++] = 0U;
 
     /* Frame layout: argc, argv[0..argc-1], NULL, envp[0..envc-1], NULL,
      * auxv[] (16-byte aligned). */
@@ -125,16 +188,25 @@ int ppc32_stack_setup(ppc32_ctx_t *ctx, const ppc32_elf_info_t *elf_info,
     }
     uint32_t final_sp = (sp - frame_bytes) & ~0xFU;
 
+    /* Guest is big-endian: every word in the initial frame must be
+     * byte-swapped on the (little-endian) host (RC2: argc arrived as
+     * 0x01000000 and killed static glibc startup). */
     uint32_t *w = (uint32_t *)ppc32_guest_ptr(ctx, final_sp);
     size_t pos = 0;
-    w[pos++] = (uint32_t)argc;
-    memcpy(&w[pos], arg_ptrs, (size_t)argc * sizeof(uint32_t));
-    pos += (size_t)argc;
+    int i;
+
+    w[pos++] = ppc32_be32((uint32_t)argc);
+    for (i = 0; i < argc; i++) {
+        w[pos++] = ppc32_be32(arg_ptrs[i]);
+    }
     w[pos++] = 0U;
-    memcpy(&w[pos], env_ptrs, (size_t)envc * sizeof(uint32_t));
-    pos += (size_t)envc;
+    for (i = 0; i < envc; i++) {
+        w[pos++] = ppc32_be32(env_ptrs[i]);
+    }
     w[pos++] = 0U;
-    memcpy(&w[pos], auxv, aux_idx * sizeof(uint32_t));
+    for (i = 0; (size_t)i < aux_idx; i++) {
+        w[pos++] = ppc32_be32(auxv[i]);
+    }
 
     ctx->guest_argc = argc;
     ctx->guest_argv = guest_argv;

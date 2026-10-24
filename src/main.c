@@ -20,11 +20,15 @@
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
 #include "interp/interp.h"
-#include "os/syscalls_min.h"
+#include "os/syscalls.h"
+#include "dbt/dbt.h"
+#include "dbt/emit_int.h"
+#include "dbt/emit_fp.h"
+#include "dbt/difftest.h"
 
 extern char **environ;
 
-#define PPC32RT_VERSION "0.1-phase1"
+#define PPC32RT_VERSION "0.2-phase2"
 
 static void usage(FILE *out)
 {
@@ -147,6 +151,38 @@ static void apply_env(ppc32_ctx_t *ctx)
 }
 
 static int run_interp(ppc32_ctx_t *ctx);
+static int run_dbt(ppc32_ctx_t *ctx);
+static int run_difftest(ppc32_ctx_t *ctx);
+
+/* RC2 emitter bridge: adapt L2c's ppc32_emit_int (own ctx struct) to the
+ * L2b driver callback (single definition lives in dbt.h). emit_begin is
+ * a trivial binder, so rebinding per instruction is correct. NEXT and
+ * END both count as emitted (dbt.c ends blocks itself); FALLBACK and
+ * staging overflow count as refuse. */
+static ppc32_ctx_t *g_emit_owner;
+
+static int emit_bridge_fn(a64_buf_t *b, const ppc32_insn_t *insn,
+    uint32_t pc)
+{
+    ppc32_emit_ctx_t e;
+    int rc;
+
+    ppc32_emit_begin(&e, g_emit_owner, b);
+    rc = ppc32_emit_int(&e, insn, pc);
+    if (rc == PPC32_EMIT_FALLBACK && !b->overflow) {
+        rc = ppc32_emit_fp(&e, insn, pc);
+    }
+    if (rc == PPC32_EMIT_FALLBACK || b->overflow) {
+        return 1;
+    }
+    return 0;
+}
+
+static void emit_bridge_install(ppc32_ctx_t *ctx)
+{
+    g_emit_owner = ctx;
+    ppc32_dbt_set_emitter(emit_bridge_fn);
+}
 
 int main(int argc, char **argv)
 {
@@ -168,30 +204,23 @@ int main(int argc, char **argv)
     ctx.guest_argv = &argv[path_idx];
     ctx.host_envp = environ;
 
-    /* RC1: interp engine live; dbt and --difftest arrive in Phase 2. */
+    /* RC2: interp + dbt engines live; --difftest runs dbt-vs-interp. */
     if (getenv("PPC32RT_ENGINE") == NULL && ctx.engine < 0) {
         ctx.engine = PPC32_ENGINE_INTERP; /* default oracle */
     }
-    if (ctx.engine == PPC32_ENGINE_DBT) {
-        fprintf(stderr, "ppc32rt: engine dbt not implemented until Phase 2\n");
-        return 2;
-    }
     if (ctx.difftest) {
-        fprintf(stderr, "ppc32rt: --difftest not implemented until Phase 2\n");
-        return 2;
+        return run_difftest(&ctx);
+    }
+    if (ctx.engine == PPC32_ENGINE_DBT) {
+        return run_dbt(&ctx);
     }
     return run_interp(&ctx);
 }
 
-/*
- * RC1 interp driver: reserve the [G, G+4GiB) window, load the guest ELF,
- * set up the initial stack, and run interp_run <-> syscall dispatch until
- * a terminal exit. exit/exit_group return the guest status byte.
- */
-static int run_interp(ppc32_ctx_t *ctx)
+/* Shared guest load: reserve the window, load the ELF, set up the stack,
+ * and park nip/sp at the entry point. Returns 0 on success. */
+static int guest_load(ppc32_ctx_t *ctx, ppc32_elf_info_t *info, uint32_t *sp)
 {
-    ppc32_elf_info_t info;
-    uint32_t sp;
     int fd;
 
     ppc32_host_probe(ctx);
@@ -205,20 +234,49 @@ static int run_interp(ppc32_ctx_t *ctx)
         return 1;
     }
     /* ppc32_elf_load closes fd (success and failure paths). */
-    if (ppc32_elf_load(ctx, fd, ctx->exec_path, &info) != 0) {
+    if (ppc32_elf_load(ctx, fd, ctx->exec_path, info) != 0) {
         return 1;
     }
-    if (ppc32_stack_setup(ctx, &info, ctx->guest_argc, ctx->guest_argv,
-            ctx->host_envp, &sp) != 0) {
+    if (ppc32_stack_setup(ctx, info, ctx->guest_argc, ctx->guest_argv,
+            ctx->host_envp, sp) != 0) {
         fprintf(stderr, "ppc32rt: stack setup failed\n");
         return 1;
     }
-    ctx->nip = info.entry;
-    ctx->gpr[PPC32_REG_SP] = sp;
+    ctx->nip = info->entry;
+    ctx->gpr[PPC32_REG_SP] = *sp;
     ctx->exit_reason = PPC32_EXIT_NONE;
-    for (;;) {
-        uint32_t nr;
+    return 0;
+}
 
+/* Dispatch one stopped-at-sc state; returns guest status on exit calls. */
+static int syscall_dispatch(ppc32_ctx_t *ctx, int *status)
+{
+    uint32_t nr = ctx->gpr[0];
+
+    if (ppc32_syscall_is_exit(nr)) {
+        ppc32_syscall(ctx);
+        *status = (int)(ctx->exit_arg & 0xFFU);
+        return 1;
+    }
+    ppc32_syscall(ctx);
+    ctx->exit_reason = PPC32_EXIT_NONE;
+    return 0;
+}
+
+/*
+ * RC1 interp driver: guest_load, then interp_run <-> syscall dispatch
+ * until a terminal exit. exit/exit_group return the guest status byte.
+ */
+static int run_interp(ppc32_ctx_t *ctx)
+{
+    ppc32_elf_info_t info;
+    uint32_t sp;
+    int status;
+
+    if (guest_load(ctx, &info, &sp) != 0) {
+        return 1;
+    }
+    for (;;) {
         interp_run(ctx);
         if (ctx->exit_reason == PPC32_EXIT_NONE) {
             continue; /* budget/page stop: keep going */
@@ -228,12 +286,260 @@ static int run_interp(ppc32_ctx_t *ctx)
                 ctx->exit_reason, ctx->nip);
             return 1;
         }
-        nr = ctx->gpr[0];
-        if (ppc32_syscall_min_is_exit(nr)) {
-            ppc32_syscall_min(ctx);
-            return (int)(ctx->exit_arg & 0xFFU);
+        if (syscall_dispatch(ctx, &status) != 0) {
+            return status;
         }
-        ppc32_syscall_min(ctx);
-        ctx->exit_reason = PPC32_EXIT_NONE;
+    }
+}
+
+/*
+ * RC2 dbt driver: same load, then dbt_run <-> syscall dispatch. The L2c
+ * integer emitter is installed via the bridge; anything it refuses
+ * falls back to interp_step inside dbt_run.
+ */
+static int run_dbt(ppc32_ctx_t *ctx)
+{
+    ppc32_elf_info_t info;
+    uint32_t sp;
+    int status;
+
+    if (guest_load(ctx, &info, &sp) != 0) {
+        return 1;
+    }
+    emit_bridge_install(ctx);
+    for (;;) {
+        dbt_run(ctx);
+        if (ctx->exit_reason == PPC32_EXIT_NONE) {
+            continue;
+        }
+        if (ctx->exit_reason != PPC32_EXIT_SYSCALL) {
+            fprintf(stderr, "ppc32rt: stopped, reason %u at nip 0x%08X\n",
+                ctx->exit_reason, ctx->nip);
+            return 1;
+        }
+        if (syscall_dispatch(ctx, &status) != 0) {
+            return status;
+        }
+    }
+}
+
+/* Snapshot of one initially-writable guest region for difftest reset. */
+typedef struct {
+    uint32_t start;
+    uint32_t len;
+    uint8_t *bytes;
+} difftest_snap_t;
+
+/* Per-segment snapshot of every writable tracked region (stack, heap,
+ * image data). The two engines share one window and the oracle runs
+ * ahead, so without a restore the DUT would read the oracle's later
+ * writes (RC2: glibc reused an LR save slot across a segment boundary
+ * and the DUT returned into __tls_init_tp instead of its caller).
+ * The snapshot is refreshed after load and after every syscall dispatch
+ * (brk/mmap can reshape the region table); restoring before each DUT
+ * segment reverts exactly the oracle's segment writes. Any writable
+ * region that cannot be captured (cap or 16 MiB limit) aborts loudly
+ * via *incomplete instead of silently mis-comparing. */
+#define DIFFTEST_SNAP_CAP 64U
+static size_t difftest_snapshot(ppc32_ctx_t *ctx, difftest_snap_t *segs,
+    size_t cap, bool *incomplete)
+{
+    size_t n = 0U;
+    size_t i;
+
+    if (incomplete != NULL) {
+        *incomplete = false;
+    }
+    for (i = 0U; i < ctx->region_count; i++) {
+        uint32_t start = ctx->regions[i].start;
+        uint32_t end = ctx->regions[i].end;
+
+        if (end <= start || (ctx->regions[i].prot & 0x2U) == 0U) {
+            continue;
+        }
+        if (n >= cap ||
+            (uint64_t)end - (uint64_t)start > 16ULL * 1024ULL * 1024ULL) {
+            if (incomplete != NULL) {
+                *incomplete = true;
+            }
+            break;
+        }
+        segs[n].start = start;
+        segs[n].len = end - start;
+        segs[n].bytes = malloc(segs[n].len);
+        if (segs[n].bytes == NULL) {
+            if (incomplete != NULL) {
+                *incomplete = true;
+            }
+            break;
+        }
+        memcpy(segs[n].bytes, ppc32_guest_ptr(ctx, start), segs[n].len);
+        n++;
+    }
+    return n;
+}
+
+static void difftest_snap_free(difftest_snap_t *segs, size_t n)
+{
+    size_t i;
+
+    for (i = 0U; i < n; i++) {
+        free(segs[i].bytes);
+        segs[i].bytes = NULL;
+        segs[i].len = 0U;
+    }
+}
+
+static void difftest_restore(ppc32_ctx_t *ctx, difftest_snap_t *segs,
+    size_t n)
+{
+    size_t i;
+
+    for (i = 0U; i < n; i++) {
+        memcpy(ppc32_guest_ptr(ctx, segs[i].start), segs[i].bytes,
+            segs[i].len);
+    }
+}
+
+/* Copy the dispatched-syscall outcome (and VM mirrors) from the oracle
+ * ctx to the DUT ctx after a shared dispatch. */
+static void difftest_sync_dut(ppc32_ctx_t *dut, const ppc32_ctx_t *ref)
+{
+    size_t i;
+
+    for (i = 0U; i < 32U; i++) {
+        dut->gpr[i] = ref->gpr[i];
+    }
+    dut->nip = ref->nip;
+    dut->lr = ref->lr;
+    dut->ctr = ref->ctr;
+    dut->cr = ref->cr;
+    dut->xer = ref->xer;
+    dut->exit_arg = ref->exit_arg;
+    dut->brk_base = ref->brk_base;
+    dut->brk_curr = ref->brk_curr;
+    dut->mmap_cursor = ref->mmap_cursor;
+    dut->region_count = ref->region_count;
+    if (ref->region_count > 0U) {
+        memcpy(dut->regions, ref->regions,
+            ref->region_count * sizeof(dut->regions[0]));
+    }
+    dut->exit_reason = PPC32_EXIT_NONE;
+}
+
+/*
+ * RC2 differential driver: the interp oracle (ref) and the dbt DUT share
+ * one window/memory and run to the same syscall boundaries, where full
+ * architectural state is compared with difftest_check. Each syscall is
+ * dispatched ONCE (on ref; effects are shared memory) and the outcome
+ * is synced into the DUT. Prints DIFFTEST: EQUAL/DIVERGENCE.
+ */
+static int run_difftest(ppc32_ctx_t *ctx)
+{
+    static ppc32_ctx_t ref;
+    ppc32_elf_info_t info;
+    uint32_t sp;
+    int mismatches = 0;
+    uint64_t bounds = 1000000ULL;
+
+    if (guest_load(ctx, &info, &sp) != 0) {
+        return 1;
+    }
+    emit_bridge_install(ctx);
+    memset(&ref, 0, sizeof(ref));
+    ref.guest_base = ctx->guest_base;
+    ref.vm_ready = true;
+    ref.profile = ctx->profile;
+    ref.host_info = ctx->host_info;
+    ref.nip = info.entry;
+    ref.gpr[PPC32_REG_SP] = sp;
+    ref.exit_reason = PPC32_EXIT_NONE;
+    /* Prime the ref VM mirrors from the shared globals. */
+    ref.brk_base = ctx->brk_base;
+    ref.brk_curr = ctx->brk_curr;
+    ref.mmap_cursor = ctx->mmap_cursor;
+    ref.region_count = ctx->region_count;
+    if (ctx->region_count > 0U) {
+        memcpy(ref.regions, ctx->regions,
+            ctx->region_count * sizeof(ref.regions[0]));
+    }
+    difftest_snap_t snap[DIFFTEST_SNAP_CAP];
+    bool incomplete = false;
+    size_t snap_n = difftest_snapshot(ctx, snap, DIFFTEST_SNAP_CAP,
+        &incomplete);
+    if (incomplete) {
+        printf("DIFFTEST: INCONCLUSIVE (snapshot gap at load)\n");
+        difftest_snap_free(snap, snap_n);
+        return 2;
+    }
+    for (;;) {
+        uint32_t stop_pc;
+
+        if (bounds-- == 0ULL) {
+            printf("DIFFTEST: INCONCLUSIVE (driver bound)\n");
+            difftest_snap_free(snap, snap_n);
+            return 2;
+        }
+        while (ref.exit_reason == PPC32_EXIT_NONE) {
+            interp_run(&ref);
+        }
+        /* Revert the oracle's segment writes so the DUT starts the
+         * segment from the exact post-boundary state (see
+         * difftest_snapshot). */
+        difftest_restore(ctx, snap, snap_n);
+        while (ctx->exit_reason == PPC32_EXIT_NONE) {
+            dbt_run(ctx);
+        }
+        if (ref.exit_reason != ctx->exit_reason) {
+            printf("DIFFTEST: DIVERGENCE stop-reason interp=%u dbt=%u\n",
+                ref.exit_reason, ctx->exit_reason);
+            difftest_snap_free(snap, snap_n);
+            return 1;
+        }
+        stop_pc = ref.nip;
+        difftest_check(&ref, ctx, stop_pc, &mismatches);
+        if (mismatches != 0) {
+            printf("DIFFTEST: DIVERGENCE mismatches=%d\n", mismatches);
+            difftest_snap_free(snap, snap_n);
+            return 1;
+        }
+        if (ref.exit_reason == PPC32_EXIT_SYSCALL) {
+            uint32_t nr = ref.gpr[0];
+
+            if (nr != ctx->gpr[0]) {
+                printf("DIFFTEST: DIVERGENCE syscall-nr interp=%u dbt=%u\n",
+                    nr, ctx->gpr[0]);
+                difftest_snap_free(snap, snap_n);
+                return 1;
+            }
+            if (ppc32_syscall_is_exit(nr)) {
+                int rst;
+
+                ppc32_syscall(&ref);
+                rst = (int)(ref.exit_arg & 0xFFU);
+                printf("DIFFTEST: EQUAL exit=%d\n", rst);
+                difftest_snap_free(snap, snap_n);
+                return rst;
+            }
+            ppc32_syscall(&ref);
+            difftest_sync_dut(ctx, &ref);
+            /* Dispatch can reshape memory (brk/mmap/mprotect): refresh
+             * the snapshot so the next restore reverts the oracle's
+             * next-segment writes against the true post-dispatch state. */
+            difftest_snap_free(snap, snap_n);
+            snap_n = difftest_snapshot(ctx, snap, DIFFTEST_SNAP_CAP,
+                &incomplete);
+            if (incomplete) {
+                printf("DIFFTEST: INCONCLUSIVE (snapshot gap)\n");
+                difftest_snap_free(snap, snap_n);
+                return 2;
+            }
+            ref.exit_reason = PPC32_EXIT_NONE;
+            continue;
+        }
+        printf("DIFFTEST: DIVERGENCE stop-reason %u at nip 0x%08X\n",
+            ref.exit_reason, ref.nip);
+        difftest_snap_free(snap, snap_n);
+        return 1;
     }
 }

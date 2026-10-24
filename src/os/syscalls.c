@@ -186,6 +186,20 @@ static long sys_close(uint32_t fd)
     return 0;
 }
 
+/* RC2: glibc remove() lowers to classic unlink(10) (qemu-strace proven). */
+static long sys_unlink(ppc32_ctx_t *ctx, uint32_t path_va)
+{
+    char path[PPC32_PATH_MAX];
+
+    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
+        return -EFAULT;
+    }
+    if (unlink(path) != 0) {
+        return -(long)errno;
+    }
+    return 0;
+}
+
 static long sys_lseek(uint32_t fd, uint32_t offset, uint32_t whence)
 {
     off_t r = lseek((int)fd, (off_t)(int32_t)offset, (int)whence);
@@ -622,6 +636,9 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         break;
     case PPC32_NR_CLOSE:
         ret = sys_close(a0);
+        break;
+    case PPC32_NR_UNLINK:
+        ret = sys_unlink(ctx, a0);
         break;
     case PPC32_NR_LSEEK:
         ret = sys_lseek(a0, a1, a2);

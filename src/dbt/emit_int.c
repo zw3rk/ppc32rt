@@ -170,18 +170,38 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         ei_xer_ca_reg(b, EI_B);
         break;
     case PPC32_OP_ADDE:
+        /* R = A+B+CA_old; C = carry(A+B) | carry((A+B)+CA_old). The
+         * adc carry-in would double-count carry(A+B) (RC2: qsort
+         * mis-sorted once __internal_syscall_cancel ran), so both
+         * carries are materialized and ORed instead. */
         ei_ld_ca(b, EI_T);
-        a64_emit_add_reg_w(b, true, EI_T2, EI_A, EI_B, A64_SHIFT_LSL, 0U);
-        a64_emit_adc_w(b, true, EI_R, EI_T2, EI_T);
-        ei_xer_ca_from_c(b);
+        a64_emit_add_reg_w(b, false, EI_T2, EI_A, EI_B, A64_SHIFT_LSL,
+            0U);
+        a64_emit_add_reg_w(b, true, EI_R, EI_T2, EI_T, A64_SHIFT_LSL,
+            0U);
+        ei_cset(b, EI_X, A64_COND_CS); /* X = carry(T2+CA_old) */
+        ei_cmp_reg(b, EI_T2, EI_A); /* C = (T2>=A) = !carry(A+B) */
+        ei_cset(b, EI_T, A64_COND_CC); /* T = carry(A+B) */
+        a64_emit_orr_reg_w(b, EI_T, EI_X, EI_T, A64_SHIFT_LSL, 0U);
+        ei_xer_ca_reg(b, EI_T);
         break;
-    case PPC32_OP_SUBFE: /* wide = (b - a) + CA - 1: carry = (t >= 1-CA) */
+    case PPC32_OP_SUBFE: /* R = (B-A) - (1-CA). The first sub may
+        * borrow (B<A) and the flags-free sub drops that borrow, so the
+        * second sub's carry alone is wrong (RC2: subfe CA stuck at 1
+        * whenever B<A, e.g. the addic/subfe zero-test idiom with input
+        * 0 in _int_malloc/_IO paths). CA = C1 & C2 with C1 = (B>=A)
+        * from the first sub and C2 = (t>=1-CA) from the second: when
+        * B<A the true difference is negative and can never reach
+        * (1-CA) in {0,1}, so C1 gates correctly. */
         ei_ld_ca(b, EI_T);
-        a64_emit_sub_reg_w(b, false, EI_R, EI_B, EI_A, A64_SHIFT_LSL, 0U);
-        a64_emit_mov_imm32(b, EI_T2, 1U);
-        a64_emit_sub_reg_w(b, false, EI_T2, EI_T2, EI_T, A64_SHIFT_LSL, 0U);
-        a64_emit_sub_reg_w(b, true, EI_R, EI_R, EI_T2, A64_SHIFT_LSL, 0U);
-        ei_xer_ca_from_c(b);
+        a64_emit_sub_reg_w(b, true, EI_R, EI_B, EI_A, A64_SHIFT_LSL, 0U);
+        ei_cset(b, EI_T2, A64_COND_CS); /* T2 = C1 = (B>=A) */
+        a64_emit_mov_imm32(b, EI_X, 1U);
+        a64_emit_sub_reg_w(b, false, EI_X, EI_X, EI_T, A64_SHIFT_LSL, 0U);
+        a64_emit_sub_reg_w(b, true, EI_R, EI_R, EI_X, A64_SHIFT_LSL, 0U);
+        ei_cset(b, EI_X, A64_COND_CS); /* X = C2 = (t>=1-CA) */
+        a64_emit_and_reg_w(b, false, EI_T, EI_T2, EI_X, A64_SHIFT_LSL, 0U);
+        ei_xer_ca_reg(b, EI_T);
         break;
     case PPC32_OP_ADDZE:
         ei_ld_ca(b, EI_T);
@@ -661,7 +681,7 @@ static int ei_stwcx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     fb_idx = b->count;
     ppc32_emit_fallback(e, pc);
     a64_patch_b_cond(b, patch_mis, fb_idx);
-    a64_patch_b_cond(b, patch_done, fail_idx);
+    a64_patch_b_cond(b, patch_done, fail_idx + 1U); /* over movz to tail */
     a64_patch_b_cond(b, patch_skip, b->count);
     return PPC32_EMIT_NEXT;
 }

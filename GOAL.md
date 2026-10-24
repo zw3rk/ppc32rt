@@ -47,11 +47,11 @@ Write `docs/lanes/phase-1.md` and run concurrent lanes `L1a..L1d`:
 
 ### Phase 2 — Static Libc Syscalls & Base Integer AArch64 DBT (`src/dbt/`) (`RC2`)
 Write `docs/lanes/phase-2.md` and run concurrent lanes `L2a..L2d`:
-- [ ] **Lane `L2a`**: Complete static-libc Linux syscall & struct conversion layer (`src/os/syscalls.c`, `stat`/`stat64`/`statx`, `iovec`, `openat`, `fcntl`, `clock_gettime`, `getrandom`, `futex`, `rt_sigprocmask`, `ioctl`).
-- [ ] **Lane `L2b`**: AArch64 DBT core (`src/dbt/dbt.c`, `src/dbt/trampoline_a64.S`, direct block chaining, 4096-entry IBTC, RAS, D2 `EXIT_UNDEF`/`EXIT_SINGLE_STEP` interpreter fallback).
-- [ ] **Lane `L2c`**: AArch64 integer instruction emitter (`src/dbt/emit_int.c`).
-- [ ] **Lane `L2d`**: Differential harness (`--difftest`) + static libc test suite (`hello`, `printf`, `malloc`, `qsort`, file I/O).
-- [ ] **Gate `RC2`**: `--difftest` reports `0` register/PC mismatches between `interp` and `dbt` on `test_p1_isa` and static libc binaries; outputs match `qemu-ppc (with -cpu 750 and -cpu e500v2)`.
+- [x] **Lane `L2a`**: Complete static-libc Linux syscall & struct conversion layer (`src/os/syscalls.c`, `stat`/`stat64`/`statx`, `iovec`, `openat`, `fcntl`, `clock_gettime`, `getrandom`, `futex`, `rt_sigprocmask`, `ioctl`).
+- [x] **Lane `L2b`**: AArch64 DBT core (`src/dbt/dbt.c`, `src/dbt/trampoline_a64.S`, direct block chaining, 4096-entry IBTC, RAS, D2 `EXIT_UNDEF`/`EXIT_SINGLE_STEP` interpreter fallback).
+- [x] **Lane `L2c`**: AArch64 integer instruction emitter (`src/dbt/emit_int.c`).
+- [x] **Lane `L2d`**: Differential harness (`--difftest`) + static libc test suite (`hello`, `printf`, `malloc`, `qsort`, file I/O).
+- [x] **Gate `RC2`**: `--difftest` reports `0` register/PC mismatches between `interp` and `dbt` on `test_p1_isa` and static libc binaries; outputs match `qemu-ppc (with -cpu 750 and -cpu e500v2)` (verified: `p1` PASS on 750 + e500v2 + interp + dbt + difftest EQUAL incl. new subfe sites 50-55; `p2` PASS on 750 + interp + dbt + difftest EQUAL; `p2` under `qemu-ppc -cpu e500v2` cannot start in this container — Debian libc IFUNC selects `__vmx_setjmp`, whose VMX insns are illegal on e500v2; guest-side only, `ppc32rt` advertises no VMX HWCAP and is unaffected).
 
 ### Phase 3 — Floating-Point & SIMD (`src/interp/fp.c`, `src/dbt/emit_fp.c`) (`RC3`)
 Write `docs/lanes/phase-3.md` and run concurrent lanes `L3a..L3c`:

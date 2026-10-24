@@ -130,7 +130,10 @@
 #define PPC32_NR_VFORK           190U
 #define PPC32_NR_FUTEX           221U
 #define PPC32_NR_SET_TID_ADDRESS 232U
-#define PPC32_NR_EXIT_GROUP      272U
+/* RC2: exit_group is 234 (glibc _exit does li r0,234; the old 272 value
+ * belongs to no ppc32 call and sent every guest exit into the ENOSYS
+ * trap slot). Grounded against the linked glibc binary + qemu oracle. */
+#define PPC32_NR_EXIT_GROUP      234U
 
 /* Sockets / IPC multiplexors */
 #define PPC32_NR_SOCKETCALL      102U

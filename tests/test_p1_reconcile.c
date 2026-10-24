@@ -47,6 +47,30 @@ static void put_insn(ppc32_ctx_t *ctx, uint32_t word)
     mem[3] = (uint8_t)word;
 }
 
+/* Store 8 big-endian bytes at a guest offset (FP test patterns). */
+static void put_data(ppc32_ctx_t *ctx, uint32_t off, uint64_t v)
+{
+    uint8_t *mem = (uint8_t *)(uintptr_t)(uint64_t)ctx->guest_base;
+    uint32_t i;
+
+    for (i = 0U; i < 8U; i++) {
+        mem[off + i] = (uint8_t)(v >> (56U - i * 8U));
+    }
+}
+
+static void expect64(const char *name, uint64_t got, uint64_t want)
+{
+    if (got != want) {
+        printf("FAIL %-18s got 0x%08X%08X want 0x%08X%08X\n", name,
+            (uint32_t)(got >> 32U), (uint32_t)got,
+            (uint32_t)(want >> 32U), (uint32_t)want);
+        fails++;
+    } else {
+        printf("ok   %-18s 0x%08X%08X\n", name, (uint32_t)(got >> 32U),
+            (uint32_t)got);
+    }
+}
+
 static ppc32_ctx_t *fresh_ctx(void)
 {
     ppc32_ctx_t *ctx = (ppc32_ctx_t *)calloc(1, sizeof(*ctx));
@@ -105,6 +129,24 @@ int main(void)
     interp_step(ctx);
     expect("sc-exit", ctx->exit_reason, PPC32_EXIT_SYSCALL);
     expect("sc-nip", ctx->nip, 0U);
+
+    /* mfpvr reports the profile PVR (glibc IFUNC dispatch). */
+    ctx->nip = 0;
+    ctx->exit_reason = PPC32_EXIT_NONE;
+    put_insn(ctx, 0x7D3F42A6U); /* mfpvr r9 (GAS-verified) */
+    interp_step(ctx);
+    expect("mfpvr-750", ctx->gpr[9], 0x00080301U);
+    expect("mfpvr-nip", ctx->nip, 4U);
+
+    /* lfd/stfd roundtrip preserves the bit pattern (RC2 FP moves). */
+    ctx->gpr[3] = 0U;
+    put_data(ctx, 0x100U, 0x0102030405060708ULL);
+    ctx->nip = 0;
+    ctx->exit_reason = PPC32_EXIT_NONE;
+    put_insn(ctx, 0xC8A30100U); /* lfd 5,0x100(3) */
+    interp_step(ctx);
+    expect64("lfd-bits", ctx->fpr[5], 0x0102030405060708ULL);
+    expect("lfd-nip", ctx->nip, 4U);
 
     /* ---- interp through the real decoder: addic. carry + CR0 ---- */
     ctx = fresh_ctx();

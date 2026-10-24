@@ -222,11 +222,12 @@ void a64_emit_shift_imm_w(a64_buf_t *b, unsigned dst_w, unsigned src_m, unsigned
         }
     } else if (shift_type == A64_SHIFT_LSR) {
         if (imm5 == 0U) {
+            /* LSR #0 (immediate) is identity: UBFM #0,31. */
             if (want_carry && out_carry_reg) {
                 a64_emit_ubfm_w(b, A64_TMP2, src_m, 31U, 31U);
                 *out_carry_reg = A64_TMP2;
             }
-            a64_emit_movz_w(b, dst_w, 0U, 0U);
+            a64_emit_mov_w(b, dst_w, src_m);
         } else {
             if (want_carry && out_carry_reg) {
                 a64_emit_ubfm_w(b, A64_TMP2, src_m, imm5 - 1U, imm5 - 1U);

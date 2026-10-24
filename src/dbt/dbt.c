@@ -89,6 +89,7 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
 
     a64_buf_init(&b, staging, 4096U);
     b.guest_start_pc = pc;
+    bool end_is_control = false;
     for (n = 0U; n < PPC32_DBT_BLOCK_BUDGET; n++) {
         uint32_t raw;
         ppc32_insn_t insn;
@@ -119,6 +120,7 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
             }
             /* Partial block: valid fallthrough-chaining tail. */
             a64_emit_exit_branch(&b, cur);
+            end_is_control = true;
             break;
         }
         cur += 4U;
@@ -126,8 +128,15 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
             break;
         }
         if (is_block_end(insn.op)) {
+            end_is_control = true;
             break;
         }
+    }
+    if (!b.overflow && b.count > 0U && !end_is_control) {
+        /* Page-cross / budget fallthrough: terminate with an explicit
+         * exit to cur (RC2: unterminated blocks ran off into zero
+         * padding and died with host SIGILL). Enables chaining. */
+        a64_emit_exit_branch(&b, cur);
     }
     if (b.overflow || b.count == 0U) {
         /* Overflow or empty (page-crossed at once): single-step via
