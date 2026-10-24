@@ -33,9 +33,9 @@ Read [`docs/lanes/phase-e.md`](docs/lanes/phase-e.md) and run concurrent experim
 
 ### Phase 0 — Repository Scaffold, Frozen Headers & Substrate Copy (`RC0`)
 Read [`docs/lanes/phase-0.md`](docs/lanes/phase-0.md) and run lanes `L0a..L0b`:
-- [ ] **Lane `L0a`**: Copy and adapt `src/rt32/ from ../i686rt`, create `flake.nix`, `Makefile`, `src/ppc32rt.h`, and CLI entry (`--version`, `--help`, `--interp`, `--dbt`, `--difftest`, `--trace`).
-- [ ] **Lane `L0b`**: Create `tests/check_abi_invariants.c` verifying all `ppc32_ctx_t`, `sigframe`, `ucontext`, and `stat` `sizeof`/`offsetof` invariants with `_Static_assert` and runtime checks.
-- [ ] **Gate `RC0`**: `_build/ppc32rt` builds cleanly as a static-PIE `aarch64-unknown-linux-musl` binary; `make check-line-limits` (`<= 900 LOC`) and `check_abi_invariants` pass.
+- [x] **Lane `L0a`**: Copy and adapt `src/rt32/ from ../i686rt`, create `flake.nix`, `Makefile`, `src/ppc32rt.h`, and CLI entry (`--version`, `--help`, `--interp`, `--dbt`, `--difftest`, `--trace`).
+- [x] **Lane `L0b`**: Create `tests/check_abi_invariants.c` verifying all `ppc32_ctx_t`, `sigframe`, `ucontext`, and `stat` `sizeof`/`offsetof` invariants with `_Static_assert` and runtime checks.
+- [x] **Gate `RC0`**: `_build/ppc32rt` builds cleanly as a static-PIE `aarch64-unknown-linux-musl` binary; `make check-line-limits` (`<= 900 LOC`) and `check_abi_invariants` pass.
 
 ### Phase 1 — Base Integer Decoder, Reference Interpreter (`src/interp/`) & Minimal Syscalls (`RC1`)
 Write `docs/lanes/phase-1.md` and run concurrent lanes `L1a..L1d`:
