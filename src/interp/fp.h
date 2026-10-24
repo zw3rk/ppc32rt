@@ -4,17 +4,11 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Classic FPU (750): lfs/lfd/stfs/stfd (+update/indexed), fadd[s]/
- * fsub[s]/fmul[s]/fdiv[s]/fsqrt[s], fused fmadd[s]/fmsub[s]/fnmadd[s]/
- * fnmsub[s], fcmpu/fcmpo (Rc=1 updates CR1), fctiw[z], frsp, fabs/
- * fnabs/fneg/fmr/fsel, mffs/mtfsf with FPSCR. fres/frsqrte are UNDEF.
- * Classic 32-bit insns never touch gpr_hi. e500v2 SPE (major opcode 4,
- * full 11-bit XO): evaddw/evsubfw/evand/evor/evxor/evmr/evmerge group,
- * evld and evstd groups, evlwhe[x]/evlwhos[x]/evlwhou[x]/evstwwe[x]/
- * evstww o[x]/evsel/evmra/MAC, scalar efs and efd groups, vector evfs
- * group. MAC traps on the qemu-ppc oracle, so it is per-EREF
- * (unverifiable via oracle). XO values are gas+objdump verified
- * (binutils 2.42) against qemu-ppc 8.2.2 sources.
+ * Classic FPU (750): full data-move/arithmetic/compare/convert/move/
+ * FPSCR set (fres/frsqrte UNDEF; 32-bit insns never touch gpr_hi).
+ * e500v2 SPE (major opcode 4, full 11-bit XO): integer/logical/merge/
+ * ldst/compare/select, scalar efs/efd, vector evfs, MAC (per-EREF:
+ * traps on the qemu oracle). XOs gas+objdump verified.
  */
 
 #ifndef PPC32_FP_H
@@ -33,6 +27,8 @@
  * PPC32_EXIT_UNDEF. Classic FPU data moves keep RC2 behavior, except
  * lfs/stfs now do true single<->double conversion (hardware parity). */
 void ppc32_fp_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn);
+/* e500v2 SPE worker (fp_spe.c); called by ppc32_fp_step. */
+void fp_spe(ppc32_ctx_t *ctx, const ppc32_insn_t *insn);
 
 /* ---- shared inline helpers (fp.c implementation detail) ------------ */
 
@@ -360,7 +356,7 @@ static inline uint32_t fp_qnan32(uint64_t n)
 
 static inline int fp_rn(const ppc32_ctx_t *ctx)
 {
-    return (int)(ctx->fpscr & 3u);
+    return (int)(ctx->fpscr & 3u); /* RN: FPSCR bits 0-1. */
 }
 
 static inline void fp_setrn(int rn)
@@ -763,6 +759,7 @@ static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
 #define PPC32_FD_FABS 264u
 #define PPC32_FD_MFFS 583u
 #define PPC32_FD_MTFSF 711u
+#define PPC32_FD_MTFSFI 134u
 
 /* ---- e500v2 SPE integer/logical/merge (full 11-bit XO) --------------- */
 #define PPC32_SPE_EVADDW 512u

@@ -845,7 +845,7 @@ void interp_step(ppc32_ctx_t *ctx)
         ctx->nip += 4U;
         break;
     }
-    /* ---- classic-FPU data moves (RC2 subset in interp/fp.c) --------- */
+    /* ---- classic-FPU data moves + Phase 3 FP/SPE (interp/fp.c) ----- */
     case PPC32_OP_LFS:
     case PPC32_OP_LFSU:
     case PPC32_OP_LFD:
@@ -854,6 +854,10 @@ void interp_step(ppc32_ctx_t *ctx)
     case PPC32_OP_STFSU:
     case PPC32_OP_STFD:
     case PPC32_OP_STFDU:
+    case PPC32_OP_FPU_SINGLE:
+    case PPC32_OP_FPU_DOUBLE:
+    case PPC32_OP_FPU_X:
+    case PPC32_OP_SPE:
         ppc32_fp_step(ctx, &insn);
         break;
     default:

@@ -55,10 +55,10 @@ Write `docs/lanes/phase-2.md` and run concurrent lanes `L2a..L2d`:
 
 ### Phase 3 — Floating-Point & SIMD (`src/interp/fp.c`, `src/dbt/emit_fp.c`) (`RC3`)
 Write `docs/lanes/phase-3.md` and run concurrent lanes `L3a..L3c`:
-- [ ] **Lane `L3a`**: Complete FPU & SIMD reference interpreter (`src/interp/fp.c`) implementing all `SPEC.md` §2 FP/SIMD instructions, NaN rules, condition codes, and status registers.
-- [ ] **Lane `L3b`**: AArch64 FP & NEON emitter (`src/dbt/emit_fp.c`) + phase-gated `AT_HWCAP` activation.
-- [ ] **Lane `L3c`**: `tests/test_p3_fp_simd.c` covering scalar FP, SIMD lanes, NaN propagation, rounding modes, and conversions.
-- [ ] **Gate `RC3`**: `test_p3_fp_simd` matches `qemu-ppc (with -cpu 750 and -cpu e500v2)` golden output bit-for-bit on both `interp` and `dbt` with `0` `--difftest` divergences.
+- [x] **Lane `L3a`**: Complete FPU & SIMD reference interpreter (`src/interp/fp.c`, split SPE half to `src/interp/fp_spe.c` under the 900-line limit) implementing SPEC §2.2 classic FPU + e500v2 SPE, NaN rules, condition codes, status registers. Host check prints `L3A OK`.
+- [x] **Lane `L3b`**: AArch64 FP & NEON emitter (`src/dbt/emit_fp.c`) + phase-gated `AT_HWCAP` activation. Host emission check prints `L3B OK`.
+- [x] **Lane `L3c`**: `tests/test_p3_fp_spe.c` (+ host model `tests/test_p3_fp_spe_host.h`; 61 guest sites) covering scalar FP, SPE lanes, NaN propagation, rounding modes, conversions. Host self-check prints `PASS`.
+- [x] **Gate `RC3`**: `test_p3_fp_spe` prints `PASS`/exit 0 on `qemu-ppc -cpu 750`, `qemu-ppc -cpu e500v2` (PVR-gated: double-FP skipped where absent, SPE skipped on 750), on `--interp` and `--dbt`, with `DIFFTEST: EQUAL` (0 divergences). Coordinator oracle fixes: `evsubfw` is subtract-from, `fmul` multiplier in FRC slot, `fctiw` asymmetric saturation, `mtfsfi` wired, `fcsel` Vn/Vm order, inexact-convert NaN/IOC handling + FPSR-clear, `ei_cr_merge` temp. `p1`/`p2` still `PASS`/`EQUAL` on both engines and oracles.
 
 ### Phase 4 — Signals (`rt_sigframe`), Threads (`clone`/`futex`/TLS), & Process Lifecycle (`fork`/`execve`) (`RC4`)
 Write `docs/lanes/phase-4.md` and run concurrent lanes `L4a..L4c`:

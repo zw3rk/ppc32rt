@@ -24,6 +24,7 @@ endif
 # and every prescribed warning intact).
 CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 LDFLAGS ?= -static-pie
+LDLIBS ?= -lm # RC3: interp fp.c fsqrt uses host sqrt(3)
 
 # Until the Phase 2 DBT lands there is no src/dbt/*.c; compile the carried
 # a64 emitter out of the JIT-call path so the link never references the
@@ -56,7 +57,7 @@ build: $(PPC32RT_BIN) ## Build static-PIE aarch64-linux ppc32rt binary
 
 $(PPC32RT_BIN): $(OBJS)
 	@printf "\033[32m▸ Linking\033[0m $@\n"
-	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) $(LDLIBS) -o $@
 	@ln -sf ppc32rt $(BUILD_DIR)/ppc32rt-binfmt-p
 
 $(OBJ_DIR)/%.o: src/%.c $(HDRS)

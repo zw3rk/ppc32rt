@@ -13,15 +13,16 @@
  *
  * FP constants are exact in binary (1.5, 2.25, 3.75, 3.375, 4.875,
  * 2.5, -1.5, 2^62), so every arithmetic expectation is bit-exact.
- * SPE sites need an e500v2 CPU (primary opcode 4 SIGILLs on the
- * classic 750); the classic-FP sites run on either CPU.
+ * CPU dispatch is by mfpvr at entry: e500v2 (no double-precision
+ * FPU) runs the SPE section only; the classic 750 (no SPE primary-4
+ * decoding) runs the classic-FP sites only. Both CPUs print PASS.
  *
  * Target path (#ifdef __powerpc__): pure .text assembly, _start entry,
  * raw sc syscalls (sc = 0x44000002, nr in r0, args in r3..r8).
  * Writes "PASS\n" + exit(0) on success, else "FAIL id=<..> got=<..>
  * want=<..>" + exit(1). No TOC use (PC-relative via bl/mflr), so no
  * startup files are needed beyond -nostdlib -static. The SPE section
- * is wrapped in .machine push/e500v2/pop so the default classic
+ * is wrapped in .machine push/e500/pop so the default classic
  * toolchain still assembles the file. Build (coordinator runs it):
  *   powerpc-linux-gnu-gcc -std=c11 -Wall -Wextra -ffreestanding \
  *     -static -nostdlib -O2 -fno-pie -no-pie -fno-stack-protector \
@@ -52,6 +53,9 @@
  * f3/f4 = results, f5/f6 = NaN operands.
  * SPE plan: r14-r17 (never touched by the classic section, so their
  * gpr_hi upper halves stay 0 until SPE insns run).
+ * CPU plan: r30/r29 hold (PVR>>16)/0x8021 at entry; classic double-FP
+ * sites run only off-e500v2 (no DPFP there), the SPE section only on
+ * e500v2 (primary-4 SIGILLs on the 750). Both CPUs print PASS.
  * check_eq(r3=got, r4=want, r5=site id) preserves r6-r12/r31/FPRs.
  */
 __asm__(
@@ -63,6 +67,13 @@ __asm__(
 "getpc:\n"
 "    mflr 31\n"
 "    addi 1,1,-64\n"
+/* ---- CPU detect: e500v2 (PVR>>16 == 0x8021) runs SPE only ---- */
+"    mfpvr 30\n"
+"    srwi 30,30,16\n"
+"    lis 29,0x8021\n"
+"    srwi 29,29,16\n"
+"    cmpw 30,29\n"
+"    beq spe_begin\n"
 /* ---- load f1=1.5, f2=2.25 ---- */
 "    lis 3,0x3FF8\n"
 "    stw 3,16(1)\n"
@@ -118,7 +129,12 @@ __asm__(
 "    li 4,0\n"
 "    li 5,8\n"
 "    bl check_eq\n"
-/* ---- sites 9-10: fsqrt(2.25) -> 1.5 ---- */
+/* ---- sites 9-10: fsqrt(2.25) -> 1.5 (no fsqrt on 750/e500v2) ---- */
+"    mfpvr 29\n"
+"    srwi 29,29,16\n"
+"    li 30,8\n"
+"    cmpw 29,30\n"
+"    beq no_fsqrt\n"
 "    fsqrt 4,2\n"
 "    stfd 4,32(1)\n"
 "    lwz 3,32(1)\n"
@@ -129,6 +145,7 @@ __asm__(
 "    li 4,0\n"
 "    li 5,10\n"
 "    bl check_eq\n"
+"no_fsqrt:\n"
 /* ---- sites 11-12: fmadd 1.5*2.25+1.5 -> 4.875 ---- */
 "    fmadd 4,1,2,1\n"
 "    stfd 4,32(1)\n"
@@ -352,16 +369,20 @@ __asm__(
 "    li 3,0\n"
 "    stw 3,20(1)\n"
 "    lfd 1,16(1)\n"
-/* ---- site 39: fctiwz(2^62) saturates -> 0x80000000 ---- */
+/* ---- site 39: fctiwz(2^62) saturates -> 0x7FFFFFFF (oracle) ---- */
 "    fctiwz 3,1\n"
 "    stfd 3,32(1)\n"
 "    lwz 3,36(1)\n"
-"    lis 4,0x8000\n"
+"    lis 4,0x7FFF\n"
+"    ori 4,4,0xFFFF\n"
 "    li 5,39\n"
 "    bl check_eq\n"
+/* ---- classic done on non-e500v2: skip the SPE section ---- */
+"    b pass\n"
 /* ---- SPE vector section (e500v2): .machine push/pop ---- */
+"spe_begin:\n"
 "    .machine push\n"
-"    .machine e500v2\n"
+"    .machine e500\n"
 /* ---- build 64-bit vecA={1,2} at 16(1), vecB={3,4} at 24(1) ---- */
 "    li 3,1\n"
 "    stw 3,16(1)\n"
@@ -395,15 +416,16 @@ __asm__(
 "    stw 3,28(1)\n"
 "    evldd 14,16(1)\n"
 "    evldd 15,24(1)\n"
-/* ---- sites 42-43: evsubfw {10,3}-{4,1} -> {6,2} ---- */
+/* ---- sites 42-43: evsubfw is subtract-from (B-A, oracle-proven):
+ * {4,1}-{10,3} -> {-6,-2} ---- */
 "    evsubfw 16,14,15\n"
 "    evstdd 16,32(1)\n"
 "    lwz 3,32(1)\n"
-"    li 4,6\n"
+"    li 4,-6\n"
 "    li 5,42\n"
 "    bl check_eq\n"
 "    lwz 3,36(1)\n"
-"    li 4,2\n"
+"    li 4,-2\n"
 "    li 5,43\n"
 "    bl check_eq\n"
 /* ---- build vecA=vecB={0xF0F0F0F0,F0F0F0F0}/{0x0FF00FF0,0x0FF00FF0} -- */
@@ -576,6 +598,7 @@ __asm__(
 "    bl check_eq\n"
 "    .machine pop\n"
 /* ---- PASS + exit(0) ---- */
+"pass:\n"
 "    addi 3,31,s_pass-getpc\n"
 "    li 4,5\n"
 "    bl print\n"
@@ -661,232 +684,6 @@ __asm__(
 );
 
 #else /* host-native self-check of the expected-output logic */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static uint64_t dbl_bits(double v)
-{
-    uint64_t u = 0u;
-    memcpy(&u, &v, sizeof u);
-    return u;
-}
-
-static uint32_t flt_bits(float v)
-{
-    uint32_t u = 0u;
-    memcpy(&u, &v, sizeof u);
-    return u;
-}
-
-static double bits_dbl(uint32_t hi, uint32_t lo)
-{
-    uint64_t u = ((uint64_t)hi << 32U) | (uint64_t)lo;
-    double v = 0.0;
-    memcpy(&v, &u, sizeof v);
-    return v;
-}
-
-/* CR outcome for fcmpu/fcmpo: 8 LT, 4 GT, 2 EQ, 1 UN (NaN). */
-static uint32_t fcmp_cr(double a, double b)
-{
-    if (a != a || b != b) {
-        return 1u;
-    }
-    if (a < b) {
-        return 8u;
-    }
-    if (a > b) {
-        return 4u;
-    }
-    return 2u;
-}
-
-/* fctiw[z] model: mode 0 = nearest-even, 1 = to-zero, 2 = +inf, 3 = -inf.
- * Out-of-range saturates to 0x80000000, matching the oracle. */
-static uint32_t fctiw_model(double x, int mode)
-{
-    double ax;
-    int64_t mag;
-    double frac;
-    int neg;
-    if (x != x || x >= 2147483648.0 || x < -2147483649.0) {
-        return 0x80000000u;
-    }
-    neg = (x < 0.0) ? 1 : 0;
-    ax = neg ? -x : x;
-    mag = (int64_t)ax;
-    frac = ax - (double)mag;
-    if (mode == 0) {
-        if (frac > 0.5 || (frac == 0.5 && (mag & 1LL) != 0LL)) {
-            mag++;
-        }
-    } else if (mode == 1) {
-        /* truncate: nothing to do */
-    } else if (mode == 2) {
-        if (!neg && frac > 0.0) {
-            mag++;
-        }
-    } else {
-        if (neg && frac > 0.0) {
-            mag++;
-        }
-    }
-    if (neg) {
-        return (uint32_t)(int32_t)(-mag);
-    }
-    return (uint32_t)(int32_t)mag;
-}
-
-/* 64-bit SPE lane pair {hi, lo}. */
-typedef struct {
-    uint32_t hi;
-    uint32_t lo;
-} spe64;
-
-static spe64 spe_add(spe64 a, spe64 b)
-{
-    spe64 r;
-    r.hi = a.hi + b.hi;
-    r.lo = a.lo + b.lo;
-    return r;
-}
-
-static spe64 spe_sub(spe64 a, spe64 b) /* evsubfw: b - a per lane */
-{
-    spe64 r;
-    r.hi = b.hi - a.hi;
-    r.lo = b.lo - a.lo;
-    return r;
-}
-
-static int failures = 0;
-
-#define TEST(name, got, want)                                  \
-    do {                                                       \
-        uint32_t g_ = (uint32_t)(got);                         \
-        uint32_t w_ = (uint32_t)(want);                        \
-        if (g_ != w_) {                                        \
-            printf("FAIL %s got=0x%08x want=0x%08x\n",         \
-                name, g_, w_);                                 \
-            failures++;                                        \
-        }                                                      \
-    } while (0)
-
-int main(void)
-{
-    double d15 = bits_dbl(0x3FF80000u, 0u);
-    double d225 = bits_dbl(0x40020000u, 0u);
-    double d375 = bits_dbl(0x400E0000u, 0u);
-    double d25 = bits_dbl(0x40040000u, 0u);
-    double dm15 = bits_dbl(0xBFF80000u, 0u);
-    double big = bits_dbl(0x43D00000u, 0u); /* 2^62 */
-    double qnan = strtod("NAN", NULL);
-    double snan = bits_dbl(0x7FF00000u, 1u);
-    float f15 = 1.5f;
-    float f225 = 2.25f;
-    float f375 = 3.75f;
-    float f25 = 2.5f;
-    float f125 = 1.25f;
-    spe64 va;
-    spe64 vb;
-    spe64 vr;
-
-    /* Scalar FP arithmetic bit patterns. */
-    TEST("fadd_hi", (uint32_t)(dbl_bits(d15 + d225) >> 32U), 0x400E0000u);
-    TEST("fadd_lo", (uint32_t)dbl_bits(d15 + d225), 0u);
-    TEST("fsub_hi", (uint32_t)(dbl_bits(d375 - d225) >> 32U), 0x3FF80000u);
-    TEST("fsub_lo", (uint32_t)dbl_bits(d375 - d225), 0u);
-    TEST("fmul_hi", (uint32_t)(dbl_bits(d15 * d225) >> 32U), 0x400B0000u);
-    TEST("fmul_lo", (uint32_t)dbl_bits(d15 * d225), 0u);
-    TEST("fdiv_hi", (uint32_t)(dbl_bits(d225 / d15) >> 32U), 0x3FF80000u);
-    TEST("fdiv_lo", (uint32_t)dbl_bits(d225 / d15), 0u);
-    TEST("fsqrt_hi", (uint32_t)(dbl_bits(d225 / d15) >> 32U), 0x3FF80000u);
-    TEST("fmadd_hi", (uint32_t)(dbl_bits(d15 * d225 + d15) >> 32U),
-        0x40138000u);
-    TEST("fmadd_lo", (uint32_t)dbl_bits(d15 * d225 + d15), 0u);
-    TEST("fneg_hi", (uint32_t)(dbl_bits(-d15) >> 32U), 0xBFF80000u);
-    TEST("fneg_lo", (uint32_t)dbl_bits(-d15), 0u);
-    TEST("fabs_hi", (uint32_t)(dbl_bits(-dm15) >> 32U), 0x3FF80000u);
-    TEST("fsel_hi", (uint32_t)(dbl_bits(d15 >= 0.0 ? d225 : d15) >> 32U),
-        0x40020000u);
-    TEST("frsp_hi", (uint32_t)(dbl_bits((double)(float)d375) >> 32U),
-        0x400E0000u);
-
-    /* fcmpo/fcmpu CR outcomes incl. NaN. */
-    TEST("fcmpu_lt", fcmp_cr(d15, d225), 8u);
-    TEST("fcmpu_gt", fcmp_cr(d225, d15), 4u);
-    TEST("fcmpu_eq", fcmp_cr(d15, d15), 2u);
-    TEST("fcmpu_qnan", fcmp_cr(qnan, d15), 1u);
-    TEST("fcmpu_snan", fcmp_cr(d15, snan), 1u);
-    TEST("fcmpo_lt", fcmp_cr(d15, d225), 8u);
-    TEST("fcmpo_qnan", fcmp_cr(qnan, d15), 1u);
-    TEST("fcmpo_snan", fcmp_cr(snan, d15), 1u);
-
-    /* Rounding modes + conversions. */
-    TEST("fctiw_near", fctiw_model(d15, 0), 2u);
-    TEST("fctiwz", fctiw_model(d15, 1), 1u);
-    TEST("fctiwz_neg", fctiw_model(dm15, 1), 0xFFFFFFFFu);
-    TEST("fctiw_neg_half", fctiw_model(dm15, 0), 0xFFFFFFFEu);
-    TEST("fctiw_halfeven", fctiw_model(d25, 0), 2u);
-    TEST("fctiwz_25", fctiw_model(d25, 1), 2u);
-    TEST("fctiw_tozero", fctiw_model(d15, 1), 1u);
-    TEST("fctiw_nearest", fctiw_model(d15, 0), 2u);
-    TEST("fctiw_pinf", fctiw_model(d15, 2), 2u);
-    TEST("fctiw_ninf", fctiw_model(d15, 3), 1u);
-    TEST("fctiw_ovf", fctiw_model(big, 1), 0x80000000u);
-
-    /* SPE vector integer. */
-    va.hi = 1u;
-    va.lo = 2u;
-    vb.hi = 3u;
-    vb.lo = 4u;
-    vr = spe_add(va, vb);
-    TEST("evaddw_hi", vr.hi, 4u);
-    TEST("evaddw_lo", vr.lo, 6u);
-    va.hi = 4u;
-    va.lo = 1u;
-    vb.hi = 10u;
-    vb.lo = 3u;
-    vr = spe_sub(va, vb);
-    TEST("evsubfw_hi", vr.hi, 6u);
-    TEST("evsubfw_lo", vr.lo, 2u);
-    va.hi = 0xF0F0F0F0u;
-    va.lo = 0xF0F0F0F0u;
-    vb.hi = 0x0FF00FF0u;
-    vb.lo = 0x0FF00FF0u;
-    TEST("evand_hi", va.hi & vb.hi, 0x00F000F0u);
-    TEST("evand_lo", va.lo & vb.lo, 0x00F000F0u);
-    TEST("evor_hi", va.hi | vb.hi, 0xFFF0FFF0u);
-    TEST("evor_lo", va.lo | vb.lo, 0xFFF0FFF0u);
-    TEST("evxor_hi", va.hi ^ vb.hi, 0xFF00FF00u);
-    TEST("evxor_lo", va.lo ^ vb.lo, 0xFF00FF00u);
-    va.hi = 1u;
-    va.lo = 2u;
-    vb.hi = 3u;
-    vb.lo = 4u;
-    TEST("evmergehi_hi", va.hi, 1u);
-    TEST("evmergehi_lo", vb.hi, 3u);
-    TEST("evmergelo_hi", va.lo, 2u);
-    TEST("evmergelo_lo", vb.lo, 4u);
-
-    /* efs/efd scalar + evfs vector spot checks. */
-    TEST("efsadd", flt_bits(f15 + f225), 0x40700000u);
-    TEST("efssub", flt_bits(f375 - f15), 0x40100000u);
-    TEST("efdadd_hi", (uint32_t)(dbl_bits(d15 + d225) >> 32U), 0x400E0000u);
-    TEST("efdadd_lo", (uint32_t)dbl_bits(d15 + d225), 0u);
-    TEST("efdsub_hi", (uint32_t)(dbl_bits(d375 - d15) >> 32U), 0x40020000u);
-    TEST("efdsub_lo", (uint32_t)dbl_bits(d375 - d15), 0u);
-    TEST("evfsadd_hi", flt_bits(f15 + f225), 0x40700000u);
-    TEST("evfsadd_lo", flt_bits(f25 + f125), 0x40700000u);
-
-    if (failures != 0) {
-        printf("FAILURES %d\n", failures);
-        return 1;
-    }
-    printf("PASS\n");
-    return 0;
-}
+#include "test_p3_fp_spe_host.h"
 
 #endif /* __powerpc__ */

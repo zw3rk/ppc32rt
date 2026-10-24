@@ -343,12 +343,14 @@ static inline void ei_store_lr(a64_buf_t *b, uint32_t next)
     b->is_call = true;
 }
 
-/* Merge a 4-bit value into CR field bf (shift s): cr = (cr&~m)|(v<<s). */
+/* Merge a 4-bit value into CR field bf (shift s): cr = (cr&~m)|(v<<s).
+ * NOTE: EI_R is NOT usable as the mask temp -- fp fcmp passes val in
+ * EI_R (RC3: always produced CR=0). EI_T2 is dead at every call site. */
 static inline void ei_cr_merge(a64_buf_t *b, unsigned cr, unsigned val,
     uint32_t s)
 {
-    a64_emit_mov_imm32(b, EI_R, 0xFU << s);
-    a64_emit_bic_reg_w(b, false, cr, cr, EI_R, A64_SHIFT_LSL, 0U);
+    a64_emit_mov_imm32(b, EI_T2, 0xFU << s);
+    a64_emit_bic_reg_w(b, false, cr, cr, EI_T2, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, cr, cr, val, A64_SHIFT_LSL, s);
     ei_ctx_st(b, cr, (uint32_t)offsetof(ppc32_ctx_t, cr));
 }
