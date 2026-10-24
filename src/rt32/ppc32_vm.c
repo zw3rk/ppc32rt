@@ -169,6 +169,7 @@ int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
     g_vm_region_count = 0U;
     ctx->mmap_cursor  = PPC32_MMAP_BASE_32;
     ctx->region_count = 0U;
+    ctx->vm_ready     = true;
     vm_lock_release();
     return 0;
 }
@@ -226,6 +227,7 @@ void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
     ctx->brk_curr    = 0U;
     ctx->mmap_cursor = PPC32_MMAP_BASE_32;
     ctx->vdso_base   = 0U;
+    ctx->vm_ready    = false;
     ctx->region_count = (w <= PPC32_MAX_REGIONS) ? w : PPC32_MAX_REGIONS;
     if (ctx->region_count > 0U) {
         memcpy(ctx->regions, g_vm_regions, ctx->region_count * sizeof(ppc32_region_t));

@@ -122,7 +122,14 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_BC;
         out->bo = (uint8_t)((raw >> 21u) & 31u);
         out->bi = (uint8_t)((raw >> 16u) & 31u);
-        out->bd = (raw >> 2u) & 0x3fffu;
+        {
+            uint32_t bd = (raw >> 2u) & 0x3fffu;
+
+            if ((bd & 0x2000u) != 0u) {
+                bd |= 0xffffc000u; /* sign-extend BD... */
+            }
+            out->bd = bd << 2u; /* ...then displacement = BD || 0b00 */
+        }
         out->oe = (uint8_t)((raw >> 1u) & 1u);
         out->rc = (uint8_t)(raw & 1u);
         return 0;
@@ -130,7 +137,14 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         return -1;
     case 18u: /* b: 24-bit LI, AA, LK */
         out->op = (uint32_t)PPC32_OP_B;
-        out->li = raw & 0x03fffffcu;
+        {
+            uint32_t li = raw & 0x03fffffcu;
+
+            if ((raw & 0x02000000u) != 0u) {
+                li |= 0xfc000000u; /* sign bit is IBM bit 6 */
+            }
+            out->li = li; /* displacement = LI || 0b00 */
+        }
         out->oe = (uint8_t)((raw >> 1u) & 1u);
         out->rc = (uint8_t)(raw & 1u);
         return 0;
@@ -421,6 +435,7 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         return 0;
     case 246u: /* dcbtst (ANALYTICAL XO): cache-hint nop */
     case 278u: /* dcbt (ANALYTICAL XO): cache-hint nop */
+    case 54u: /* dcbst: block store (write-back hint); nop in emulation */
         out->op = (uint32_t)PPC32_OP_DCBT;
         return 0;
     case 247u:
@@ -443,7 +458,7 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         return 0;
     case 339u: /* mfspr: 10-bit SPR number rides in ui */
         out->op = (uint32_t)PPC32_OP_MFSPR;
-        out->ui = (((raw >> 16u) & 31u) << 5u) | rb;
+        out->ui = (rb << 5u) | ((raw >> 16u) & 31u);
         return 0;
     case 343u:
         out->op = (uint32_t)PPC32_OP_LHAX;
@@ -468,7 +483,7 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         return 0;
     case 467u: /* mtspr: 10-bit SPR number rides in ui */
         out->op = (uint32_t)PPC32_OP_MTSPR;
-        out->ui = (((raw >> 16u) & 31u) << 5u) | rb;
+        out->ui = (rb << 5u) | ((raw >> 16u) & 31u);
         return 0;
     case 476u:
         out->op = (uint32_t)PPC32_OP_NAND;
@@ -524,6 +539,13 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         return 0;
     case 854u:
         out->op = (uint32_t)PPC32_OP_SYNC;
+        return 0;
+    case 982u: /* icbi: no guest icache in emulation; nop (DBT uses
+        * page-version invalidation + host cache maintenance) */
+        out->op = (uint32_t)PPC32_OP_SYNC;
+        return 0;
+    case 1014u: /* dcbz: zero 32-byte block (user-mode, Book I) */
+        out->op = (uint32_t)PPC32_OP_DCBZ;
         return 0;
     case 918u:
         out->op = (uint32_t)PPC32_OP_STHBRX;

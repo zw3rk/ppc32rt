@@ -50,7 +50,7 @@ void interp_step(ppc32_ctx_t *ctx)
     uint64_t wide;
     bool ov;
 
-    if (ctx->guest_base == 0U) {
+    if (!ctx->vm_ready) {
         fault(ctx, ctx->nip);
         return;
     }
@@ -70,12 +70,12 @@ void interp_step(ppc32_ctx_t *ctx)
         ctx->nip += 4U;
         break;
     case PPC32_OP_ADDIC:
-    case PPC32_OP_ADDICX:
+    case PPC32_OP_ADDIC_DOT:
         a = ctx->gpr[insn.ra];
         wide = (uint64_t)a + (uint64_t)(uint32_t)insn.si;
         ctx->gpr[insn.rt] = (uint32_t)wide;
         xer_set_ca(ctx, (wide >> 32U) != 0U);
-        if (insn.op == PPC32_OP_ADDICX) {
+        if (insn.op == PPC32_OP_ADDIC_DOT) {
             set_cr0(ctx, (uint32_t)wide);
         }
         ctx->nip += 4U;
@@ -450,15 +450,8 @@ void interp_step(ppc32_ctx_t *ctx)
         ctx->nip += 4U;
         break;
     }
-    /* ---- CR logical ops ---------------------------------------- */
-    case PPC32_OP_CRAND:
-    case PPC32_OP_CRANDC:
-    case PPC32_OP_CROR:
-    case PPC32_OP_CRORC:
-    case PPC32_OP_CRXOR:
-    case PPC32_OP_CRNAND:
-    case PPC32_OP_CRNOR:
-    case PPC32_OP_CREQV: {
+    /* ---- CR logical ops (decoder: single PPC32_OP_CR, XO picks) - */
+    case PPC32_OP_CR: {
         uint32_t ba = (raw >> 16U) & 31U;
         uint32_t bb = (raw >> 11U) & 31U;
         uint32_t bd = (raw >> 21U) & 31U;
@@ -466,28 +459,29 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t bbit = cr_bit(ctx, bb);
         uint32_t out = 0U;
 
-        switch (insn.op) {
-        case PPC32_OP_CRAND:
+        switch (insn.xo) {
+        case 257u: /* crand */
             out = abit & bbit;
             break;
-        case PPC32_OP_CRANDC:
+        case 129u: /* crandc */
             out = abit & (bbit ^ 1U);
             break;
-        case PPC32_OP_CROR:
+        case 449u: /* cror */
             out = abit | bbit;
             break;
-        case PPC32_OP_CRORC:
+        case 417u: /* crorc */
             out = abit | (bbit ^ 1U);
             break;
-        case PPC32_OP_CRXOR:
+        case 193u: /* crxor */
             out = abit ^ bbit;
             break;
-        case PPC32_OP_CRNAND:
+        case 225u: /* crnand */
             out = (abit & bbit) ^ 1U;
             break;
-        case PPC32_OP_CRNOR:
+        case 33u: /* crnor */
             out = (abit | bbit) ^ 1U;
             break;
+        case 289u: /* creqv */
         default:
             out = (abit ^ bbit) ^ 1U;
             break;
@@ -540,7 +534,7 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     case PPC32_OP_MFSPR:
     case PPC32_OP_MTSPR: {
-        uint32_t spr = (((raw >> 16U) & 31U) << 5U) | ((raw >> 11U) & 31U);
+        uint32_t spr = (((raw >> 11U) & 31U) << 5U) | ((raw >> 16U) & 31U);
 
         if (insn.op == PPC32_OP_MFSPR) {
             switch (spr) {
@@ -796,26 +790,16 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     /* ---- traps -------------------------------------------------- */
     case PPC32_OP_TWI:
-    case PPC32_OP_TW:
-    case PPC32_OP_TDI:
-    case PPC32_OP_TD: {
+    case PPC32_OP_TW: {
         uint32_t to = (raw >> 21U) & 31U;
         bool hit;
 
         if (insn.op == PPC32_OP_TWI) {
             hit = trap_cond(to, ctx->gpr[insn.ra], (uint32_t)insn.si,
                 false, 0, 0);
-        } else if (insn.op == PPC32_OP_TW) {
+        } else {
             hit = trap_cond(to, ctx->gpr[insn.ra], ctx->gpr[insn.rb],
                 false, 0, 0);
-        } else if (insn.op == PPC32_OP_TDI) {
-            hit = trap_cond(to, 0U, 0U, true,
-                (int64_t)(int32_t)ctx->gpr[insn.ra],
-                (int64_t)insn.si);
-        } else {
-            hit = trap_cond(to, 0U, 0U, true,
-                (int64_t)(int32_t)ctx->gpr[insn.ra],
-                (int64_t)(int32_t)ctx->gpr[insn.rb]);
         }
         if (hit) {
             ctx->exit_reason = PPC32_EXIT_TRAP;
@@ -826,14 +810,14 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     /* ---- syscall ------------------------------------------------ */
     case PPC32_OP_SC:
-        ctx->nip += 4U;
+        /* Leave nip AT the sc: ppc32_syscall_min advances past it on
+         * return (its documented contract). Advancing here too would
+         * skip the instruction after every syscall (RC1). */
         ctx->exit_reason = PPC32_EXIT_SYSCALL;
         res_invalidate(ctx);
         break;
     /* ---- memory-order / cache no-ops ---------------------------- */
     case PPC32_OP_SYNC:
-    case PPC32_OP_ISYNC:
-    case PPC32_OP_EIEIO:
     case PPC32_OP_DCBT:
         ctx->nip += 4U;
         break;

@@ -48,9 +48,10 @@ typedef enum ppc32_op {
     PPC32_OP_ANDI,      /* 28 (Rc implied) */
     PPC32_OP_ANDIS,     /* 29 (Rc implied) */
 
-    /* Branches. B/I-form: `li` = 24-bit LI field, `oe` = AA bit 30,
-     * `rc` = LK bit 31. B-form: `bo`, `bi`, `bd` = raw 14-bit BD field
-     * (displacement = signExtend(BD || 0b00)); `oe` = AA, `rc` = LK.
+    /* Branches. B/I-form: `li` = sign-extended 26-bit displacement
+     * (LI || 0b00), `oe` = AA bit 30, `rc` = LK bit 31. B-form: `bo`,
+     * `bi`, `bd` = sign-extended 16-bit displacement (BD || 0b00);
+     * `oe` = AA, `rc` = LK.
      * XL-form (19): `bo`, `bi`, `xo` = 10-bit XO, `rc` = LK; `rb` holds
      * the raw RB field (BH hint in its low 2 bits for bclr/bcctr). */
     PPC32_OP_B,     /* 18 */
@@ -109,7 +110,8 @@ typedef enum ppc32_op {
     /* X-form integer (primary 31): rt/rs, ra, rb, oe (bit 21),
      * xo (10-bit XO), rc (bit 31). Specials: MTCRF stores the 8-bit
      * FXM mask (bits 12-19) in `ui`; MFSPR/MTSPR store the 10-bit SPR
-     * number (SPR = RA<<5 | RB split field) in `ui`; LSWI/STSWI store
+     * number (SPR = RB<<5 | RA split field, XFX-form) in `ui`;
+     * LSWI/STSWI store
      * the NB count (0 means 32) in `rb`; SRAWI stores SH in `rb`;
      * TWI/TW store TO in `rt`/`rs`, CMP/CMPL store BF<<2 in `rt`. */
     PPC32_OP_ADD,    /* 266 */ PPC32_OP_ADDC,   /* 10 */
@@ -148,7 +150,8 @@ typedef enum ppc32_op {
     PPC32_OP_STWBRX, /* 662 */ PPC32_OP_STHBRX, /* 918 */
     PPC32_OP_LSWI,  /* 597 */ PPC32_OP_LSWX,  /* 533 */
     PPC32_OP_STSWI, /* 725 */ PPC32_OP_STSWX, /* 661 */
-    PPC32_OP_DCBT   /* 278 dcbt / 246 dcbtst: cache-hint nop */
+    PPC32_OP_DCBT,  /* 278 dcbt / 246 dcbtst: cache-hint nop */
+    PPC32_OP_DCBZ   /* 1014 dcbz: zero 32-byte block at EA (user Book I) */
 } ppc32_op_t;
 
 /* Decoded instruction. Only the fields meaningful to `op` (see above)

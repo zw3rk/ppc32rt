@@ -18,10 +18,13 @@
 #include <string.h>
 
 #include "ppc32rt.h"
+#include "rt32/ppc32.h"
+#include "interp/interp.h"
+#include "os/syscalls_min.h"
 
 extern char **environ;
 
-#define PPC32RT_VERSION "0.0-phase0"
+#define PPC32RT_VERSION "0.1-phase1"
 
 static void usage(FILE *out)
 {
@@ -143,6 +146,8 @@ static void apply_env(ppc32_ctx_t *ctx)
     }
 }
 
+static int run_interp(ppc32_ctx_t *ctx);
+
 int main(int argc, char **argv)
 {
     ppc32_ctx_t ctx;
@@ -163,11 +168,72 @@ int main(int argc, char **argv)
     ctx.guest_argv = &argv[path_idx];
     ctx.host_envp = environ;
 
-    /* Engines arrive in Phase 1 (interp) and Phase 2 (dbt). */
+    /* RC1: interp engine live; dbt and --difftest arrive in Phase 2. */
     if (getenv("PPC32RT_ENGINE") == NULL && ctx.engine < 0) {
         ctx.engine = PPC32_ENGINE_INTERP; /* default oracle */
     }
-    fprintf(stderr, "ppc32rt: engine %s not implemented in Phase 0\n",
-            ctx.engine == PPC32_ENGINE_DBT ? "dbt" : "interp");
-    return 2;
+    if (ctx.engine == PPC32_ENGINE_DBT) {
+        fprintf(stderr, "ppc32rt: engine dbt not implemented until Phase 2\n");
+        return 2;
+    }
+    if (ctx.difftest) {
+        fprintf(stderr, "ppc32rt: --difftest not implemented until Phase 2\n");
+        return 2;
+    }
+    return run_interp(&ctx);
+}
+
+/*
+ * RC1 interp driver: reserve the [G, G+4GiB) window, load the guest ELF,
+ * set up the initial stack, and run interp_run <-> syscall dispatch until
+ * a terminal exit. exit/exit_group return the guest status byte.
+ */
+static int run_interp(ppc32_ctx_t *ctx)
+{
+    ppc32_elf_info_t info;
+    uint32_t sp;
+    int fd;
+
+    ppc32_host_probe(ctx);
+    if (ppc32_vm_init(ctx, 0) != 0) {
+        fprintf(stderr, "ppc32rt: cannot reserve guest window\n");
+        return 1;
+    }
+    fd = ppc32_open_guest_ro(ctx, ctx->exec_path);
+    if (fd < 0) {
+        fprintf(stderr, "ppc32rt: cannot open '%s'\n", ctx->exec_path);
+        return 1;
+    }
+    /* ppc32_elf_load closes fd (success and failure paths). */
+    if (ppc32_elf_load(ctx, fd, ctx->exec_path, &info) != 0) {
+        return 1;
+    }
+    if (ppc32_stack_setup(ctx, &info, ctx->guest_argc, ctx->guest_argv,
+            ctx->host_envp, &sp) != 0) {
+        fprintf(stderr, "ppc32rt: stack setup failed\n");
+        return 1;
+    }
+    ctx->nip = info.entry;
+    ctx->gpr[PPC32_REG_SP] = sp;
+    ctx->exit_reason = PPC32_EXIT_NONE;
+    for (;;) {
+        uint32_t nr;
+
+        interp_run(ctx);
+        if (ctx->exit_reason == PPC32_EXIT_NONE) {
+            continue; /* budget/page stop: keep going */
+        }
+        if (ctx->exit_reason != PPC32_EXIT_SYSCALL) {
+            fprintf(stderr, "ppc32rt: stopped, reason %u at nip 0x%08X\n",
+                ctx->exit_reason, ctx->nip);
+            return 1;
+        }
+        nr = ctx->gpr[0];
+        if (ppc32_syscall_min_is_exit(nr)) {
+            ppc32_syscall_min(ctx);
+            return (int)(ctx->exit_arg & 0xFFU);
+        }
+        ppc32_syscall_min(ctx);
+        ctx->exit_reason = PPC32_EXIT_NONE;
+    }
 }

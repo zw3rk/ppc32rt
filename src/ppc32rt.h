@@ -216,6 +216,14 @@ typedef struct ppc32_ctx {
     uint64_t icache_flushes;
     uint64_t wx_transitions;
 
+    /*
+     * VM readiness (RC1): guest_base == 0 is a VALID window base (G=0
+     * identity mapping, tried first by ppc32_vm_init), so "not yet
+     * initialized" needs its own flag. Set by ppc32_vm_init on success,
+     * cleared by ppc32_vm_reset_for_exec (window torn down).
+     */
+    bool vm_ready;
+
 } ppc32_ctx_t;
 
 /* ABI-locked offsets (future trampoline, Phase 3+, must agree). */
