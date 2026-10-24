@@ -39,11 +39,11 @@ Read [`docs/lanes/phase-0.md`](docs/lanes/phase-0.md) and run lanes `L0a..L0b`:
 
 ### Phase 1 — Base Integer Decoder, Reference Interpreter (`src/interp/`) & Minimal Syscalls (`RC1`)
 Write `docs/lanes/phase-1.md` and run concurrent lanes `L1a..L1d`:
-- [ ] **Lane `L1a`**: Instruction decoder (`src/interp/decode.c`, `src/interp/decode.h`).
-- [ ] **Lane `L1b`**: Base integer reference interpreter (`src/interp/interp.c`) including all control-flow, delay-slot/annul, register-window/prefix, unaligned, and atomic instructions in `SPEC.md` §2.
-- [ ] **Lane `L1c`**: Minimal Linux syscall layer (`exit`, `exit_group`, `write`, `read`, `brk`, `mmap`, `munmap`, `mprotect`, `uname`, `set_tid_address`).
-- [ ] **Lane `L1d`**: Freestanding ISA test suite (`tests/test_p1_isa.c`) covering ALU, shifts, branches, page-final branches before `PROT_NONE` pages, atomics, and unaligned loads/stores.
-- [ ] **Gate `RC1`**: `test_p1_isa` under `PPC32RT_ENGINE=interp` matches `qemu-ppc (with -cpu 750 and -cpu e500v2)` exit code and stdout bit-for-bit.
+- [x] **Lane `L1a`**: Instruction decoder (`src/interp/decode.c`, `src/interp/decode.h`).
+- [x] **Lane `L1b`**: Base integer reference interpreter (`src/interp/interp.c`) including all control-flow, delay-slot/annul, register-window/prefix, unaligned, and atomic instructions in `SPEC.md` §2.
+- [x] **Lane `L1c`**: Minimal Linux syscall layer (`exit`, `exit_group`, `write`, `read`, `brk`, `mmap`, `munmap`, `mprotect`, `uname`, `set_tid_address`).
+- [x] **Lane `L1d`**: Freestanding ISA test suite (`tests/test_p1_isa.c`) covering ALU, shifts, branches, page-final branches before `PROT_NONE` pages, atomics, and unaligned loads/stores.
+- [x] **Gate `RC1`**: `test_p1_isa` under `PPC32RT_ENGINE=interp` matches `qemu-ppc (with -cpu 750 and -cpu e500v2)` exit code and stdout bit-for-bit.
 
 ### Phase 2 — Static Libc Syscalls & Base Integer AArch64 DBT (`src/dbt/`) (`RC2`)
 Write `docs/lanes/phase-2.md` and run concurrent lanes `L2a..L2d`:
