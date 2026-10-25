@@ -20,6 +20,16 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+/* --no-host latch (Wave 1 CLI): the frozen context carries no slot
+ * for it, so it lives next to the probe it gates. Set once from
+ * main.c CLI parsing before the first probe. */
+static bool g_no_host = false;
+
+void ppc32_host_set_no_host(bool skip)
+{
+    g_no_host = skip;
+}
+
 void ppc32_host_probe(ppc32_ctx_t *ctx)
 {
     if (!ctx) {
@@ -27,6 +37,10 @@ void ppc32_host_probe(ppc32_ctx_t *ctx)
     }
     memset(&ctx->host_info, 0, sizeof(ctx->host_info));
     ctx->has_host_info = false;
+
+    if (g_no_host) {
+        return;
+    }
 
     const char *host_env = getenv("PPC32RT_HOST");
     if (host_env && strcmp(host_env, "none") == 0) {

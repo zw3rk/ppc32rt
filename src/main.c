@@ -12,11 +12,20 @@
 /* POSIX 2008: setenv/environ under strict -std=c11 with musl. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/auxv.h>
+#ifndef AT_EXECFD
+#define AT_EXECFD 2 /* kernel auxv key (linux/auxvec.h) */
+#endif
+#endif
 
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
@@ -31,6 +40,11 @@
 
 extern char **environ;
 
+/* Probe skip latch owned by src/rt32/ppc32_host.c (the frozen context
+ * carries no slot for it); declared here so main.c stays the only
+ * other file that names it. */
+extern void ppc32_host_set_no_host(bool skip);
+
 #define PPC32RT_VERSION "0.2-phase2"
 
 static void usage(FILE *out)
@@ -40,7 +54,8 @@ static void usage(FILE *out)
         "\n"
         "Usage:\n"
         "  ppc32rt [--interp | --dbt] [--difftest] [--trace]\n"
-        "          [--profile classic|spe] [--sysroot DIR] -- PATH [ARGV0...]\n"
+        "          [--profile classic|spe] [--sysroot DIR] [--window HEX]\n"
+        "          [--execfn PATH] [--image-fd FD] [--no-host] -- PATH [ARGS...]\n"
         "  ppc32rt --help\n"
         "  ppc32rt --version\n"
         "\n"
@@ -71,6 +86,51 @@ static int parse_profile(const char *s, int *out)
         *out = PPC32_PROFILE_SPE;
         return 0;
     }
+    return -1;
+}
+
+/* Wave 1 host-contract CLI state (HOST-CONTRACT §3). The frozen
+ * ppc32_ctx_t carries no window/fd slots, so parsed values wait here
+ * until guest_load consumes them. UINT64_MAX = no --window: run the
+ * contract G order (PPC32RT_WINDOW → host hint → G=0 → scan). */
+static uint64_t g_requested_window = UINT64_MAX;
+static const char *g_execfn = NULL;
+static int g_image_fd = -1;
+static bool g_no_host = false;
+
+/* Strict unsigned value parse (base 0 for --window, base 10 for
+ * --image-fd): 0 ok, -1 on empty/negative/junk/overflow. */
+static int parse_u64(const char *s, int base, uint64_t *out)
+{
+    char *end = NULL;
+    unsigned long long v;
+
+    errno = 0;
+    if (s[0] == '\0' || strchr(s, '-') != NULL) {
+        return -1;
+    }
+    v = strtoull(s, &end, base);
+    if (errno == ERANGE || end == s || *end != '\0') {
+        return -1;
+    }
+    *out = (uint64_t)v;
+    return 0;
+}
+
+/* AT_EXECFD presence probe (HOST-CONTRACT §3.1): errno-checked
+ * getauxval, so a valid fd 0 (stdin closed before execve) counts.
+ * Off Linux there is no auxv to read; -1 means "absent". */
+static int auxv_exec_fd(void)
+{
+#if defined(__linux__)
+    unsigned long v;
+
+    errno = 0;
+    v = getauxval((unsigned long)AT_EXECFD);
+    if (errno == 0 && v <= (unsigned long)INT_MAX) {
+        return (int)v;
+    }
+#endif
     return -1;
 }
 
@@ -113,6 +173,45 @@ static int parse_args(ppc32_ctx_t *ctx, int argc, char **argv)
         }
         if (strcmp(argv[i], "--trace") == 0) {
             ctx->trace_syscalls = true;
+            i++;
+            continue;
+        }
+        if (strcmp(argv[i], "--window") == 0) {
+            /* Fail-hard on a bad value (incl. the UINT64_MAX
+             * "unset" sentinel); reservation failure is fail-hard
+             * in ppc32_vm_init. */
+            uint64_t w = 0U;
+
+            if (i + 1 >= argc || parse_u64(argv[i + 1], 0, &w) != 0 ||
+                w == UINT64_MAX) {
+                return -1;
+            }
+            g_requested_window = w;
+            i += 2;
+            continue;
+        }
+        if (strcmp(argv[i], "--execfn") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                return -1;
+            }
+            g_execfn = argv[i + 1];
+            i += 2;
+            continue;
+        }
+        if (strcmp(argv[i], "--image-fd") == 0) {
+            /* Any fd >= 0 is valid (0 included, stdin closed). */
+            uint64_t f = 0U;
+
+            if (i + 1 >= argc || parse_u64(argv[i + 1], 10, &f) != 0 ||
+                f > (uint64_t)INT_MAX) {
+                return -1;
+            }
+            g_image_fd = (int)f;
+            i += 2;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-host") == 0) {
+            g_no_host = true;
             i++;
             continue;
         }
@@ -240,7 +339,18 @@ int main(int argc, char **argv)
         return 2;
     }
     apply_env(&ctx);
-    ctx.exec_path = abs_exec_path(argv[path_idx]);
+    if (g_no_host) {
+        ppc32_host_set_no_host(true);
+    }
+    if (g_execfn != NULL) {
+        /* --execfn decouples the path from argv: every token after
+         * "--" stays verbatim in guest_argv (custom argv[0] kept,
+         * even with no extra args). */
+        ctx.exec_path = abs_exec_path(g_execfn);
+    } else {
+        /* Without --execfn, argv[i] is both path and argv[0]. */
+        ctx.exec_path = abs_exec_path(argv[path_idx]);
+    }
     ctx.guest_argc = argc - path_idx;
     ctx.guest_argv = &argv[path_idx];
     ctx.host_envp = environ;
@@ -262,17 +372,29 @@ int main(int argc, char **argv)
  * and park nip/sp at the entry point. Returns 0 on success. */
 static int guest_load(ppc32_ctx_t *ctx, ppc32_elf_info_t *info, uint32_t *sp)
 {
-    int fd;
+    int fd = -1;
 
     ppc32_host_probe(ctx);
-    if (ppc32_vm_init(ctx, 0) != 0) {
+    /* Contract G order lives in ppc32_vm_init; UINT64_MAX means "no
+     * explicit --window": env → host hint → G=0 → aligned scan. */
+    if (ppc32_vm_init(ctx, g_requested_window) != 0) {
         fprintf(stderr, "ppc32rt: cannot reserve guest window\n");
         return 1;
     }
-    fd = ppc32_open_guest_ro(ctx, ctx->exec_path);
+    /* Image source order: --image-fd wins, then AT_EXECFD from our own
+     * auxv, then the exec path. The loader closes fd after mapping
+     * (all paths); no other fd is touched. */
+    if (g_image_fd >= 0) {
+        fd = g_image_fd;
+    } else {
+        fd = auxv_exec_fd();
+    }
     if (fd < 0) {
-        fprintf(stderr, "ppc32rt: cannot open '%s'\n", ctx->exec_path);
-        return 1;
+        fd = ppc32_open_guest_ro(ctx, ctx->exec_path);
+        if (fd < 0) {
+            fprintf(stderr, "ppc32rt: cannot open '%s'\n", ctx->exec_path);
+            return 1;
+        }
     }
     /* ppc32_elf_load closes fd (success and failure paths). */
     if (ppc32_elf_load(ctx, fd, ctx->exec_path, info) != 0) {
