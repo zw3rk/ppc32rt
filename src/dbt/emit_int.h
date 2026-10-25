@@ -281,11 +281,20 @@ static inline void ei_ea_x(a64_buf_t *b, unsigned ra, unsigned rb)
  * call site (EA computation leaves none live). Multi-byte/string ops
  * check the base EA only: EAs advance upward from the base, so a base at
  * or above the guard cannot descend into it short of 4 GiB wrap-around
- * (out of scope, same as the interpreter). */
+ * (out of scope, same as the interpreter).
+ * RC6: every guarded memory op first spills its own pc to ctx->nip
+ * (TMP0 is dead at all guard call sites; only w22, and EI_B for
+ * overlapping update-stores, are live). A host protection fault
+ * (write to RX, any touch of NONE) then reports the faulting
+ * instruction instead of the block start, matching the interpreter
+ * and the oracle frame for frame. */
 static inline void ei_guard_low(a64_buf_t *b, uint32_t pc)
 {
     size_t to_ok;
 
+    a64_emit_mov_pc32(b, A64_TMP0, pc);
+    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX,
+        (uint32_t)offsetof(ppc32_ctx_t, nip));
     a64_emit_sub_imm_w(b, true, A64_ZR, A64_ADDR, 16U, 1U);
     to_ok = a64_emit_b_cond_placeholder(b, A64_COND_CS);
     a64_emit_exit_fault(b, pc, A64_ADDR);

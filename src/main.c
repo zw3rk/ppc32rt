@@ -30,6 +30,7 @@
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
 #include "interp/interp.h"
+#include "os/hostfault.h"
 #include "os/signals.h"
 #include "os/syscalls.h"
 #include "os/threads.h"
@@ -339,6 +340,10 @@ int main(int argc, char **argv)
         return 2;
     }
     apply_env(&ctx);
+    /* Host protection-fault translation (hostfault.h): guest accesses
+     * that violate page permissions revive at the engine checkpoints
+     * with FAULT recorded; anything else still crashes loudly. */
+    ppc32_hostfault_install();
     if (g_no_host) {
         ppc32_host_set_no_host(true);
     }
@@ -443,6 +448,28 @@ static int deliver_sync(ppc32_ctx_t *ctx)
  * exit on the calling host thread. Returns the guest exit code
  * (0..255), or a negative guest signal number when a fault/trap goes
  * undelivered. */
+/* Host-fault-run adapters: single segments match the callback type
+ * directly (interp_run); the int-returning dbt_run and the
+ * loop-until-stop difftest drivers need these shims. */
+static void run_dbt_one(ppc32_ctx_t *ctx)
+{
+    (void)dbt_run(ctx);
+}
+
+static void run_interp_stop(ppc32_ctx_t *ctx)
+{
+    while (ctx->exit_reason == PPC32_EXIT_NONE) {
+        interp_run(ctx);
+    }
+}
+
+static void run_dbt_stop(ppc32_ctx_t *ctx)
+{
+    while (ctx->exit_reason == PPC32_EXIT_NONE) {
+        (void)dbt_run(ctx);
+    }
+}
+
 long ppc32_run_guest_child(ppc32_ctx_t *child)
 {
     if (child == NULL) {
@@ -450,9 +477,9 @@ long ppc32_run_guest_child(ppc32_ctx_t *child)
     }
     for (;;) {
         if (child->engine == PPC32_ENGINE_DBT) {
-            dbt_run(child);
+            (void)ppc32_hostfault_run(child, run_dbt_one);
         } else {
-            interp_run(child);
+            (void)ppc32_hostfault_run(child, interp_run);
         }
         if (child->exit_reason == PPC32_EXIT_SYSCALL) {
             uint32_t nr = child->gpr[0];
@@ -519,7 +546,10 @@ static int run_interp(ppc32_ctx_t *ctx)
         return 1;
     }
     for (;;) {
-        interp_run(ctx);
+        /* Host protection faults inside the engine revive here with
+         * FAULT already recorded (hostfault.h); the engine runs
+         * inside the checkpoint frame. */
+        (void)ppc32_hostfault_run(ctx, interp_run);
         if (ctx->exit_reason == PPC32_EXIT_NONE) {
             continue; /* budget/page stop: keep going */
         }
@@ -563,7 +593,7 @@ static int run_dbt(ppc32_ctx_t *ctx)
     }
     emit_bridge_install(ctx);
     for (;;) {
-        dbt_run(ctx);
+        (void)ppc32_hostfault_run(ctx, run_dbt_one);
         if (ctx->exit_reason == PPC32_EXIT_NONE) {
             continue;
         }
@@ -773,16 +803,12 @@ static int run_difftest(ppc32_ctx_t *ctx)
             difftest_snap_free(snap, snap_n);
             return 2;
         }
-        while (ref.exit_reason == PPC32_EXIT_NONE) {
-            interp_run(&ref);
-        }
+        (void)ppc32_hostfault_run(&ref, run_interp_stop);
         /* Revert the oracle's segment writes so the DUT starts the
          * segment from the exact post-boundary state (see
          * difftest_snapshot). */
         difftest_restore(ctx, snap, snap_n);
-        while (ctx->exit_reason == PPC32_EXIT_NONE) {
-            dbt_run(ctx);
-        }
+        (void)ppc32_hostfault_run(ctx, run_dbt_stop);
         if (ref.exit_reason != ctx->exit_reason) {
             printf("DIFFTEST: DIVERGENCE stop-reason interp=%u dbt=%u\n",
                 ref.exit_reason, ctx->exit_reason);

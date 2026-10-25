@@ -81,3 +81,32 @@ fails twice, needs a frozen-header edit, or a spec detail is ambiguous.
    P1–P5 gates on both engines × both CPUs with `0` divergences;
    `make check`, `make check-line-limits`, `check-abi-invariants`.
 3. Tick `GOAL.md` Phase 6 / `RC6`, commit on `master`.
+
+## `RC6` gate record (coordinator L6b escalation, committed on `master`)
+
+Lane `L6a` merged as-is (`--window`/`--execfn`/`--image-fd`/`--no-host`,
+contract `G` order, `tools/p6_host_check.sh` 18/18). Lane `L6b`
+escalated: `test_p6_perms` died with a host `SIGSEGV` (exit 139) on
+both engines vs oracle `PASS` — the first test to touch a
+`PROT_NONE` page or write an `RX` page. Root causes, both fixed by
+the coordinator on `master`:
+- No host fault translator existed: `interp_mem_ok` checks only the
+low guard, and DBT accesses check nothing, so a guest protection
+violation killed the process. New `src/os/hostfault.c` translates a
+host `SIGSEGV`/`SIGBUS` whose data address lies in `[G, G + 4 GiB)`
+into a guest `FAULT` (else chains to the previous disposition).
+Checkpoint must stay alive across the run: the engine runs *inside*
+`ppc32_hostfault_run(ctx, fn)` (a returned checkpoint revives into a
+dead frame — observed as a NULL-PC death after the first translated
+fault), and the call sites carry `returns_twice`.
+- DBT reported the block-start `nip` for mid-block host faults while
+the interpreter reported the faulting store. Every guarded memory
+op now spills its own `pc` to `ctx->nip` inside `ei_guard_low`
+(all int/fp/SPE/multi/string/dcbz emitters funnel through it;
+`TMP0` is dead at all call sites), matching the interpreter and the
+oracle frame for frame.
+Verified: `tools/p6_host_check.sh` 18/18, `tools/p6_parity.sh`
+`pass=26 divergences=0` (all fixtures 750 + e500v2 `--interp`/`--dbt`
+vs `qemu-ppc` goldens, `p6_perms` `--difftest` EQUAL,
+`qualify_busybox.sh` identical triple), `make check`,
+`check-line-limits`, `check-abi-invariants` green.
