@@ -176,6 +176,13 @@ int ppc32_stack_setup(ppc32_ctx_t *ctx, const ppc32_elf_info_t *elf_info,
     auxv[aux_idx++] = 0U;
     auxv[aux_idx++] = 31U; /* AT_EXECFN */
     auxv[aux_idx++] = at_execfn_va;
+    /* Phase 5 L5a: AT_BASE (interpreter base, 0 when static) and
+     * AT_SECURE (0: no setuid/setgid elevation). Appended after the
+     * existing slots; AT_NULL still terminates the vector. */
+    auxv[aux_idx++] = 7U; /* AT_BASE */
+    auxv[aux_idx++] = elf_info->interp_base;
+    auxv[aux_idx++] = 23U; /* AT_SECURE */
+    auxv[aux_idx++] = 0U;
     auxv[aux_idx++] = 0U; /* AT_NULL */
     auxv[aux_idx++] = 0U;
 

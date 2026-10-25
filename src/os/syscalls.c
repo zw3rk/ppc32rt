@@ -46,6 +46,7 @@
 
 #include "os/convert.h"
 #include "os/proc.h"
+#include "os/procfs.h"
 #include "os/signals.h"
 #include "os/syscall_nr.h"
 #include "os/threads.h"
@@ -178,6 +179,10 @@ static long sys_openat(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
 
     if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
         return -EFAULT;
+    }
+    /* Phase 5 L5a: /proc/self/... opens serve synthetic translator state. */
+    if (ppc32_procfs_kind(path) != PPC32_PROCFS_NONE) {
+        return (long)ppc32_procfs_open(ctx, path);
     }
     /* AT_FDCWD (-100) is ABI-identical; anything else is a guest fd. */
     host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? -100 : (int)dfd_va;
@@ -758,6 +763,11 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         break;
     case PPC32_NR_CLOSE:
         ret = sys_close(a0);
+        break;
+    case PPC32_NR_READLINK:
+        /* Phase 5 L5a: /proc/self/exe keeps symlink semantics; other
+         * paths fall through to the host readlink inside procfs.c. */
+        ret = ppc32_procfs_readlink(ctx, a0, a1, a2);
         break;
     case PPC32_NR_UNLINK:
         ret = sys_unlink(ctx, a0);
