@@ -52,14 +52,192 @@ static int dbt_fallback_emit(a64_buf_t *b, const ppc32_insn_t *insn,
     return -1;
 }
 
-static ppc32_emit_fn s_emitter = dbt_fallback_emit;
+static ppc32_emit_fn s_user_emitter = dbt_fallback_emit;
+
+/* H1 SMC: hook into the translator (defined in cache.c). Emitted
+ * stores call back with (ctx, EA, len, cur_entry) right after the
+ * store executes. Declared here (not via dbt.h) to keep the lane's
+ * footprint inside cache.c/dbt.c. */
+extern void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
+    void *cur);
+extern void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
+    uint32_t start, uint32_t end);
+
+/* H1 SMC: classify natively-emitted guest stores. Returns true with
+ * *len_out = stored byte count and *back_out = how far w22 (the EA)
+ * has advanced past the range start (multi-word/dcbz/string strides).
+ * Every op listed here leaves the access EA in w22 on success; the
+ * hook reads it back, so update-form ordering needs no special case.
+ * Returns false for loads, barriers, and anything the emitter refuses
+ * (fallback stores retire through the interpreter, covered by the
+ * UNDEF-path flush plus dispatch snapshot verification). */
+static bool dbt_store_shape(const ppc32_insn_t *insn, uint32_t *len_out,
+    uint32_t *back_out)
+{
+    uint32_t len = 0U;
+    uint32_t back = 0U;
+    uint32_t n;
+
+    if (insn == NULL || len_out == NULL || back_out == NULL) {
+        return false;
+    }
+    switch (insn->op) {
+    case PPC32_OP_STB:
+    case PPC32_OP_STBU:
+    case PPC32_OP_STBX:
+    case PPC32_OP_STBUX:
+        len = 1U;
+        break;
+    case PPC32_OP_STH:
+    case PPC32_OP_STHU:
+    case PPC32_OP_STHX:
+    case PPC32_OP_STHUX:
+    case PPC32_OP_STHBRX:
+        len = 2U;
+        break;
+    case PPC32_OP_STW:
+    case PPC32_OP_STWU:
+    case PPC32_OP_STWX:
+    case PPC32_OP_STWUX:
+    case PPC32_OP_STWBRX:
+    case PPC32_OP_STWCX:
+        len = 4U;
+        break;
+    case PPC32_OP_STMW:
+        /* stw loop from rt: n words, w22 ends (n-1)*4 past base. */
+        if (insn->rt > 31U) {
+            return false;
+        }
+        n = 32U - (uint32_t)insn->rt;
+        len = n * 4U;
+        back = (n - 1U) * 4U;
+        break;
+    case PPC32_OP_STSWI:
+        /* nb lives in the rb field (0 means 32); w22 ends n-1 past. */
+        n = (insn->rb == 0U) ? 32U : (uint32_t)insn->rb;
+        if (n == 0U || n > 32U) {
+            return false;
+        }
+        len = n;
+        back = n - 1U;
+        break;
+    case PPC32_OP_DCBZ:
+        /* Aligned base, 8 ascending words: w22 ends 28 past base. */
+        len = 32U;
+        back = 28U;
+        break;
+    case PPC32_OP_STFS:
+    case PPC32_OP_STFSU:
+        len = 4U;
+        break;
+    case PPC32_OP_STFD:
+    case PPC32_OP_STFDU:
+        len = 8U;
+        break;
+    case PPC32_OP_FPU_X: {
+        /* Indexed float bit2 = store, bit1 = double (fp_indexed). */
+        uint32_t k;
+
+        if (insn->xo < 535U || insn->xo > 759U ||
+            ((insn->xo - 535U) & 31U) != 0U) {
+            return false;
+        }
+        k = (insn->xo - 535U) >> 5U;
+        if ((k & 4U) == 0U) {
+            return false;
+        }
+        len = ((k & 2U) != 0U) ? 8U : 4U;
+        break;
+    }
+    case PPC32_OP_SPE:
+        /* 64-bit indexed stores only (768/770 are the loads). */
+        if (insn->xo != 800U && insn->xo != 802U) {
+            return false;
+        }
+        len = 8U;
+        break;
+    default:
+        return false;
+    }
+    *len_out = len;
+    *back_out = back;
+    return true;
+}
+
+/* H1 SMC: emit the post-store hook after a natively-emitted store.
+ * Contract (mirrors emit_int.h design rules): GPRs live in ctx, no
+ * guest state survives in host regs across instructions, w0-w7 are
+ * never touched by emitted code, and NZCV is dead at every call site,
+ * so x0-x2 (args) plus x21 (TMP3 scratch, dead at all call sites) are
+ * free. The helper preserves x19-x28/x22/x27 (AAPCS64 callee-saved);
+ * w22 still holds the store EA and x27 the current entry. blr writes
+ * LR, so the sequence spills/fills it on the host stack: no
+ * call-preserved register is free, and the block's final ret must
+ * still reach the trampoline resume address. */
+static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
+{
+    uintptr_t fn = (uintptr_t)ppc32_smc_store;
+    uint32_t hi3 = (uint32_t)((fn >> 48U) & 0xFFFFU);
+    uint32_t hi2 = (uint32_t)((fn >> 32U) & 0xFFFFU);
+    uint32_t hi1 = (uint32_t)((fn >> 16U) & 0xFFFFU);
+    uint32_t lo = (uint32_t)(fn & 0xFFFFU);
+
+    if (back != 0U) {
+        /* w1 = w22 - back (range start for strided stores). */
+        a64_emit_sub_imm_w(b, false, 1U, 22U, (uint16_t)back, 0U);
+    } else {
+        a64_emit_mov_w(b, 1U, 22U);
+    }
+    a64_emit_mov_imm32(b, 2U, len);
+    a64_emit(b, 0xAA1303E0U); /* mov x0, x19 (ctx) */
+    a64_emit(b, 0xAA1B03E3U); /* mov x3, x27 (cur entry) */
+    a64_emit(b, 0xD2800000U | ((uint32_t)3U << 21) |
+        (hi3 << 5) | 21U); /* movz x21, #hi3, lsl #48 */
+    a64_emit(b, 0xF2800000U | ((uint32_t)2U << 21) |
+        (hi2 << 5) | 21U); /* movk x21, #hi2, lsl #32 */
+    a64_emit(b, 0xF2800000U | ((uint32_t)1U << 21) |
+        (hi1 << 5) | 21U); /* movk x21, #hi1, lsl #16 */
+    a64_emit(b, 0xF2800000U | (lo << 5) | 21U); /* movk x21, #lo */
+    /* blr writes LR, but the block's final ret must still reach the
+     * trampoline resume address the trampoline's own blr left there.
+     * Spill/fill LR on the host stack: no call-preserved register is
+     * free (x0-x4/x21 are caller-saved scratch here; x19-x28 carry the
+     * translator contract). SP stays 16-byte aligned throughout (the
+     * trampoline aligned it; emitted code never touches it), and the
+     * spill touches neither NZCV nor any live register. */
+    a64_emit(b, 0xF81F0FFEU); /* str x30, [sp, #-16]! */
+    a64_emit(b, 0xD63F02A0U); /* blr x21 */
+    a64_emit(b, 0xF84107FEU); /* ldr x30, [sp], #16 */
+}
+
+/* H1 SMC wrapper: every translation goes through here. Native
+ * stores get a post-store invalidation hook; everything else passes
+ * through untouched (fallback/refusal codes propagate so dbt.c still
+ * ends blocks exactly as before). */
+static int dbt_emit_wrap(a64_buf_t *b, const ppc32_insn_t *insn,
+    uint32_t pc)
+{
+    int rc = s_user_emitter(b, insn, pc);
+
+    if (rc == 0 && insn != NULL) {
+        uint32_t len = 0U;
+        uint32_t back = 0U;
+
+        if (dbt_store_shape(insn, &len, &back)) {
+            dbt_emit_smc_hook(b, len, back);
+        }
+    }
+    return rc;
+}
+
+static ppc32_emit_fn s_emitter = dbt_emit_wrap;
 
 void ppc32_dbt_set_emitter(ppc32_emit_fn fn)
 {
     if (fn != NULL) {
-        s_emitter = fn;
+        s_user_emitter = fn;
     } else {
-        s_emitter = dbt_fallback_emit;
+        s_user_emitter = dbt_fallback_emit;
     }
 }
 
@@ -111,12 +289,17 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
                 /* Nothing emitted: force interp_step progress via an
                  * UNDEF exit (an exit_branch here would retranslate
                  * the same pc forever). */
+                ppc32_block_t *e;
+
                 a64_buf_init(&b, staging, 4096U);
                 b.guest_start_pc = pc;
                 a64_emit_exit_undef(&b, cur);
                 b.guest_end_pc = cur;
-                return ppc32_cache_install(ctx, pc, staging, b.count,
+                e = ppc32_cache_install(ctx, pc, staging, b.count,
                     NULL, 0U, false, 0U);
+                /* H1 SMC: empty guest range (fallback block). */
+                ppc32_cache_record_guest(ctx, e, pc, cur);
+                return e;
             }
             /* Partial block: valid fallthrough-chaining tail. */
             a64_emit_exit_branch(&b, cur);
@@ -141,12 +324,17 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
     if (b.overflow || b.count == 0U) {
         /* Overflow or empty (page-crossed at once): single-step via
          * interp instead of installing a corrupt block. */
+        ppc32_block_t *e;
+
         a64_buf_init(&b, staging, 4096U);
         b.guest_start_pc = pc;
         a64_emit_exit_undef(&b, pc);
         b.guest_end_pc = pc;
-        return ppc32_cache_install(ctx, pc, staging, b.count, NULL, 0U,
+        e = ppc32_cache_install(ctx, pc, staging, b.count, NULL, 0U,
             false, 0U);
+        /* H1 SMC: empty guest range (fallback block). */
+        ppc32_cache_record_guest(ctx, e, pc, pc);
+        return e;
     }
     b.guest_end_pc = cur;
     /* NOTE: the install below passes b.exit_slot_pcs/b.exit_slot_count
@@ -161,6 +349,9 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
             ctx->exit_reason = PPC32_EXIT_FAULT;
             return NULL;
         }
+        /* H1 SMC: snapshot the translated guest bytes for dispatch
+         * re-verification (covers interpreter stores and restores). */
+        ppc32_cache_record_guest(ctx, e, pc, cur);
         return e;
     }
 }
@@ -178,8 +369,29 @@ int dbt_run(ppc32_ctx_t *ctx)
             return (int)ctx->exit_reason;
         }
         if (ctx->single_step) {
-            /* GDB single-step (Phase 4): stay on the interpreter. */
+            /* GDB single-step (Phase 4): stay on the interpreter. A
+             * stepped store bypasses the hooks, so retire the cache
+             * the same way the UNDEF path does (decode the word
+             * about to step, before it advances). */
+            uint32_t upc = ctx->nip;
+            uint32_t raw = 0U;
+            ppc32_insn_t stepped;
+            uint32_t len = 0U;
+            uint32_t back = 0U;
+            bool flush = false;
+
+            if (ctx->vm_ready) {
+                memcpy(&raw, ppc32_guest_ptr(ctx, upc), sizeof(raw));
+                memset(&stepped, 0, sizeof(stepped));
+                if (ppc_decode(ppc32_be32(raw), &stepped) == 0 &&
+                    dbt_store_shape(&stepped, &len, &back)) {
+                    flush = true;
+                }
+            }
             interp_step(ctx);
+            if (flush) {
+                ppc32_cache_invalidate_all(ctx);
+            }
             return (int)ctx->exit_reason;
         }
         if (!ctx->vm_ready) {
@@ -209,12 +421,39 @@ int dbt_run(ppc32_ctx_t *ctx)
              * syscall layer advances past exactly once. */
             ctx->nip = ctx->exit_dest - 4U;
             ctx->exit_reason = PPC32_EXIT_SYSCALL;
+            /* H1 SMC: syscalls can write guest memory outside the
+             * JIT hooks (read/recv/sigframe via the VM layer), so a
+             * chained re-entry must not trust prior translations. */
+            ppc32_cache_invalidate_all(ctx);
             return (int)ctx->exit_reason;
-        case PPC32_EXIT_UNDEF:
-            ctx->nip = ctx->exit_dest;
+        case PPC32_EXIT_UNDEF: {
+            /* H1 SMC: the single step below has no store hook; when
+             * the stepped word stores, retire the whole cache so a
+             * chained re-entry retranslates fresh bytes. Decode
+             * before stepping (a faulting step still flushes). */
+            uint32_t upc = ctx->exit_dest;
+            uint32_t raw = 0U;
+            ppc32_insn_t stepped;
+            uint32_t len = 0U;
+            uint32_t back = 0U;
+            bool flush = false;
+
+            if (ctx->vm_ready) {
+                memcpy(&raw, ppc32_guest_ptr(ctx, upc), sizeof(raw));
+                memset(&stepped, 0, sizeof(stepped));
+                if (ppc_decode(ppc32_be32(raw), &stepped) == 0 &&
+                    dbt_store_shape(&stepped, &len, &back)) {
+                    flush = true;
+                }
+            }
+            ctx->nip = upc;
             ctx->exit_reason = PPC32_EXIT_NONE;
             interp_step(ctx);
+            if (flush) {
+                ppc32_cache_invalidate_all(ctx);
+            }
             break;
+        }
         default:
             /* TRAP/FAULT: nip already stored by the exit stub. */
             return (int)ctx->exit_reason;

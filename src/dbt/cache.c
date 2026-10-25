@@ -20,6 +20,22 @@
  * are reusable) and severs every ctx IBTC/RAS entry whose key falls in
  * [start, end). invalidate_all bumps the global epoch instead, which
  * retires every emitted epoch check at once.
+ *
+ * Phase 7 H1 (SMC): guest stores to translated pages are observed two
+ * ways. (1) Every natively-emitted guest store carries a post-store
+ * hook (emitted by src/dbt/dbt.c) calling ppc32_smc_store with the
+ * exact [EA, EA+len); the range is evicted and severed eagerly, so a
+ * chained re-entry can never run stale bytes. The currently-executing
+ * entry is link-severed but never unmapped (a block rewriting itself
+ * finishes its TB-atomic remainder, exactly like qemu). (2) Every
+ * installed block records its guest [start, end) plus a byte snapshot
+ * (ppc32_cache_record_guest, called from dbt.c); dispatch lookups
+ * re-verify the snapshot and evict on mismatch, covering interpreter
+ * single-step stores, difftest restores, and any out-of-band change.
+ * Snapshot words ride in the block's spare pad words (pad0[1..3]); no
+ * struct layout change. Guest data pages stay non-PROT_EXEC on the
+ * host throughout (ppc32_host_prot strips X); only the JIT's own
+ * mappings are ever PROT_EXEC.
  */
 
 #include <stdlib.h>
@@ -132,6 +148,8 @@ static void block_free(ppc32_block_t *e)
             (void)munmap(e->host_code, len);
         }
     }
+    /* H1 SMC snapshot (pad0[3]); NULL when never recorded. */
+    free((void *)(uintptr_t)e->pad0[3]);
     free(e);
 }
 
@@ -154,11 +172,77 @@ static ppc32_block_t *lookup_valid(uint32_t pc)
     return e;
 }
 
+/* H1 SMC: record the guest byte range a block was translated from,
+ * plus a snapshot copy. dbt.c calls this right after install, while
+ * the bytes just fetched are still current. Empty ranges (fallback
+ * single-exit blocks) record no snapshot and always verify clean. */
+void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
+    uint32_t start, uint32_t end)
+{
+    uint64_t len;
+
+    if (e == NULL) {
+        return;
+    }
+    e->pad0[1] = (uint64_t)start;
+    e->pad0[2] = (uint64_t)end;
+    e->pad0[3] = (uint64_t)0;
+    if (ctx == NULL || !ctx->vm_ready) {
+        return;
+    }
+    len = (uint64_t)end - (uint64_t)start;
+    if (end <= start || len > 4096ULL) {
+        return;
+    }
+    {
+        uint8_t *snap = (uint8_t *)malloc((size_t)len);
+
+        if (snap == NULL) {
+            return;
+        }
+        memcpy(snap, ppc32_guest_ptr(ctx, start), (size_t)len);
+        e->pad0[3] = (uint64_t)(uintptr_t)snap;
+    }
+}
+
+/* H1 SMC: verify the recorded guest bytes are still current. True
+ * when no snapshot was recorded, or the bytes still match. */
+static bool snapshot_clean(ppc32_ctx_t *ctx, const ppc32_block_t *e)
+{
+    const uint8_t *snap;
+    uint64_t len;
+
+    if (ctx == NULL || e == NULL) {
+        return true;
+    }
+    snap = (const uint8_t *)(uintptr_t)e->pad0[3];
+    if (snap == NULL) {
+        return true;
+    }
+    len = e->pad0[2] - e->pad0[1];
+    if (len == 0ULL || len > 4096ULL || !ctx->vm_ready) {
+        return true;
+    }
+    return memcmp(snap, ppc32_guest_ptr(ctx, (uint32_t)e->pad0[1]),
+        (size_t)len) == 0;
+}
+
 ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc)
 {
     ppc32_block_t *e = lookup_valid(pc);
 
     if (e != NULL) {
+        if (!snapshot_clean(ctx, e)) {
+            /* Guest bytes changed under this block (store via the
+             * interpreter, difftest restore, or any out-of-band
+             * write): evict eagerly and report a miss so the caller
+             * retranslates the fresh bytes. Chained entries cannot
+             * reach here stale: native stores hook ppc32_smc_store
+             * before any chained re-entry. */
+            ppc32_cache_invalidate_range(ctx, (uint32_t)e->pad0[1],
+                (uint32_t)e->pad0[2]);
+            return NULL;
+        }
         ibtc_fill(ctx, pc, e);
     }
     return e;
@@ -285,8 +369,8 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     return e;
 }
 
-void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
-    uint32_t end)
+void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
+    uint32_t end, ppc32_block_t *skip)
 {
     uint32_t pg;
 
@@ -310,10 +394,23 @@ void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
             continue;
         }
         if (e->guest_pc >= start && e->guest_pc < end) {
+            if (e == skip) {
+                /* H1 SMC: the currently-executing entry is
+                 * link-severed but never unmapped (see below). */
+                continue;
+            }
             sever_links_to(e);
             s_table[i] = NULL;
             block_free(e);
         }
+    }
+    if (skip != NULL && (uint32_t)skip->pad0[1] < end &&
+        (uint32_t)skip->pad0[2] > start) {
+        /* The executing entry overlaps the stored range: sever
+         * incoming chains to it (any later re-entry must dispatch
+         * on the bumped page version and retranslate the fresh
+         * bytes) but keep executing the TB-atomic remainder. */
+        sever_links_to(skip);
     }
     /* Sweep links that referenced evicted entries from surviving blocks
      * whose slot lists were recorded before eviction (sever_links_to
@@ -334,6 +431,35 @@ void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
     if (ctx != NULL) {
         ctx->icache_flushes++;
     }
+}
+
+void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
+    uint32_t end)
+{
+    ppc32_cache_invalidate_range_skip(ctx, start, end, NULL);
+}
+
+/* H1 SMC post-store hook (called from JIT-emitted code right after a
+ * natively-emitted guest store of `len` bytes at `ea`; `cur` is the
+ * executing entry, x27 at the call site). Evicts and severs every
+ * overlapping translation so no chained re-entry can run stale
+ * bytes; the executing entry itself is only link-severed, never
+ * unmapped mid-execution. Wrap-around ranges flush everything. */
+void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
+    void *cur)
+{
+    uint64_t end;
+
+    if (ctx == NULL || len == 0U || len > 4096U) {
+        return;
+    }
+    end = (uint64_t)ea + (uint64_t)len;
+    if (end > 0x100000000ULL) {
+        ppc32_cache_invalidate_all(ctx);
+        return;
+    }
+    ppc32_cache_invalidate_range_skip(ctx, ea, (uint32_t)end,
+        (ppc32_block_t *)cur);
 }
 
 void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx)
