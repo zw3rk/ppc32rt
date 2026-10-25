@@ -505,11 +505,15 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
         !thread_range_ok(parent, parent_tid_va, 4U)) {
         return -EFAULT;
     }
-    if ((flags & PPC32_CLONE_CHILD_SETTID) != 0U &&
+    /* A NULL set/clear pointer means "no record" (the host kernel
+     * tolerates it for this flag combination — oracle-proven: BusyBox
+     * spawn passes child_tid 0 with CHILD_SETTID|CHILD_CLEARTID — so
+     * only validate nonzero pointers instead of failing the clone). */
+    if ((flags & PPC32_CLONE_CHILD_SETTID) != 0U && child_tid_va != 0U &&
         !thread_range_ok(parent, child_tid_va, 4U)) {
         return -EFAULT;
     }
-    if ((flags & PPC32_CLONE_CHILD_CLEARTID) != 0U &&
+    if ((flags & PPC32_CLONE_CHILD_CLEARTID) != 0U && child_tid_va != 0U &&
         !thread_range_ok(parent, child_tid_va, 4U)) {
         return -EFAULT;
     }
@@ -543,10 +547,10 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
     if ((flags & PPC32_CLONE_PARENT_SETTID) != 0U) {
         thread_st32be(parent, parent_tid_va, child_tid);
     }
-    if ((flags & PPC32_CLONE_CHILD_SETTID) != 0U) {
+    if ((flags & PPC32_CLONE_CHILD_SETTID) != 0U && child_tid_va != 0U) {
         thread_st32be(child, child_tid_va, child_tid);
     }
-    if ((flags & PPC32_CLONE_CHILD_CLEARTID) != 0U) {
+    if ((flags & PPC32_CLONE_CHILD_CLEARTID) != 0U && child_tid_va != 0U) {
         child->clear_child_tid = child_tid_va;
     }
     /* The reservation dies at clone birth on both sides (SPEC 2.2). */

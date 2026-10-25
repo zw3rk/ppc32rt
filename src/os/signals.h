@@ -169,5 +169,9 @@ int ppc32_sig_restore_frame(ppc32_ctx_t *ctx, uint32_t frame_va);
  */
 long ppc32_sig_deliver_sync(ppc32_ctx_t *ctx, int sig, int code,
     uint32_t fault_addr, uint32_t is_store);
+/* kill(2) self-delivery fast path (see signals.c): 1 when fully applied
+ * (handler entered, no tail advance), 0 with *out_ret for the tail. */
+int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
+    long *out_ret);
 
 #endif /* PPC32RT_OS_SIGNALS_H */

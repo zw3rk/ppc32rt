@@ -48,4 +48,9 @@ int ppc32_procfs_open(ppc32_ctx_t *ctx, const char *path);
 long ppc32_procfs_readlink(ppc32_ctx_t *ctx, uint32_t path_va,
     uint32_t buf_va, uint32_t bufsiz);
 
+/* readlinkat(296): absolute paths and AT_FDCWD delegate to readlink
+ * above; dirfd-relative paths resolve through /proc/self/fd. */
+long ppc32_procfs_readlinkat(ppc32_ctx_t *ctx, uint32_t dfd_va,
+    uint32_t path_va, uint32_t buf_va, uint32_t bufsiz);
+
 #endif /* PPC32RT_OS_PROCFS_H */

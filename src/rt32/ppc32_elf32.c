@@ -98,6 +98,41 @@ static void elf_swap_phdr(elf32_phdr_t *p)
     p->p_align  = ppc32_be32(p->p_align);
 }
 
+/* Resolve an absolute guest path against the sysroot into out (out_len
+ * bytes): "<sysroot><guest_path>" when a sysroot is configured, else a
+ * plain copy. Returns 0 on success, -1 when the inputs do not fit.
+ * The syscall layer (openat/access/statx) shares this with the loader
+ * above so guest-absolute paths see one consistent sysroot view. */
+int ppc32_sysroot_path(const ppc32_ctx_t *ctx, const char *guest_path,
+    char *out, size_t out_len)
+{
+    if (guest_path == NULL || guest_path[0] == '\0' || out == NULL ||
+        out_len == 0U) {
+        return -1;
+    }
+    if (ctx != NULL && guest_path[0] == '/' && ctx->sysroot != NULL &&
+        ctx->sysroot[0] != '\0') {
+        int n = snprintf(out, out_len, "%s%s", ctx->sysroot, guest_path);
+
+        if (n > 0 && (size_t)n < out_len) {
+            return 0;
+        }
+        return -1;
+    }
+    {
+        size_t i;
+
+        for (i = 0U; guest_path[i] != '\0'; i++) {
+            if (i + 1U >= out_len) {
+                return -1;
+            }
+            out[i] = guest_path[i];
+        }
+        out[i] = '\0';
+    }
+    return 0;
+}
+
 int ppc32_open_guest_ro(const ppc32_ctx_t *ctx, const char *guest_path)
 {
     if (guest_path == NULL || guest_path[0] == '\0') {

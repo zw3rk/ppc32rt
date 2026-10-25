@@ -56,6 +56,9 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
  * options passthrough, BE struct rusage (NULL/0 skips). */
 long ppc32_proc_wait4(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t status_va,
     uint32_t options, uint32_t rusage_va);
+/* getpid(2): the host pid is the guest pid in the single-process model
+ * (fork children refresh it via proc_fork). */
+long ppc32_proc_getpid(void);
 
 /* waitid: idtype (P_ALL 0, P_PID 1, P_PGID 2), id, 128 B BE siginfo
  * out, options passthrough. WNOWAIT is rejected with -EINVAL (the

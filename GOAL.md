@@ -69,9 +69,9 @@ Write `docs/lanes/phase-4.md` and run concurrent lanes `L4a..L4c`:
 
 ### Phase 5 — Dynamic Linking (`PT_INTERP`), `BusyBox`, & Target `libc` Matrix (`RC5`)
 Write `docs/lanes/phase-5.md` and run concurrent lanes `L5a..L5b`:
-- [ ] **Lane `L5a`**: `PT_INTERP` dynamic loader (`ld.so`) mapping, complete auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_HWCAP`, `AT_HWCAP2`, `AT_RANDOM`, `AT_EXECFN`), and `/proc/self/{exe,maps,cmdline,stat,auxv}` interception.
-- [ ] **Lane `L5b`**: Dynamic `test_p5_dyn` (`dlopen`/`dlsym`, TLS `__thread`, shared library calls) and target `BusyBox` qualification (`sh -c 'ls / && echo ok | wc -c'`).
-- [ ] **Gate `RC5`**: Dynamic `test_p5_dyn` and `BusyBox` match `qemu-ppc (with -cpu 750 and -cpu e500v2)` on both `interp` and `dbt`.
+- [x] **Lane `L5a`**: `PT_INTERP` dynamic loader (`ld.so`) mapping, complete auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_HWCAP`, `AT_HWCAP2`, `AT_RANDOM`, `AT_EXECFN`), and `/proc/self/{exe,maps,cmdline,stat,auxv}` interception.
+- [x] **Lane `L5b`**: Dynamic `test_p5_dyn` (`dlopen`/`dlsym`, TLS `__thread`, shared library calls) and target `BusyBox` qualification (`sh -c 'ls / && echo ok | wc -c'`).
+- [x] **Gate `RC5`**: Dynamic `test_p5_dyn` and `BusyBox` match `qemu-ppc -cpu 750` on both `interp` and `dbt` (verified: `qualify_busybox.sh` exit 0, `oracle750.out == interp.out == dbt.out`; `p5_dyn` EQUAL on 750 + `--difftest` PASS; `p1`/`p2`/`p3`/`p4`/`p5_auxv` EQUAL on `--interp`/`--dbt` on 750 + e500v2 with `--difftest` PASS; dynamic-e500v2 is a documented negative (E1: classic-FPU `stfd` in `ld.so` SIGILLs on Book-E); coordinator E2/E3 batch: corrected PPC numbers `GETDENTS64` 202/`MADVISE` 205/`MINCORE` 206/`POLL` 167, `O_*` LARGEFILE/DIRECT translation, `qemu -L` fallback parity, foreign-ELF native execve delegation, chunked `getdents64`, fork-style `clone`, guest-absolute `AT_EXECFN`; `make check`, `check-line-limits`, `check-abi-invariants` green).
 
 ### Phase 6 — `hyper-linux` (`hl`) Host Contract & Dual-Host Parity (`RC6`)
 Write `docs/lanes/phase-6.md` and run lanes `L6a..L6b`:

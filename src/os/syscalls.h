@@ -33,6 +33,23 @@
 void ppc32_syscall(ppc32_ctx_t *ctx);
 int ppc32_syscall_is_exit(uint32_t nr);
 
+/* Longest guest path buffer shared by the file layer. */
+#define PPC32_PATH_MAX 4096U
+
+/* RC5 file layer (syscalls_file.c): openat plus the PPC/host O_*
+ * translation (LARGEFILE 0200000 and DIRECT 0400000 trade places;
+ * all other bits pass). */
+long sys_openat(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
+    uint32_t flags, uint32_t mode);
+uint32_t ppc32_open_flags_ppc2host(uint32_t flags);
+uint32_t ppc32_open_flags_host2ppc(uint32_t flags);
+
+/* RC5 dynamic-loading layer (syscalls_dyn.c): access/statx/getcwd/
+ * rlimit/dents64/ids. Returns 1 with `*out_ret` set when owned. */
+int ppc32_dyn_dispatch(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
+    uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5,
+    long *out_ret);
+
 /* RC4 inline clone child (main.c): drive `child` to guest exit on the
  * calling host thread through the child's own engine loop (syscall
  * dispatch, fault/trap delivery, exit interception). Returns the guest

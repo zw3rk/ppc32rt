@@ -27,7 +27,9 @@
 #include "os/signals.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "os/sigframe_ppc32.h"
 #include "os/syscall_nr.h"
@@ -706,6 +708,61 @@ static long sys_sigaltstack(ppc32_ctx_t *ctx, uint32_t uss_va,
 int ppc32_sig_nr_no_advance(uint32_t nr)
 {
     return (nr == PPC32_NR_RT_SIGRETURN) ? 1 : 0;
+}
+
+/* kill(2): self-delivery goes through the guest signal layer (a host
+ * kill would bypass the installed handler and slay the translator);
+ * anything else forwards to the host (fork children are real host
+ * processes, so kill/wait4 on them behave natively). Returns 1 when the
+ * call was fully applied inside (E01 + nip + syscalls_executed all
+ * handled, ppc32_sig_deliver_sync entered the handler); 0 with *out_ret
+ * set when the generic tail (E01 + advance) still applies. Moved here
+ * from syscalls.c in RC5 (file-size discipline): the signal layer owns
+ * delivery, so it owns the self-delivery fast path too. */
+int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
+    long *out_ret)
+{
+    ppc32_sigact_t act;
+
+    if (out_ret == NULL) {
+        return 0;
+    }
+    if (sig < 1U || sig > PPC32_NSIG) {
+        *out_ret = -EINVAL;
+        return 0;
+    }
+    if ((pid_t)(int32_t)pid_va != getpid()) {
+        *out_ret = (kill((pid_t)(int32_t)pid_va, (int)sig) == 0) ? 0L :
+            -(long)errno;
+        return 0;
+    }
+    if (ppc32_sigaction_get((int)sig, &act) != 0) {
+        *out_ret = -EINVAL;
+        return 0;
+    }
+    if (act.handler != PPC32_SIG_DFL && act.handler != PPC32_SIG_IGN) {
+        /* Handled: success return first (post-sc nip is what the frame
+         * captures), then redirect into the handler; the tail must not
+         * advance nip a second time. */
+        ctx->gpr[3] = 0U;
+        ctx->cr &= (uint32_t)~PPC32_CR0_SO;
+        ctx->nip += 4U;
+        ctx->syscalls_executed++;
+        if (ppc32_sig_deliver_sync(ctx, (int)sig, 0, 0U, 0U) != 0) {
+            raise(SIGSEGV);
+            *out_ret = -EFAULT;
+            return 0;
+        }
+        return 1;
+    }
+    if (act.handler == PPC32_SIG_IGN) {
+        *out_ret = 0L;
+        return 0;
+    }
+    /* Default disposition: let the host apply it (fatal signals terminate
+     * us exactly like the qemu-ppc oracle dies; ignore-defaults return). */
+    *out_ret = (raise((int)sig) == 0) ? 0L : -(long)errno;
+    return 0;
 }
 
 int ppc32_sig_syscall(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,

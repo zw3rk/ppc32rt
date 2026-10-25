@@ -74,6 +74,10 @@ typedef struct ppc32_elf_info {
 } ppc32_elf_info_t;
 
 int ppc32_open_guest_ro(const ppc32_ctx_t *ctx, const char *guest_path);
+/* Resolve an absolute guest path against ctx->sysroot (RC5 dynamic
+ * loading); plain copy when no sysroot applies. 0 ok, -1 on overflow. */
+int ppc32_sysroot_path(const ppc32_ctx_t *ctx, const char *guest_path,
+    char *out, size_t out_len);
 int ppc32_elf_load(ppc32_ctx_t *ctx, int exec_fd, const char *path,
                   ppc32_elf_info_t *out_info);
 /* No kuser helper page exists on PPC32: the synthetic ppc32 vDSO/sigtramp

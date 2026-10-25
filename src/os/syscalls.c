@@ -13,8 +13,10 @@
  * Memory-backed calls delegate to the frozen rt32 window manager
  * (src/rt32/ppc32.h); fd and time calls use direct host calls. Char
  * buffers are byte streams (no byte-swap); every multi-byte struct
- * field converts through os/convert.h. The guest O_* flag bits match
- * the host asm-generic values, so open flags pass through. Phase 4
+ * field converts through os/convert.h. Four guest O_* flag bits differ
+ * from the host asm-generic layout (DIRECTORY/NOFOLLOW/LARGEFILE/DIRECT),
+ * so syscalls_file.c translates them on every open/fcntl crossing.
+ * Phase 4
  * (RC4) wires the lane-owned layers: signals via os/signals.h
  * (ppc32_sig_syscall, no-advance rt_sigreturn), threads via os/threads.h
  * (clone/futex/set_tid_address), and process lifecycle via os/proc.h
@@ -35,6 +37,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -82,7 +85,6 @@
 #define PPC32_UTS_FIELD 65U
 #define PPC32_UTS_FIELDS 6U
 
-#define PPC32_PATH_MAX 4096U
 #define PPC32_IOV_CHUNK 16U
 #define PPC32_IOV_MAX 1024U
 
@@ -170,28 +172,7 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
     return (long)total;
 }
 
-static long sys_openat(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
-    uint32_t flags, uint32_t mode)
-{
-    char path[PPC32_PATH_MAX];
-    int host_dfd;
-    int fd;
-
-    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
-        return -EFAULT;
-    }
-    /* Phase 5 L5a: /proc/self/... opens serve synthetic translator state. */
-    if (ppc32_procfs_kind(path) != PPC32_PROCFS_NONE) {
-        return (long)ppc32_procfs_open(ctx, path);
-    }
-    /* AT_FDCWD (-100) is ABI-identical; anything else is a guest fd. */
-    host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? -100 : (int)dfd_va;
-    fd = openat(host_dfd, path, (int)flags, (mode_t)(mode & 07777U));
-    if (fd < 0) {
-        return -(long)errno;
-    }
-    return (long)fd;
-}
+/* File opens live in syscalls_file.c (PPC/host O_* translation). */
 
 static long sys_close(uint32_t fd)
 {
@@ -387,9 +368,13 @@ static long sys_getrandom(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
 }
 
 /* E01 return convention (SPEC 2.3, experiments/E01): classify on the
- * kernel-style long, never on the magnitude of the truncated r3 alone. */
-static void sys_apply_ret(ppc32_ctx_t *ctx, long ret)
+ * kernel-style long, never on the magnitude of the truncated r3 alone.
+ * Under --trace, also reports the kernel-style result (G3 bring-up). */
+static void sys_apply_ret(ppc32_ctx_t *ctx, uint32_t nr, long ret)
 {
+    if (ctx->trace_syscalls) {
+        fprintf(stderr, "  sc=%u -> %ld\n", nr, ret);
+    }
     if (ret < 0L && ret >= -4095L) {
         ctx->gpr[3] = (uint32_t)(-ret);
         ctx->cr |= PPC32_CR0_SO;
@@ -399,60 +384,8 @@ static void sys_apply_ret(ppc32_ctx_t *ctx, long ret)
     }
 }
 
-static long sys_getpid(void)
-{
-    return (long)getpid();
-}
-
-/* kill(2): self-delivery goes through the guest signal layer (a host
- * kill would bypass the installed handler and slay the translator);
- * anything else forwards to the host (fork children are real host
- * processes, so kill/wait4 on them behave natively). Returns 1 when the
- * call was fully applied inside (E01 + nip + syscalls_executed all
- * handled, ppc32_sig_deliver_sync entered the handler); 0 with *out_ret
- * set when the generic tail (E01 + advance) still applies. */
-static int sys_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
-    long *out_ret)
-{
-    ppc32_sigact_t act;
-
-    if (sig < 1U || sig > PPC32_NSIG) {
-        *out_ret = -EINVAL;
-        return 0;
-    }
-    if ((pid_t)(int32_t)pid_va != getpid()) {
-        *out_ret = (kill((pid_t)(int32_t)pid_va, (int)sig) == 0) ? 0L :
-            -(long)errno;
-        return 0;
-    }
-    if (ppc32_sigaction_get((int)sig, &act) != 0) {
-        *out_ret = -EINVAL;
-        return 0;
-    }
-    if (act.handler != PPC32_SIG_DFL && act.handler != PPC32_SIG_IGN) {
-        /* Handled: success return first (post-sc nip is what the frame
-         * captures), then redirect into the handler; the tail must not
-         * advance nip a second time. */
-        ctx->gpr[3] = 0U;
-        ctx->cr &= (uint32_t)~PPC32_CR0_SO;
-        ctx->nip += 4U;
-        ctx->syscalls_executed++;
-        if (ppc32_sig_deliver_sync(ctx, (int)sig, 0, 0U, 0U) != 0) {
-            raise(SIGSEGV);
-            *out_ret = -EFAULT;
-            return 0;
-        }
-        return 1;
-    }
-    if (act.handler == PPC32_SIG_IGN) {
-        *out_ret = 0L;
-        return 0;
-    }
-    /* Default disposition: let the host apply it (fatal signals terminate
-     * us exactly like the qemu-ppc oracle dies; ignore-defaults return). */
-    *out_ret = (raise((int)sig) == 0) ? 0L : -(long)errno;
-    return 0;
-}
+/* getpid(2) and kill(2) live in their owning layers (proc.c, signals.c):
+ * the switch below calls ppc32_proc_getpid and ppc32_sig_kill. */
 
 /* RC4 synchronous-clone reaping. Inline clone children (see the CLONE
  * case) exit before the clone sc returns and own no host process, so a
@@ -529,15 +462,34 @@ static int sync_kid_reap(ppc32_ctx_t *ctx, uint32_t pid_va,
 
 static long sys_fcntl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t cmd, uint32_t arg)
 {
-    /* F_* numbers used here are Linux-generic: pass through. */
+    /* F_* numbers used here are Linux-generic: pass through, except
+     * file-status flags (F_SETFL in, F_GETFL out), whose O_DIRECT and
+     * O_LARGEFILE bits trade places (see syscalls_file.c). */
     switch (cmd) {
     case 0U: /* F_DUPFD */
     case 1U: /* F_GETFD */
-    case 3U: /* F_GETFL */
     case 2U: /* F_SETFD */
-    case 4U: /* F_SETFL */
     {
         int r = fcntl((int)fd, (int)cmd, (int)arg);
+
+        if (r < 0) {
+            return -(long)errno;
+        }
+        return (long)r;
+    }
+    case 3U: /* F_GETFL */
+    {
+        int r = fcntl((int)fd, (int)cmd);
+
+        if (r < 0) {
+            return -(long)errno;
+        }
+        return (long)(int)ppc32_open_flags_host2ppc((uint32_t)r);
+    }
+    case 4U: /* F_SETFL */
+    {
+        uint32_t host_arg = ppc32_open_flags_ppc2host(arg);
+        int r = fcntl((int)fd, (int)cmd, (int)host_arg);
 
         if (r < 0) {
             return -(long)errno;
@@ -699,6 +651,13 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     ctx->res_valid = 0;
     ctx->reservation_epoch++;
 
+    /* RC5 (G3): guest syscall trace for dynamic bring-up; prints the
+     * number + raw args at entry. Quiet unless --trace is passed. */
+    if (ctx->trace_syscalls) {
+        fprintf(stderr, "ppc32rt: sc=%u(%u,%u,%u,%u,%u,%u)\n", nr, a0, a1,
+            a2, a3, a4, a5);
+    }
+
     /* Phase 4 signal syscalls (L4a): rt_sigaction/procmask/pending,
      * rt_sigreturn, sigaltstack. rt_sigreturn restores nip/r3/cr from
      * the frame, so neither the E01 convention nor the sc advance
@@ -708,7 +667,7 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
 
         if (ppc32_sig_syscall(ctx, nr, a0, a1, a2, a3, &hook)) {
             if (!ppc32_sig_nr_no_advance(nr)) {
-                sys_apply_ret(ctx, hook);
+                sys_apply_ret(ctx, nr, hook);
                 ctx->nip += 4U;
             }
             ctx->syscalls_executed++;
@@ -721,7 +680,7 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         long waited = 0L;
 
         if (sync_kid_reap(ctx, a0, a1, a2, a3, &waited)) {
-            sys_apply_ret(ctx, waited);
+            sys_apply_ret(ctx, nr, waited);
             ctx->nip += 4U;
             ctx->syscalls_executed++;
             return;
@@ -732,6 +691,18 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
      * tail, including the execve-success no-advance reparking). */
     if (ppc32_proc_dispatch(ctx, nr, a0, a1, a2, a3, a4, a5)) {
         return;
+    }
+    /* RC5 dynamic-loading layer (access/statx/getcwd/rlimit/dents64/
+     * ids). Owned numbers take the common E01 + advance tail below. */
+    {
+        long dyn = 0L;
+
+        if (ppc32_dyn_dispatch(ctx, nr, a0, a1, a2, a3, a4, a5, &dyn)) {
+            sys_apply_ret(ctx, nr, dyn);
+            ctx->nip += 4U;
+            ctx->syscalls_executed++;
+            return;
+        }
     }
 
     switch (nr) {
@@ -768,6 +739,11 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         /* Phase 5 L5a: /proc/self/exe keeps symlink semantics; other
          * paths fall through to the host readlink inside procfs.c. */
         ret = ppc32_procfs_readlink(ctx, a0, a1, a2);
+        break;
+    case PPC32_NR_READLINKAT:
+        /* RC5: readlinkat (BusyBox resolves /proc/self/exe through it);
+         * dirfd-relative resolution matches openat semantics. */
+        ret = ppc32_procfs_readlinkat(ctx, a0, a1, a2, a3);
         break;
     case PPC32_NR_UNLINK:
         ret = sys_unlink(ctx, a0);
@@ -827,19 +803,20 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         ret = ppc32_futex(ctx, a0, a1, a2, a3, a4, a5);
         break;
     case PPC32_NR_FCNTL:
+    case PPC32_NR_FCNTL64:
         ret = sys_fcntl(ctx, a0, a1, a2);
         break;
     case PPC32_NR_IOCTL:
         ret = sys_ioctl(ctx, a0, a1, a2);
         break;
     case PPC32_NR_GETPID:
-        ret = sys_getpid();
+        ret = ppc32_proc_getpid();
         break;
     case PPC32_NR_KILL:
     {
         long killed = 0L;
 
-        if (sys_kill(ctx, a0, a1, &killed)) {
+        if (ppc32_sig_kill(ctx, a0, a1, &killed)) {
             return;
         }
         ret = killed;
@@ -855,6 +832,38 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
          * difftest (whose snapshot refreshes after this dispatch). A
          * host-thread child would race the interpreter's non-atomic
          * reservation ops; true concurrency is a Phase 7 concern. */
+        /* Fork-style clone (no CLONE_VM): process semantics, e.g. the
+         * BusyBox posix_spawn idiom SIGCHLD|CHILD_CLEARTID|CHILD_SETTID.
+         * A host fork copies mm/files/fs exactly like fork(2); thread
+         * semantics w/o an address space stay -EINVAL (kernel parity).
+         * SETTID stores honored; CLEARTID clearing is best-effort. */
+        if ((a0 & PPC32_CLONE_VM) == 0U) {
+            long pid;
+
+            if ((a0 & (PPC32_CLONE_THREAD | PPC32_CLONE_SIGHAND)) != 0U) {
+                ret = -EINVAL;
+                break;
+            }
+            pid = ppc32_proc_fork(ctx);
+            if (pid < 0L) {
+                ret = pid;
+                break;
+            }
+            if (pid == 0L) {
+                if ((a0 & PPC32_CLONE_CHILD_SETTID) != 0U &&
+                    a4 != 0U && ppc32_range_ok(a4, 4U)) {
+                    ppc32_st32be(ctx, a4, ctx->guest_pid);
+                }
+                ret = 0L;
+                break;
+            }
+            if ((a0 & PPC32_CLONE_PARENT_SETTID) != 0U &&
+                a2 != 0U && ppc32_range_ok(a2, 4U)) {
+                ppc32_st32be(ctx, a2, (uint32_t)pid);
+            }
+            ret = pid;
+            break;
+        }
         ppc32_ctx_t *child = NULL;
         long tid = ppc32_clone(ctx, a0, a1, a2, a3, a4, NULL, NULL,
             &child);
@@ -885,7 +894,7 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         break;
     }
 
-    sys_apply_ret(ctx, ret);
+    sys_apply_ret(ctx, nr, ret);
     ctx->syscalls_executed++;
     ctx->nip += 4U;
 }

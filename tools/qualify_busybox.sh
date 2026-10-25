@@ -8,14 +8,16 @@
 #
 # Runs INSIDE the Phase 5 lane container (Debian --platform linux/arm64
 # with gcc-powerpc-linux-gnu, qemu-user, file, make, curl, xz-utils,
-# bzip2, ca-certificates): builds
+# bzip2, ca-certificates, gcc): builds
 # BusyBox from source with powerpc-linux-gnu- (static), then runs
 #   sh -c 'ls / && echo ok | wc -c'
-# under the oracle (qemu-ppc -cpu 750 and -cpu e500v2, -L sysroot) and
-# under ppc32rt --interp / --dbt, and byte-diffs all outputs against the
-# oracle. Exit 0 on identical output, 1 otherwise. Every step is bounded
-# (timeout --kill-after=30s); remove the lane container on exit (the
-# caller owns `docker rm`).
+# under the oracle (qemu-ppc -cpu 750, -L sysroot) and under ppc32rt
+# --interp / --dbt, and byte-diffs all outputs against the 750 oracle.
+# Exit 0 on identical output, 1 otherwise. The -cpu e500v2 oracle is a
+# best-effort probe only (RC5 E1: powerpc userspace SIGILLs on Book-E;
+# the static e500v2 check lives with the freestanding fixtures).
+# Every step is bounded (timeout --kill-after=30s); remove the lane
+# container on exit (the caller owns `docker rm`).
 #
 # Environment overrides:
 #   BUSYBOX_VERSION  source release (default 1.37.0)
@@ -64,12 +66,12 @@ else
     exit 2
 fi
 
-if [ ! -x "$PPC32RT" ]; then
-    case $PPC32RT in
-        /*) ;;
-        *) PPC32RT="$root/$PPC32RT" ;;
-    esac
-fi
+# Absolutize up front: the workload runs from WORKDIR below, so a
+# repo-relative PPC32RT must be anchored at the repo root now.
+case $PPC32RT in
+    /*) ;;
+    *) PPC32RT="$root/$PPC32RT" ;;
+esac
 if [ ! -x "$PPC32RT" ]; then
     log "translator not executable: $PPC32RT"
     exit 2
@@ -134,9 +136,13 @@ fi
 log "oracle -cpu 750"
 $STEP_TIMEOUT 60s qemu-ppc -cpu 750 -L "$SYSROOT" \
     "$WORKDIR/busybox" sh -c "$GUEST_CMD" >oracle750.out 2>oracle750.err
-log "oracle -cpu e500v2"
+log "oracle -cpu e500v2 (best-effort probe, RC5 E1)"
+set +e
 $STEP_TIMEOUT 60s qemu-ppc -cpu e500v2 -L "$SYSROOT" \
     "$WORKDIR/busybox" sh -c "$GUEST_CMD" >oraclee500v2.out 2>oraclee500v2.err
+e500v2_rc=$?
+set -e
+log "e500v2 oracle exit=$e500v2_rc (nonzero documents the E1 negative)"
 log "translator --interp"
 $STEP_TIMEOUT 60s "$PPC32RT" --interp -- "$WORKDIR/busybox" sh -c \
     "$GUEST_CMD" >interp.out 2>interp.err
@@ -145,7 +151,7 @@ $STEP_TIMEOUT 60s "$PPC32RT" --dbt -- "$WORKDIR/busybox" sh -c \
     "$GUEST_CMD" >dbt.out 2>dbt.err
 
 fail=0
-for f in oraclee500v2.out interp.out dbt.out; do
+for f in interp.out dbt.out; do
     if cmp -s oracle750.out "$f"; then
         log "identical: oracle750.out == $f"
     else

@@ -373,6 +373,68 @@ int ppc32_procfs_open(ppc32_ctx_t *ctx, const char *path)
     return fd;
 }
 
+long ppc32_procfs_readlinkat(ppc32_ctx_t *ctx, uint32_t dfd_va,
+    uint32_t path_va, uint32_t buf_va, uint32_t bufsiz)
+{
+    char path[PROCFS_PATH_MAX];
+    char rel[PROCFS_PATH_MAX + 32U];
+    char tmp[PROCFS_PATH_MAX];
+    size_t want;
+    ssize_t n;
+    int m;
+
+    if (ctx == NULL) {
+        return -EFAULT;
+    }
+    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
+        return -EFAULT;
+    }
+    if (bufsiz == 0U) {
+        return -EINVAL;
+    }
+    /* Absolute paths and AT_FDCWD share the readlink core. */
+    if (path[0] == '/' || dfd_va == (uint32_t)(int32_t)-100) {
+        return ppc32_procfs_readlink(ctx, path_va, buf_va, bufsiz);
+    }
+    /* dirfd-relative: open O_PATH|O_NOFOLLOW (no final-symlink
+     * traversal), then read the /proc/self/fd link of the new fd.
+     * O_PATH is Linux-only; elsewhere report ENOSYS for this form
+     * (absolute paths and AT_FDCWD above stay portable). */
+#ifdef __linux__
+    {
+        int fd = openat((int)dfd_va, path,
+            O_PATH | O_NOFOLLOW | O_CLOEXEC);
+
+        if (fd < 0) {
+            return -(long)errno;
+        }
+        m = snprintf(rel, sizeof rel, "/proc/self/fd/%d", fd);
+        if (m < 0 || (size_t)m >= sizeof rel) {
+            close(fd);
+            return -ENAMETOOLONG;
+        }
+        want = ((size_t)bufsiz < sizeof tmp) ? (size_t)bufsiz :
+            sizeof tmp;
+        n = readlink(rel, tmp, want);
+        close(fd);
+        if (n < 0) {
+            return -(long)errno;
+        }
+        if (ppc32_copyout(ctx, buf_va, tmp, (size_t)n) != 0) {
+            return -EFAULT;
+        }
+        return (long)n;
+    }
+#else
+    (void)m;
+    (void)n;
+    (void)rel;
+    (void)tmp;
+    (void)want;
+    return -ENOSYS;
+#endif
+}
+
 long ppc32_procfs_readlink(ppc32_ctx_t *ctx, uint32_t path_va,
     uint32_t buf_va, uint32_t bufsiz)
 {

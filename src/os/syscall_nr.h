@@ -49,6 +49,10 @@
 #define PPC32_NR_GETEGID         50U
 #define PPC32_NR_IOCTL           54U
 #define PPC32_NR_FCNTL           55U
+/* RC5: PPC uses fcntl64(204) for the modern fcntl interface (BusyBox
+ * spawn dup's pipes via F_DUPFD_CLOEXEC); the F_* commands are
+ * Linux-generic, so 204 shares the sys_fcntl implementation. */
+#define PPC32_NR_FCNTL64         204U
 #define PPC32_NR_SETPGID         57U
 #define PPC32_NR_UMASK           60U
 #define PPC32_NR_CHROOT          61U
@@ -84,8 +88,8 @@
 #define PPC32_NR_MUNLOCK         151U
 #define PPC32_NR_MREMAP          163U
 #define PPC32_NR_MMAP2           192U
-#define PPC32_NR_MINCORE         218U
-#define PPC32_NR_MADVISE         219U
+#define PPC32_NR_MINCORE         206U
+#define PPC32_NR_MADVISE         205U
 
 /* Filesystem / stat */
 #define PPC32_NR_STATFS          99U
@@ -103,11 +107,14 @@
 #define PPC32_NR_READV           145U
 #define PPC32_NR_WRITEV          146U
 #define PPC32_NR_FDATASYNC       148U
-#define PPC32_NR_GETCWD          183U
+#define PPC32_NR_UGETRLIMIT      190U
+/* RC5: getcwd is 182 (verified against the powerpc sysroot
+ * asm/unistd_32.h; 183 belongs to no ppc32 call). */
+#define PPC32_NR_GETCWD          182U
 #define PPC32_NR_STAT64          195U
 #define PPC32_NR_LSTAT64         196U
 #define PPC32_NR_FSTAT64         197U
-#define PPC32_NR_GETDENTS64      220U
+#define PPC32_NR_GETDENTS64      202U
 
 /* Signals (rt_* arrive with the Phase 4 sigframe lane) */
 #define PPC32_NR_SIGRETURN       119U
@@ -139,9 +146,15 @@
 #define PPC32_NR_SOCKETCALL      102U
 #define PPC32_NR_IPC             117U
 
+/* RC5 dynamic loading (verified against the powerpc sysroot
+ * asm/unistd_32.h): statx is the first fatal gap in ld.so startup;
+ * readlinkat serves /proc/self/exe alongside readlink(85). */
+#define PPC32_NR_READLINKAT      296U
+#define PPC32_NR_STATX           383U
+
 /* Time */
 #define PPC32_NR_NANOSLEEP       162U
-#define PPC32_NR_POLL            168U
+#define PPC32_NR_POLL            167U
 #define PPC32_NR_SENDFILE        186U
 
 #endif /* PPC32_SYSCALL_NR_H */

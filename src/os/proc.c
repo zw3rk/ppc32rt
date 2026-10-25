@@ -94,6 +94,11 @@ static void proc_child_refresh(ppc32_ctx_t *ctx)
     proc_invalidate_reservation(ctx);
 }
 
+long ppc32_proc_getpid(void)
+{
+    return (long)getpid();
+}
+
 long ppc32_proc_fork(ppc32_ctx_t *ctx)
 {
     pid_t pid;
@@ -235,6 +240,11 @@ static long proc_copy_vec(ppc32_ctx_t *ctx, uint32_t vec_va, char ***out,
  * magic, ELFCLASS32, ELFDATA2MSB, EM_PPC(20), ET_EXEC(2)/ET_DYN(3).
  * Runs on the already-open fd via pread, so the caller can reject a
  * foreign binary before ppc32_vm_reset_for_exec. */
+/* Admission classes: 1 runs (32-bit big-endian PowerPC EXEC/DYN),
+ * 0 is a script-or-text fallback (-ENOEXEC, the shell re-execs its own
+ * interpreter like the kernel would), -1 is a valid ELF of another
+ * machine (the caller runs it natively in a host child: qemu-user
+ * parity for host binaries on PATH). */
 static int proc_admission_ok(int fd, const char *path)
 {
     uint8_t h[20];
@@ -251,16 +261,16 @@ static int proc_admission_ok(int fd, const char *path)
         got += (size_t)n;
     }
     if (h[0] != 0x7fU || h[1] != (uint8_t)'E' || h[2] != (uint8_t)'L' ||
-        h[3] != (uint8_t)'F' || h[4] != 1U || h[5] != 2U) {
-        fprintf(stderr, "ppc32rt: %s: not a 32-bit big-endian ELF\n",
-            path);
+        h[3] != (uint8_t)'F') {
         return 0;
+    }
+    if (h[4] != 1U || h[5] != 2U) {
+        return -1;
     }
     type = (uint16_t)(((uint16_t)h[16] << 8) | (uint16_t)h[17]);
     machine = (uint16_t)(((uint16_t)h[18] << 8) | (uint16_t)h[19]);
     if (machine != 20U) {
-        fprintf(stderr, "ppc32rt: %s: not a PowerPC (EM_PPC) ELF\n", path);
-        return 0;
+        return -1;
     }
     if (type != 2U && type != 3U) {
         fprintf(stderr, "ppc32rt: %s: unsupported ELF type %u\n", path,
@@ -306,6 +316,37 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
      * -ENOEXEC while the old image still runs. Deeper load failures past
      * this point still destroy the image (partial-teardown exposure, as
      * on Linux). */
+    /* RC5: /proc/self/exe names the running guest image (BusyBox applets
+     * re-exec it); substitute the guest executable path with the same
+     * priority procfs uses (exec_path, else argv[0]). The literal host
+     * path would open the translator itself and fail admission. */
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        const char *ep = NULL;
+
+        if (ctx->exec_path != NULL) {
+            ep = ctx->exec_path;
+        } else if (ctx->guest_argv != NULL && ctx->guest_argc > 0) {
+            ep = ctx->guest_argv[0];
+        }
+        if (ep == NULL) {
+            proc_free_vec(args, argc);
+            proc_free_vec(env, envc);
+            return -ENOENT;
+        }
+        {
+            size_t i;
+
+            for (i = 0U; ep[i] != '\0'; i++) {
+                if (i + 1U >= sizeof path) {
+                    proc_free_vec(args, argc);
+                    proc_free_vec(env, envc);
+                    return -ENAMETOOLONG;
+                }
+                path[i] = ep[i];
+            }
+            path[i] = '\0';
+        }
+    }
     fd = ppc32_open_guest_ro(ctx, path);
     if (fd < 0) {
         rc = -(long)errno;
@@ -313,11 +354,51 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         proc_free_vec(env, envc);
         return rc;
     }
-    if (!proc_admission_ok(fd, path)) {
-        close(fd);
-        proc_free_vec(args, argc);
-        proc_free_vec(env, envc);
-        return -ENOEXEC;
+    {
+        int adm = proc_admission_ok(fd, path);
+
+        if (adm == 0) {
+            close(fd);
+            proc_free_vec(args, argc);
+            proc_free_vec(env, envc);
+            return -ENOEXEC;
+        }
+        if (adm < 0) {
+            /* Foreign ELF (host arch): run it natively in a host child
+             * (qemu-user parity: the oracle execs host binaries like
+             * /usr/bin/ls natively, so BusyBox applets resolve through
+             * PATH). The waiting guest exits with the native status;
+             * gpr[0] is reparked on EXIT so the engine stops (the
+             * dispatch post-check in main.c picks it up). */
+            pid_t pid;
+            int st = 0;
+            int code;
+
+            close(fd);
+            fflush(NULL);
+            pid = fork();
+            if (pid < 0) {
+                int e = errno;
+
+                proc_free_vec(args, argc);
+                proc_free_vec(env, envc);
+                return -(long)e;
+            }
+            if (pid == 0) {
+                execve(path, args, env);
+                _exit(127);
+            }
+            proc_free_vec(args, argc);
+            proc_free_vec(env, envc);
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+            }
+            code = WIFEXITED(st) ? WEXITSTATUS(st) :
+                (WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 127);
+            ctx->exit_arg = (uint32_t)(code & 0xFF);
+            ctx->gpr[0] = PPC32_NR_EXIT;
+            ctx->gpr[3] = ctx->exit_arg;
+            return (long)code;
+        }
     }
     memset(&info, 0, sizeof info);
     ppc32_vm_reset_for_exec(ctx);
@@ -357,7 +438,38 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     ctx->host_tid = (int)(long)getpid();
     ctx->guest_pid = (uint32_t)(long)getpid();
     ctx->guest_tid = ctx->guest_pid;
-    ctx->exec_path = NULL;
+    /* AT_EXECFN/_dl_get_origin needs the guest-absolute path (the kernel
+     * reports d_path; BusyBox re-execs relative argv[0] when running a
+     * script fallback). Guest cwd == host cwd (no chdir emulation). */
+    {
+        char *ep = NULL;
+
+        if (path[0] == '/') {
+            size_t m = strlen(path);
+
+            ep = (char *)malloc(m + 1U);
+            if (ep != NULL) {
+                memcpy(ep, path, m + 1U);
+            }
+        } else {
+            char cwd[4096];
+
+            if (getcwd(cwd, sizeof cwd) != NULL) {
+                size_t n = strlen(cwd);
+                size_t m = strlen(path);
+
+                if (n + 1U + m + 1U <= sizeof cwd) {
+                    ep = (char *)malloc(n + 1U + m + 1U);
+                    if (ep != NULL) {
+                        memcpy(ep, cwd, n);
+                        ep[n] = '/';
+                        memcpy(ep + n + 1U, path, m + 1U);
+                    }
+                }
+            }
+        }
+        ctx->exec_path = (ep != NULL) ? ep : NULL;
+    }
     use_env = env;
     if (ppc32_stack_setup(ctx, &info, (int)argc, args, use_env, &sp) != 0) {
         proc_free_vec(args, argc);
@@ -369,6 +481,8 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     ctx->nip = ctx->elf_entry;
     ctx->gpr[PPC32_REG_SP] = sp;
     ctx->exit_reason = PPC32_EXIT_NONE;
+    /* The reset cleared vm_ready; the new image + stack are up. */
+    ctx->vm_ready = true;
     /* The new vectors back guest_argv/host_envp from here on (ownership
      * transfers to ctx; execve is rare, so no reclaim). */
     ctx->guest_argc = (int)argc;

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
@@ -39,7 +40,7 @@ static void usage(FILE *out)
         "\n"
         "Usage:\n"
         "  ppc32rt [--interp | --dbt] [--difftest] [--trace]\n"
-        "          [--profile classic|spe] -- PATH [ARGV0...]\n"
+        "          [--profile classic|spe] [--sysroot DIR] -- PATH [ARGV0...]\n"
         "  ppc32rt --help\n"
         "  ppc32rt --version\n"
         "\n"
@@ -102,6 +103,14 @@ static int parse_args(ppc32_ctx_t *ctx, int argc, char **argv)
             i++;
             continue;
         }
+        if (strcmp(argv[i], "--sysroot") == 0) {
+            if (i + 1 >= argc) {
+                return -1;
+            }
+            ctx->sysroot = argv[i + 1];
+            i += 2;
+            continue;
+        }
         if (strcmp(argv[i], "--trace") == 0) {
             ctx->trace_syscalls = true;
             i++;
@@ -150,11 +159,17 @@ static void apply_env(ppc32_ctx_t *ctx)
             }
         }
     }
+    /* RC5 E2: guest sysroot for absolute-path resolution (loader,
+     * openat/access/statx); --sysroot wins over the environment. */
+    if (ctx->sysroot == NULL) {
+        ctx->sysroot = getenv("PPC32RT_SYSROOT");
+    }
 }
 
 static int run_interp(ppc32_ctx_t *ctx);
 static int run_dbt(ppc32_ctx_t *ctx);
 static int run_difftest(ppc32_ctx_t *ctx);
+static int report_stop(ppc32_ctx_t *ctx);
 
 /* RC2 emitter bridge: adapt L2c's ppc32_emit_int (own ctx struct) to the
  * L2b driver callback (single definition lives in dbt.h). emit_begin is
@@ -186,6 +201,30 @@ static void emit_bridge_install(ppc32_ctx_t *ctx)
     ppc32_dbt_set_emitter(emit_bridge_fn);
 }
 
+/* RC5: absolute guest-executable path for /proc/self/exe (ld.so's
+ * _dl_get_origin asserts linkval[0] == '/'; the kernel always reports
+ * an absolute d_path). Falls back to argv as-is when the cwd is
+ * not recoverable. */
+static const char *abs_exec_path(const char *given)
+{
+    static char abs[4096];
+    size_t n;
+
+    if (given == NULL || given[0] == '/') {
+        return given;
+    }
+    if (getcwd(abs, sizeof abs) == NULL) {
+        return given;
+    }
+    n = strlen(abs);
+    if (n + 1U + strlen(given) + 1U > sizeof abs) {
+        return given;
+    }
+    abs[n] = '/';
+    memcpy(abs + n + 1U, given, strlen(given) + 1U);
+    return abs;
+}
+
 int main(int argc, char **argv)
 {
     ppc32_ctx_t ctx;
@@ -201,7 +240,7 @@ int main(int argc, char **argv)
         return 2;
     }
     apply_env(&ctx);
-    ctx.exec_path = argv[path_idx];
+    ctx.exec_path = abs_exec_path(argv[path_idx]);
     ctx.guest_argc = argc - path_idx;
     ctx.guest_argv = &argv[path_idx];
     ctx.host_envp = environ;
@@ -301,6 +340,9 @@ long ppc32_run_guest_child(ppc32_ctx_t *child)
                 return (long)(child->exit_arg & 0xFFU);
             }
             ppc32_syscall(child);
+            if (ppc32_syscall_is_exit(child->gpr[0])) {
+                return (long)(child->exit_arg & 0xFFU);
+            }
             child->exit_reason = PPC32_EXIT_NONE;
             continue;
         }
@@ -331,6 +373,12 @@ static int syscall_dispatch(ppc32_ctx_t *ctx, int *status)
         return 1;
     }
     ppc32_syscall(ctx);
+    /* Native execve delegation reparks gpr[0] on EXIT with the native
+     * status in exit_arg (proc.c): stop the engine like an exit call. */
+    if (ppc32_syscall_is_exit(ctx->gpr[0])) {
+        *status = (int)(ctx->exit_arg & 0xFFU);
+        return 1;
+    }
     ctx->exit_reason = PPC32_EXIT_NONE;
     return 0;
 }
@@ -360,14 +408,21 @@ static int run_interp(ppc32_ctx_t *ctx)
             }
         }
         if (ctx->exit_reason != PPC32_EXIT_SYSCALL) {
-            fprintf(stderr, "ppc32rt: stopped, reason %u at nip 0x%08X\n",
-                ctx->exit_reason, ctx->nip);
-            return 1;
+            return report_stop(ctx);
         }
         if (syscall_dispatch(ctx, &status) != 0) {
             return status;
         }
     }
+}
+
+/* RC5: stop-report helper shared by run_interp/run_dbt: reason, fault
+ * address, and nip on one line for post-mortems. */
+static int report_stop(ppc32_ctx_t *ctx)
+{
+    fprintf(stderr, "ppc32rt: stopped, reason %u addr 0x%08X at nip 0x%08X\n",
+        ctx->exit_reason, ctx->fault_addr, ctx->nip);
+    return 1;
 }
 
 /*
@@ -397,9 +452,7 @@ static int run_dbt(ppc32_ctx_t *ctx)
             }
         }
         if (ctx->exit_reason != PPC32_EXIT_SYSCALL) {
-            fprintf(stderr, "ppc32rt: stopped, reason %u at nip 0x%08X\n",
-                ctx->exit_reason, ctx->nip);
-            return 1;
+            return report_stop(ctx);
         }
         if (syscall_dispatch(ctx, &status) != 0) {
             return status;
@@ -557,6 +610,21 @@ static int run_difftest(ppc32_ctx_t *ctx)
     ref.nip = ctx->elf_entry;
     ref.gpr[PPC32_REG_SP] = sp;
     ref.exit_reason = PPC32_EXIT_NONE;
+    /* RC5: startup metadata the syscall layer (procfs, sysroot) and the
+     * allocator mirrors derive from the main ctx, not the engine loop.
+     * Without these, /proc/self reads fail on the ref side and the DUT
+     * inherits the same gap through sync (L5a id=b0 finding). */
+    ref.guest_argc = ctx->guest_argc;
+    ref.guest_argv = ctx->guest_argv;
+    ref.host_envp = ctx->host_envp;
+    ref.exec_path = ctx->exec_path;
+    ref.sysroot = ctx->sysroot;
+    ref.guest_pid = ctx->guest_pid;
+    ref.trace_syscalls = ctx->trace_syscalls;
+    if (ctx->auxv_bytes <= sizeof ref.auxv_data) {
+        memcpy(ref.auxv_data, ctx->auxv_data, ctx->auxv_bytes);
+        ref.auxv_bytes = ctx->auxv_bytes;
+    }
     /* Prime the ref VM mirrors from the shared globals. */
     ref.brk_base = ctx->brk_base;
     ref.brk_curr = ctx->brk_curr;

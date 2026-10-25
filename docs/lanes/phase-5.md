@@ -83,8 +83,43 @@ dynamic pair builds in the container.
 
 ## `RC5` (coordinator, after both merge)
 
-`test_p5_auxv` and dynamic `test_p5_dyn` (+ BusyBox) match
-`qemu-ppc (with -cpu 750 and -cpu e500v2, -L sysroot)` on both `interp`
-and `dbt` with `--difftest` EQUAL (0 divergences), in a bounded Docker
+`test_p5_auxv` (static) matches `qemu-ppc -cpu 750` and `-cpu e500v2`
+on both `interp` and `dbt` with `--difftest` EQUAL (0 divergences).
+Dynamic `test_p5_dyn` (+ BusyBox) matches `qemu-ppc -cpu 750 -L
+sysroot` on both engines with `--difftest` EQUAL; the `-cpu e500v2`
+dynamic oracle is a documented negative (E1: Debian powerpc userspace
+executes classic-FPU `stfd` inside `ld.so` itself and SIGILLs on
+Book-E — same guest-side root cause as the RC2 `p2`/e500v2 IFUNC
+note; static `p1`/`p4` keep covering e500v2). All in a bounded Docker
 container; `make check`, `make check-line-limits`,
 `check_abi_invariants` green; Phases 0–4 suites unchanged.
+
+## `RC5` gate record (coordinator E2/E3 batch, committed on `master`)
+
+Lane `L5a` merged (`auxv`/`procfs`; `readlink` 85; `test_p5_auxv`
+12/12). Lane `L5b` delivered fixtures + `qualify_busybox.sh` and
+escalated E1 (dynamic-e500v2 negative, same `stfd`-in-`ld.so` root cause
+as the RC2 `p2` note: gate on 750) and E2/E3, which the coordinator
+closed on `master`:
+- Corrected PPC syscall numbers against the sysroot UAPI table
+(`GETDENTS64` 220→202, `MADVISE` 219→205, `MINCORE` 218→206, `POLL`
+168→167; all 118 numbers re-diffed, rest exact).
+- `O_*` translation (`src/os/syscalls_file.c`): PPC `LARGEFILE`
+0200000/`DIRECT` 0400000 trade places with the aarch64 host
+(`DIRECTORY`/`NOFOLLOW` match); verified against
+`arch/arm64` + `asm-powerpc/fcntl.h` after the host rejected
+`O_DIRECTORY|O_DIRECT` with `EINVAL`.
+- `qemu -L` fallback parity: missing sysroot entries resolve to the
+raw path (`openat`, `access`, `statx`); foreign-arch ELF on `execve`
+runs natively in a host child (the oracle execs `/usr/bin/{ls,wc}`
+natively, so BusyBox resolves applets through `PATH`), and the
+waiting guest exits with the native status (`gpr[0]` reparked on
+`EXIT`, post-checks in `main.c`).
+- `getdents64` chunks guest counts above the 8 KiB staging heap;
+fork-style `clone` (no `CLONE_VM`) via host fork with `SETTID`
+stores; execve records the guest-absolute path for `AT_EXECFN`.
+Verified: `qualify_busybox.sh` exit 0 (`oracle750.out ==
+interp.out == dbt.out`); `p1`/`p2`/`p3`/`p4`/`p5_auxv` EQUAL on
+`--interp`/`--dbt` on 750 + e500v2 with `--difftest` PASS;
+`p5_dyn` EQUAL on 750 + `--difftest` PASS; `make check`,
+`check-line-limits`, `check-abi-invariants` green.
