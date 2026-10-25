@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -230,6 +231,45 @@ static long proc_copy_vec(ppc32_ctx_t *ctx, uint32_t vec_va, char ***out,
     return 0;
 }
 
+/* Header probe mirroring the loader's admission (ppc32_elf32.c):
+ * magic, ELFCLASS32, ELFDATA2MSB, EM_PPC(20), ET_EXEC(2)/ET_DYN(3).
+ * Runs on the already-open fd via pread, so the caller can reject a
+ * foreign binary before ppc32_vm_reset_for_exec. */
+static int proc_admission_ok(int fd, const char *path)
+{
+    uint8_t h[20];
+    size_t got = 0U;
+    uint16_t type;
+    uint16_t machine;
+
+    while (got < sizeof h) {
+        ssize_t n = pread(fd, h + got, sizeof h - got, (off_t)got);
+
+        if (n <= 0) {
+            return 0;
+        }
+        got += (size_t)n;
+    }
+    if (h[0] != 0x7fU || h[1] != (uint8_t)'E' || h[2] != (uint8_t)'L' ||
+        h[3] != (uint8_t)'F' || h[4] != 1U || h[5] != 2U) {
+        fprintf(stderr, "ppc32rt: %s: not a 32-bit big-endian ELF\n",
+            path);
+        return 0;
+    }
+    type = (uint16_t)(((uint16_t)h[16] << 8) | (uint16_t)h[17]);
+    machine = (uint16_t)(((uint16_t)h[18] << 8) | (uint16_t)h[19]);
+    if (machine != 20U) {
+        fprintf(stderr, "ppc32rt: %s: not a PowerPC (EM_PPC) ELF\n", path);
+        return 0;
+    }
+    if (type != 2U && type != 3U) {
+        fprintf(stderr, "ppc32rt: %s: unsupported ELF type %u\n", path,
+            (unsigned int)type);
+        return 0;
+    }
+    return 1;
+}
+
 long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     uint32_t envp_va)
 {
@@ -261,14 +301,23 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         return rc;
     }
     /* Admission re-entry (SPEC 1.1): resolve through the sysroot, then
-     * tear the old address space down before loading, so a failed load
-     * still leaves the old image behind (rc < 0 returns early). */
+     * probe the header BEFORE tearing the old address space down, so a
+     * foreign binary (scripts, native host binaries) is rejected with
+     * -ENOEXEC while the old image still runs. Deeper load failures past
+     * this point still destroy the image (partial-teardown exposure, as
+     * on Linux). */
     fd = ppc32_open_guest_ro(ctx, path);
     if (fd < 0) {
         rc = -(long)errno;
         proc_free_vec(args, argc);
         proc_free_vec(env, envc);
         return rc;
+    }
+    if (!proc_admission_ok(fd, path)) {
+        close(fd);
+        proc_free_vec(args, argc);
+        proc_free_vec(env, envc);
+        return -ENOEXEC;
     }
     memset(&info, 0, sizeof info);
     ppc32_vm_reset_for_exec(ctx);

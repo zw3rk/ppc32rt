@@ -14,8 +14,12 @@
  * (src/rt32/ppc32.h); fd and time calls use direct host calls. Char
  * buffers are byte streams (no byte-swap); every multi-byte struct
  * field converts through os/convert.h. The guest O_* flag bits match
- * the host asm-generic values, so open flags pass through; clone and
- * rt_sigprocmask are -ENOSYS stubs (Phase 4 owns threads/signals).
+ * the host asm-generic values, so open flags pass through. Phase 4
+ * (RC4) wires the lane-owned layers: signals via os/signals.h
+ * (ppc32_sig_syscall, no-advance rt_sigreturn), threads via os/threads.h
+ * (clone/futex/set_tid_address), and process lifecycle via os/proc.h
+ * (fork/execve/wait4/pipe/dup2). Old-style sigaction/sigprocmask stay
+ * -ENOSYS (the static-libc oracle path uses the rt_* variants).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -27,6 +31,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -34,11 +40,15 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "os/convert.h"
+#include "os/proc.h"
+#include "os/signals.h"
 #include "os/syscall_nr.h"
+#include "os/threads.h"
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
 
@@ -371,53 +381,145 @@ static long sys_getrandom(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
 #endif
 }
 
-/* FUTEX_WAIT/FUTEX_WAKE (+PRIVATE variants): the guest window is host
- * memory, so the host futex operates on the guest address directly. The
- * WAIT comparator needs the raw little-endian word (the byte-reversed
- * image of the guest's big-endian value), which is exactly what a plain
- * memcpy yields — no ppc32_be32. Single-threaded until Phase 4 wires up
- * clone, so an unmatched WAIT can only return via timeout or signal. */
-static long sys_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
-    uint32_t val, uint32_t timeout_va)
+/* E01 return convention (SPEC 2.3, experiments/E01): classify on the
+ * kernel-style long, never on the magnitude of the truncated r3 alone. */
+static void sys_apply_ret(ppc32_ctx_t *ctx, long ret)
 {
-#ifdef __linux__
-    uint32_t base = op & ~((uint32_t)128U | (uint32_t)256U);
-    int32_t *up;
-    int32_t hval;
-    struct timespec ts;
-    struct timespec *tsp = NULL;
-    long r;
+    if (ret < 0L && ret >= -4095L) {
+        ctx->gpr[3] = (uint32_t)(-ret);
+        ctx->cr |= PPC32_CR0_SO;
+    } else {
+        ctx->gpr[3] = (uint32_t)ret;
+        ctx->cr &= (uint32_t)~PPC32_CR0_SO;
+    }
+}
 
-    if (base != 0U && base != 1U) {
-        return -ENOSYS;
+static long sys_getpid(void)
+{
+    return (long)getpid();
+}
+
+/* kill(2): self-delivery goes through the guest signal layer (a host
+ * kill would bypass the installed handler and slay the translator);
+ * anything else forwards to the host (fork children are real host
+ * processes, so kill/wait4 on them behave natively). Returns 1 when the
+ * call was fully applied inside (E01 + nip + syscalls_executed all
+ * handled, ppc32_sig_deliver_sync entered the handler); 0 with *out_ret
+ * set when the generic tail (E01 + advance) still applies. */
+static int sys_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
+    long *out_ret)
+{
+    ppc32_sigact_t act;
+
+    if (sig < 1U || sig > PPC32_NSIG) {
+        *out_ret = -EINVAL;
+        return 0;
     }
-    if (!ppc32_range_ok(uaddr, 4U)) {
-        return -EFAULT;
+    if ((pid_t)(int32_t)pid_va != getpid()) {
+        *out_ret = (kill((pid_t)(int32_t)pid_va, (int)sig) == 0) ? 0L :
+            -(long)errno;
+        return 0;
     }
-    if (base == 0U && timeout_va != 0U) {
-        if (ppc32_get_timespec(ctx, timeout_va, &ts) != 0) {
-            return -EFAULT;
+    if (ppc32_sigaction_get((int)sig, &act) != 0) {
+        *out_ret = -EINVAL;
+        return 0;
+    }
+    if (act.handler != PPC32_SIG_DFL && act.handler != PPC32_SIG_IGN) {
+        /* Handled: success return first (post-sc nip is what the frame
+         * captures), then redirect into the handler; the tail must not
+         * advance nip a second time. */
+        ctx->gpr[3] = 0U;
+        ctx->cr &= (uint32_t)~PPC32_CR0_SO;
+        ctx->nip += 4U;
+        ctx->syscalls_executed++;
+        if (ppc32_sig_deliver_sync(ctx, (int)sig, 0, 0U, 0U) != 0) {
+            raise(SIGSEGV);
+            *out_ret = -EFAULT;
+            return 0;
         }
-        tsp = &ts;
+        return 1;
     }
-    up = (int32_t *)ppc32_guest_ptr(ctx, uaddr);
-    memcpy(&hval, up, sizeof hval);
-    /* WAIT compares memory against the raw LE word; WAKE takes the guest
-     * count directly. */
-    r = syscall(SYS_futex, up, (int)op,
-        base == 0U ? hval : (int32_t)val, tsp, NULL, 0);
-    if (r < 0) {
-        return -(long)errno;
+    if (act.handler == PPC32_SIG_IGN) {
+        *out_ret = 0L;
+        return 0;
     }
-    return r;
-#else
-    (void)ctx;
-    (void)uaddr;
-    (void)op;
-    (void)val;
-    (void)timeout_va;
-    return -ENOSYS;
-#endif
+    /* Default disposition: let the host apply it (fatal signals terminate
+     * us exactly like the qemu-ppc oracle dies; ignore-defaults return). */
+    *out_ret = (raise((int)sig) == 0) ? 0L : -(long)errno;
+    return 0;
+}
+
+/* RC4 synchronous-clone reaping. Inline clone children (see the CLONE
+ * case) exit before the clone sc returns and own no host process, so a
+ * host wait4/waitpid would report ECHILD; consult this table first. The
+ * stored status is the guest exit code; the reported word is status<<8
+ * like a native wait4 status for _exit(status). WNOHANG with no exited
+ * child reports 0 instead of hanging. */
+#define SYNC_KID_MAX 32U
+
+typedef struct {
+    uint32_t tid;
+    int status;
+    bool used;
+} sync_kid_t;
+
+static sync_kid_t sync_kids[SYNC_KID_MAX];
+
+static void sync_kid_record(uint32_t tid, int status)
+{
+    uint32_t i;
+
+    for (i = 0U; i < SYNC_KID_MAX; i++) {
+        if (!sync_kids[i].used) {
+            sync_kids[i].tid = tid;
+            sync_kids[i].status = status;
+            sync_kids[i].used = true;
+            return;
+        }
+    }
+}
+
+/* Returns 1 with *out_ret set when pid matched a reaped inline child
+ * (E01 + advance still apply in the caller); 0 when pid is not ours. */
+static int sync_kid_reap(ppc32_ctx_t *ctx, uint32_t pid_va,
+    uint32_t status_va, uint32_t options, uint32_t rusage_va, long *out_ret)
+{
+    uint32_t i;
+    uint32_t word;
+
+    for (i = 0U; i < SYNC_KID_MAX; i++) {
+        if (!sync_kids[i].used) {
+            continue;
+        }
+        if (pid_va != 0xFFFFFFFFU && pid_va != sync_kids[i].tid) {
+            continue;
+        }
+        if (status_va != 0U && !ppc32_range_ok(status_va, 4U)) {
+            *out_ret = -EFAULT;
+            return 1;
+        }
+        word = (sync_kids[i].status < 0) ?
+            (uint32_t)(-sync_kids[i].status & 0x7F) :
+            (((uint32_t)sync_kids[i].status & 0xFFU) << 8U);
+        if (status_va != 0U) {
+            ppc32_st32be(ctx, status_va, word);
+        }
+        if (rusage_va != 0U) {
+            if (!ppc32_range_ok(rusage_va, 72U)) {
+                *out_ret = -EFAULT;
+                return 1;
+            }
+            memset(ppc32_guest_ptr(ctx, rusage_va), 0, 72U);
+        }
+        sync_kids[i].used = false;
+        *out_ret = (long)(int32_t)sync_kids[i].tid;
+        return 1;
+    }
+    if (pid_va == 0xFFFFFFFFU && (options & (uint32_t)WNOHANG) != 0U) {
+        *out_ret = 0L;
+        return 1;
+    }
+    return 0;
 }
 
 static long sys_fcntl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t cmd, uint32_t arg)
@@ -561,21 +663,6 @@ static long sys_ioctl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t req, uint32_t arg_
 #endif
 }
 
-static long sys_set_tid_address(ppc32_ctx_t *ctx, uint32_t tidptr_va)
-{
-    long tid;
-
-    ctx->clear_child_tid = tidptr_va;
-    /* Linux returns the caller's thread id; musl uses it to seed the
-     * main thread's tid. Prefer the recorded host tid, else getpid. */
-    if (ctx->host_tid > 0) {
-        tid = (long)ctx->host_tid;
-    } else {
-        tid = (long)getpid();
-    }
-    return tid;
-}
-
 int ppc32_syscall_is_exit(uint32_t nr)
 {
     return (nr == PPC32_NR_EXIT || nr == PPC32_NR_EXIT_GROUP) ? 1 : 0;
@@ -606,6 +693,41 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     /* Reservations die at syscall entry (SPEC 2.2, lwarx/stwcx.). */
     ctx->res_valid = 0;
     ctx->reservation_epoch++;
+
+    /* Phase 4 signal syscalls (L4a): rt_sigaction/procmask/pending,
+     * rt_sigreturn, sigaltstack. rt_sigreturn restores nip/r3/cr from
+     * the frame, so neither the E01 convention nor the sc advance
+     * applies to it (ppc32_sig_nr_no_advance). */
+    {
+        long hook = 0L;
+
+        if (ppc32_sig_syscall(ctx, nr, a0, a1, a2, a3, &hook)) {
+            if (!ppc32_sig_nr_no_advance(nr)) {
+                sys_apply_ret(ctx, hook);
+                ctx->nip += 4U;
+            }
+            ctx->syscalls_executed++;
+            return;
+        }
+    }
+    /* Inline-clone children own no host process: reap them here before
+     * the host wait4/waitpid path (which would report ECHILD). */
+    if (nr == PPC32_NR_WAIT4 || nr == PPC32_NR_WAITPID) {
+        long waited = 0L;
+
+        if (sync_kid_reap(ctx, a0, a1, a2, a3, &waited)) {
+            sys_apply_ret(ctx, waited);
+            ctx->nip += 4U;
+            ctx->syscalls_executed++;
+            return;
+        }
+    }
+    /* Phase 4 process lifecycle (L4c): fork/execve/wait4/pipe/dup2.
+     * Owned numbers apply E01 + nip internally (proc_dispatch owns the
+     * tail, including the execve-success no-advance reparking). */
+    if (ppc32_proc_dispatch(ctx, nr, a0, a1, a2, a3, a4, a5)) {
+        return;
+    }
 
     switch (nr) {
     case PPC32_NR_EXIT:
@@ -692,7 +814,7 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         ret = sys_getrandom(ctx, a0, a1, a2);
         break;
     case PPC32_NR_FUTEX:
-        ret = sys_futex(ctx, a0, a1, a2, a3);
+        ret = ppc32_futex(ctx, a0, a1, a2, a3, a4, a5);
         break;
     case PPC32_NR_FCNTL:
         ret = sys_fcntl(ctx, a0, a1, a2);
@@ -700,30 +822,60 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     case PPC32_NR_IOCTL:
         ret = sys_ioctl(ctx, a0, a1, a2);
         break;
-    case PPC32_NR_CLONE:
-        ret = -ENOSYS;
+    case PPC32_NR_GETPID:
+        ret = sys_getpid();
         break;
+    case PPC32_NR_KILL:
+    {
+        long killed = 0L;
+
+        if (sys_kill(ctx, a0, a1, &killed)) {
+            return;
+        }
+        ret = killed;
+        break;
+    }
+    case PPC32_NR_CLONE:
+    {
+        /* PPC clone arg order (threads.h): flags, stack, parent_tid,
+         * tls, child_tid in r3..r7. RC4 runs the child inline on the
+         * calling host thread to guest exit: single-threaded, so the
+         * fixture's lwarx/stwcx counter (1000 = parent 500 + child
+         * 500) reproduces the oracle exactly under interp, dbt, and
+         * difftest (whose snapshot refreshes after this dispatch). A
+         * host-thread child would race the interpreter's non-atomic
+         * reservation ops; true concurrency is a Phase 7 concern. */
+        ppc32_ctx_t *child = NULL;
+        long tid = ppc32_clone(ctx, a0, a1, a2, a3, a4, NULL, NULL,
+            &child);
+
+        if (tid < 0L) {
+            ret = tid;
+            break;
+        }
+        if (child == NULL) {
+            ret = -EFAULT;
+            break;
+        }
+        sync_kid_record((uint32_t)tid,
+            (int)ppc32_run_guest_child(child));
+        ppc32_thread_exit(child);
+        ret = tid;
+        break;
+    }
     case PPC32_NR_SIGPROCMASK:
-    case PPC32_NR_RT_SIGPROCMASK:
+        /* Old-style mask stays -ENOSYS; the rt_* path above owns it. */
         ret = -ENOSYS;
         break;
     case PPC32_NR_SET_TID_ADDRESS:
-        ret = sys_set_tid_address(ctx, a0);
+        ret = ppc32_set_tid_address(ctx, a0);
         break;
     default:
         ret = -ENOSYS;
         break;
     }
 
-    /* E01 return convention: classify on the kernel-style long, never on
-     * the magnitude of the truncated r3 alone. */
-    if (ret < 0L && ret >= -4095L) {
-        ctx->gpr[3] = (uint32_t)(-ret);
-        ctx->cr |= PPC32_CR0_SO;
-    } else {
-        ctx->gpr[3] = (uint32_t)ret;
-        ctx->cr &= (uint32_t)~PPC32_CR0_SO;
-    }
+    sys_apply_ret(ctx, ret);
     ctx->syscalls_executed++;
     ctx->nip += 4U;
 }

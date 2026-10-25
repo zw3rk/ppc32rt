@@ -309,6 +309,10 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg);
 void a64_emit_exit_syscall(a64_buf_t *b, uint32_t next_pc, uint32_t syscall_nr);
 void a64_emit_exit_undef(a64_buf_t *b, uint32_t fault_pc);
 void a64_emit_exit_trap(a64_buf_t *b, uint32_t trap_pc);
+/* RC4: low-guard fault exit. Stores nip = fault_pc and fault_addr = w(addr)
+ * (the faulting guest EA), returns PPC32_EXIT_FAULT. The driver delivers
+ * SIGSEGV to an installed guest handler (ppc32_sig_deliver_sync). */
+void a64_emit_exit_fault(a64_buf_t *b, uint32_t fault_pc, unsigned addr_w);
 
 /* Decoder entry points arrive with the Phase 1/2 engines
  * (src/interp/, src/dbt/). */

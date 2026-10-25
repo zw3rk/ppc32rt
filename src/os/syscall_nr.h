@@ -112,22 +112,22 @@
 /* Signals (rt_* arrive with the Phase 4 sigframe lane) */
 #define PPC32_NR_SIGRETURN       119U
 #define PPC32_NR_SIGPROCMASK     126U
-#define PPC32_NR_RT_SIGRETURN    173U
-#define PPC32_NR_RT_SIGACTION    174U
-#define PPC32_NR_RT_SIGPROCMASK  175U
-#define PPC32_NR_RT_SIGPENDING   176U
-#define PPC32_NR_RT_SIGTIMEDWAIT 177U
-#define PPC32_NR_RT_SIGQUEUEINFO 178U
-#define PPC32_NR_RT_SIGSUSPEND    179U
-#define PPC32_NR_SIGALTSTACK      186U
+#define PPC32_NR_RT_SIGRETURN    172U
+#define PPC32_NR_RT_SIGACTION    173U
+#define PPC32_NR_RT_SIGPROCMASK  174U
+#define PPC32_NR_RT_SIGPENDING   175U
+#define PPC32_NR_RT_SIGTIMEDWAIT 176U
+#define PPC32_NR_RT_SIGQUEUEINFO 177U
+#define PPC32_NR_RT_SIGSUSPEND    178U
+#define PPC32_NR_SIGALTSTACK      185U
 
 /* Threads / futex (clone TLS via CLONE_SETTLS, E06) */
 #define PPC32_NR_CLONE           120U
 #define PPC32_NR_UNAME           122U
-#define PPC32_NR_PRCTL           172U
-#define PPC32_NR_PREAD64         180U
-#define PPC32_NR_PWRITE64        181U
-#define PPC32_NR_VFORK           190U
+#define PPC32_NR_PRCTL           171U
+#define PPC32_NR_PREAD64         179U
+#define PPC32_NR_PWRITE64        180U
+#define PPC32_NR_VFORK           189U
 #define PPC32_NR_FUTEX           221U
 #define PPC32_NR_SET_TID_ADDRESS 232U
 /* RC2: exit_group is 234 (glibc _exit does li r0,234; the old 272 value
@@ -142,6 +142,6 @@
 /* Time */
 #define PPC32_NR_NANOSLEEP       162U
 #define PPC32_NR_POLL            168U
-#define PPC32_NR_SENDFILE        187U
+#define PPC32_NR_SENDFILE        186U
 
 #endif /* PPC32_SYSCALL_NR_H */

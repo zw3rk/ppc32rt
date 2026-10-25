@@ -333,7 +333,11 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
     if ((act->flags & PPC32_SA_RESTORER) != 0U && act->restorer != 0U) {
         lr = act->restorer;
     } else {
-        lr = PPC32_SIGTRAMP_RT;
+        /* Write in-frame RT sigreturn trampoline (li r0,172; sc) into abigap,
+         * matching arch/powerpc/kernel/signal_32.c setup_trampoline. */
+        sig_st32(ctx, frame + ABIGAP_OFF, 0x38000000U | PPC32_NR_RT_SIGRETURN);
+        sig_st32(ctx, frame + ABIGAP_OFF + 4U, 0x44000002U);
+        lr = frame + ABIGAP_OFF;
     }
     ctx->gpr[PPC32_REG_SP] = frame;
     ctx->gpr[3] = (uint32_t)sig;

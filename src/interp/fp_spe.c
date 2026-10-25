@@ -26,6 +26,7 @@ static void fp_spe_ldst(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         ea = (insn->ra == 0u ? 0u : ctx->gpr[insn->ra]) +
             ((uint32_t)insn->rb << sh);
     }
+    if (!interp_mem_ok(ea, 8U)) { fault(ctx, ea); return; }
     switch (xo) {
     case PPC32_SPE_EVLDD: case PPC32_SPE_EVLDDX:
     case PPC32_SPE_EVLDW: case PPC32_SPE_EVLDWX:

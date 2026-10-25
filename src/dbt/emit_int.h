@@ -274,6 +274,24 @@ static inline void ei_ea_x(a64_buf_t *b, unsigned ra, unsigned rb)
     a64_emit_add_reg_w(b, false, A64_ADDR, EI_A, EI_B, A64_SHIFT_LSL, 0U);
 }
 
+/* RC4 low-guard fault: EA is in w22; fault (nip = pc, fault_addr = EA)
+ * when EA < PPC32_LOW_GUARD_SIZE, so the driver delivers SIGSEGV instead
+ * of the host faulting on the PROT_NONE guard window. Single subs against
+ * #0x10000 (16, lsl #12); no scratch reg, AArch64 flags dead at every
+ * call site (EA computation leaves none live). Multi-byte/string ops
+ * check the base EA only: EAs advance upward from the base, so a base at
+ * or above the guard cannot descend into it short of 4 GiB wrap-around
+ * (out of scope, same as the interpreter). */
+static inline void ei_guard_low(a64_buf_t *b, uint32_t pc)
+{
+    size_t to_ok;
+
+    a64_emit_sub_imm_w(b, true, A64_ZR, A64_ADDR, 16U, 1U);
+    to_ok = a64_emit_b_cond_placeholder(b, A64_COND_CS);
+    a64_emit_exit_fault(b, pc, A64_ADDR);
+    a64_patch_b_cond(b, to_ok, b->count);
+}
+
 /* Load XER.CA (bit 29) as a 0/1 value into `rd`. Clobbers EI_T2. */
 static inline void ei_ld_ca(a64_buf_t *b, unsigned rd)
 {
@@ -526,7 +544,8 @@ static inline bool ei_is_update(uint32_t op)
         op == PPC32_OP_STBUX || op == PPC32_OP_STHUX;
 }
 
-static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x)
+static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
+    uint32_t pc)
 {
     unsigned width = 2U;
     unsigned swap = 2U;
@@ -587,13 +606,22 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x)
     /* Interp (interp_exec_dform_mem) accesses BEFORE the base update, so
      * a store with rs == ra must capture the source first (RC2: stwu
      * r1,-32(r1) stored EA instead of the old value). Loads keep EA in
-     * w22 across the update, so only the overlapping store needs this. */
+     * w22 across the update, so only the overlapping store needs this.
+     * RC4 low-guard placement mirrors the interpreter per form: D-forms
+     * guard before the update (interp accesses first), X-forms guard
+     * after it (interp_exec_xform_mem updates first). */
     bool overlap = !load && ei_is_update(in->op) && in->rs == in->ra;
     if (overlap) {
         ei_ld(b, EI_B, in->rs);
     }
+    if (!is_x) {
+        ei_guard_low(b, pc);
+    }
     if (ei_is_update(in->op)) {
         a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
+    }
+    if (is_x) {
+        ei_guard_low(b, pc);
     }
     if (load) {
         if (width == 2U) {
@@ -644,6 +672,7 @@ static inline int ei_multi(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     size_t fb_idx;
 
     ei_ea_d(b, in->ra, (uint32_t)in->d);
+    ei_guard_low(b, pc);
     a64_emit_mov_imm32(b, EI_A, 3U);
     a64_emit_and_reg_w(b, true, A64_ZR, A64_ADDR, EI_A, A64_SHIFT_LSL, 0U);
     patch_mis = a64_emit_b_cond_placeholder(b, A64_COND_NE);
@@ -670,7 +699,7 @@ static inline int ei_multi(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
 }
 
 /* lswi/stswi: NB = rb (0 means 32). Bytes pack big-end first (E05). */
-static inline int ei_string(a64_buf_t *b, const ppc32_insn_t *in)
+static inline int ei_string(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc)
 {
     uint32_t n = (in->rb == 0U) ? 32U : in->rb;
     uint32_t i;
@@ -680,6 +709,7 @@ static inline int ei_string(a64_buf_t *b, const ppc32_insn_t *in)
     } else {
         ei_ld(b, A64_ADDR, in->ra);
     }
+    ei_guard_low(b, pc);
     if (in->op == PPC32_OP_STSWI) {
         for (i = 0U; i < n; i++) {
             uint32_t reg = (in->rs + i / 4U) & 31U;

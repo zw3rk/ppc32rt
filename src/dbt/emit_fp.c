@@ -289,7 +289,7 @@ static void fp_ldst_mem(a64_buf_t *b, bool is_store, bool dbl, unsigned fr)
 
 /* D-form (is_x false) and indexed (is_x true) FP loads/stores. */
 static int fp_ldst(a64_buf_t *b, const ppc32_insn_t *insn, bool is_x,
-    bool is_update, bool is_store, bool dbl)
+    bool is_update, bool is_store, bool dbl, uint32_t pc)
 {
     if (insn->rt >= 32U || insn->rb >= 32U) {
         return PPC32_EMIT_FALLBACK;
@@ -306,10 +306,12 @@ static int fp_ldst(a64_buf_t *b, const ppc32_insn_t *insn, bool is_x,
     } else {
         ei_ea_d(b, insn->ra, (uint32_t)insn->d);
     }
-    fp_ldst_mem(b, is_store, dbl, insn->rt);
+    /* RC4: update-first matches interp fp_lsD/fp_lsX, then guard, access. */
     if (is_update) {
         ei_st(b, A64_ADDR, insn->ra);
     }
+    ei_guard_low(b, pc);
+    fp_ldst_mem(b, is_store, dbl, insn->rt);
     if (b->overflow) {
         return PPC32_EMIT_FALLBACK;
     }
@@ -782,7 +784,7 @@ static int spe_scalar(a64_buf_t *b, const ppc32_insn_t *insn)
 }
 
 /* Indexed SPE 64-bit loads/stores (X-form only). */
-static int spe_mem_x(a64_buf_t *b, const ppc32_insn_t *insn)
+static int spe_mem_x(a64_buf_t *b, const ppc32_insn_t *insn, uint32_t pc)
 {
     bool is_store = (insn->xo == 800U || insn->xo == 802U);
 
@@ -790,6 +792,7 @@ static int spe_mem_x(a64_buf_t *b, const ppc32_insn_t *insn)
         return PPC32_EMIT_FALLBACK;
     }
     ei_ea_x(b, insn->ra, insn->rb);
+    ei_guard_low(b, pc);
     a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
     if (!is_store) {
         a64_emit(b, 0xF9400000U | ((unsigned)A64_TMP2 << 5) | 15U);
@@ -813,7 +816,7 @@ static int spe_mem_x(a64_buf_t *b, const ppc32_insn_t *insn)
 
 /* ---- top-level dispatch ---- */
 
-static int fp_indexed(a64_buf_t *b, const ppc32_insn_t *insn)
+static int fp_indexed(a64_buf_t *b, const ppc32_insn_t *insn, uint32_t pc)
 {
     /* XOs 535..759 step 32: k bit0 = update, bit1 = double, bit2 = store. */
     uint32_t k;
@@ -824,7 +827,7 @@ static int fp_indexed(a64_buf_t *b, const ppc32_insn_t *insn)
     }
     k = (insn->xo - FP_XO_LFSX) >> 5U;
     return fp_ldst(b, insn, true, (k & 1U) != 0U, (k & 4U) != 0U,
-        (k & 2U) != 0U);
+        (k & 2U) != 0U, pc);
 }
 
 static int fp_classic(a64_buf_t *b, const ppc32_insn_t *insn, bool is_double)
@@ -864,7 +867,6 @@ int ppc32_emit_fp(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn,
 {
     a64_buf_t *b = e->buf;
 
-    (void)pc;
     if (insn == NULL) {
         return PPC32_EMIT_FALLBACK;
     }
@@ -875,11 +877,11 @@ int ppc32_emit_fp(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn,
         uint32_t k = insn->op - (uint32_t)PPC32_OP_LFS;
 
         return fp_ldst(b, insn, false, (k & 1U) != 0U, (k & 4U) != 0U,
-            (k & 2U) != 0U);
+            (k & 2U) != 0U, pc);
     }
     switch (insn->op) {
     case PPC32_OP_FPU_X:
-        return fp_indexed(b, insn);
+        return fp_indexed(b, insn, pc);
     case PPC32_OP_FPU_SINGLE:
         return fp_classic(b, insn, false);
     case PPC32_OP_FPU_DOUBLE:
@@ -887,7 +889,7 @@ int ppc32_emit_fp(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn,
     case PPC32_OP_SPE:
         if (insn->xo == 768U || insn->xo == 770U || insn->xo == 800U ||
             insn->xo == 802U) {
-            return spe_mem_x(b, insn);
+            return spe_mem_x(b, insn, pc);
         }
         return spe_scalar(b, insn);
     default:

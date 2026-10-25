@@ -319,6 +319,28 @@ static inline void fault(ppc32_ctx_t *ctx, uint32_t ea)
     res_invalidate(ctx);
 }
 
+/* RC4 low-guard check for guest data/instruction accesses. Mirrors
+ * ppc32_range_ok (os/convert.c) without depending on the os layer:
+ * anything below the 64 KiB guard (or past 4 GiB) faults with EA
+ * recorded, and the driver delivers SIGSEGV to an installed guest
+ * handler. Mapped-region misses keep their historical behavior. */
+static inline bool interp_mem_ok(uint32_t ea, uint32_t len)
+{
+    uint64_t end;
+
+    if (len == 0U) {
+        return true;
+    }
+    if (ea < PPC32_LOW_GUARD_SIZE) {
+        return false;
+    }
+    end = (uint64_t)ea + (uint64_t)len;
+    if (end > 0x100000000ULL) {
+        return false;
+    }
+    return true;
+}
+
 static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
     const ppc32_insn_t *insn)
 {
@@ -339,30 +361,37 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
     switch (insn->op) {
     case PPC32_OP_LBZ:
     case PPC32_OP_LBZU:
+        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZ:
     case PPC32_OP_LHZU:
+        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] = ld16(ctx, ea);
         break;
     case PPC32_OP_LHA:
     case PPC32_OP_LHAU:
+        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] =
             (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZ:
     case PPC32_OP_LWZU:
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] = ld32(ctx, ea);
         break;
     case PPC32_OP_STB:
     case PPC32_OP_STBU:
+        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
         st8(ctx, ea, (uint8_t)ctx->gpr[insn->rs]);
         break;
     case PPC32_OP_STH:
     case PPC32_OP_STHU:
+        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
         st32(ctx, ea, ctx->gpr[insn->rs]);
         break;
     }
@@ -415,30 +444,37 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
     switch (insn->op) {
     case PPC32_OP_LBZX:
     case PPC32_OP_LBZUX:
+        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZX:
     case PPC32_OP_LHZUX:
+        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] = ld16(ctx, ea);
         break;
     case PPC32_OP_LHAX:
     case PPC32_OP_LHAUX:
+        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] =
             (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZX:
     case PPC32_OP_LWZUX:
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
         ctx->gpr[insn->rt] = ld32(ctx, ea);
         break;
     case PPC32_OP_STBX:
     case PPC32_OP_STBUX:
+        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
         st8(ctx, ea, (uint8_t)ctx->gpr[insn->rs]);
         break;
     case PPC32_OP_STHX:
     case PPC32_OP_STHUX:
+        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
         st32(ctx, ea, ctx->gpr[insn->rs]);
         break;
     }

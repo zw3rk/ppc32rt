@@ -55,6 +55,7 @@ void interp_step(ppc32_ctx_t *ctx)
         fault(ctx, ctx->nip);
         return;
     }
+    if (!interp_mem_ok(ctx->nip, 4U)) { fault(ctx, ctx->nip); return; }
     raw = fetch_raw(ctx);
     (void)ppc_decode(raw, &insn);
 
@@ -686,6 +687,7 @@ void interp_step(ppc32_ctx_t *ctx)
             fault(ctx, ea);
             break;
         }
+        if (!interp_mem_ok(ea, (32U - rt) * 4U)) { fault(ctx, ea); break; }
         for (idx = rt; idx < 32U; idx++) {
             if (insn.op == PPC32_OP_LMW) {
                 ctx->gpr[idx] = ld32(ctx, ea);
@@ -704,6 +706,7 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t n = (nb == 0U) ? 32U : nb;
         uint32_t i;
 
+        if (!interp_mem_ok(ea, n)) { fault(ctx, ea); break; }
         if (insn.op == PPC32_OP_LSWI) {
             uint32_t cur = 0U;
             uint32_t cur_reg = 0U;
@@ -749,15 +752,19 @@ void interp_step(ppc32_ctx_t *ctx)
 
         switch (insn.op) {
         case PPC32_OP_LWBRX:
+            if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
             ctx->gpr[insn.rt] = ld32r(ctx, ea);
             break;
         case PPC32_OP_LHBRX:
+            if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); break; }
             ctx->gpr[insn.rt] = ld16r(ctx, ea);
             break;
         case PPC32_OP_STWBRX:
+            if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
             st32r(ctx, ea, ctx->gpr[insn.rs]);
             break;
         default:
+            if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); break; }
             st16r(ctx, ea, (uint16_t)ctx->gpr[insn.rs]);
             break;
         }
@@ -774,6 +781,7 @@ void interp_step(ppc32_ctx_t *ctx)
             fault(ctx, ea);
             break;
         }
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
         ctx->gpr[insn.rt] = ld32(ctx, ea);
         ctx->res_addr = al;
         ctx->res_val = ctx->gpr[insn.rt];
@@ -791,6 +799,7 @@ void interp_step(ppc32_ctx_t *ctx)
             fault(ctx, ea);
             break;
         }
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
         if (ok) {
             st32(ctx, ea, ctx->gpr[insn.rs]);
         }
@@ -839,6 +848,7 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t base = ea & ~31U;
         uint32_t i;
 
+        if (!interp_mem_ok(ea, 32U)) { fault(ctx, ea); break; }
         for (i = 0U; i < 32U; i++) {
             st8(ctx, base + i, 0U);
         }

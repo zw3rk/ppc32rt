@@ -424,6 +424,10 @@ static void thread_copy_state(ppc32_ctx_t *dst, const ppc32_ctx_t *src)
     dst->engine = src->engine;
     dst->profile = src->profile;
     dst->sig_mask = src->sig_mask;
+    /* The child shares the address space (CLONE_VM): the window stays up
+     * (RC4: without this the child faults on its first step and the
+     * fault/deliver loop exhausts its stack). */
+    dst->vm_ready = src->vm_ready;
     /* Fresh per-thread state: caches, counters, signals, robust. */
     dst->res_valid = 0;
     dst->reservation_epoch = src->reservation_epoch + 1U;

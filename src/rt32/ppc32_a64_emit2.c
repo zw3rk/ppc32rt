@@ -450,6 +450,15 @@ void a64_emit_exit_trap(a64_buf_t *b, uint32_t trap_pc)
     a64_emit_ret(b);
 }
 
+void a64_emit_exit_fault(a64_buf_t *b, uint32_t fault_pc, unsigned addr_w)
+{
+    a64_emit_mov_pc32(b, A64_TMP0, fault_pc);
+    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, (uint32_t)offsetof(ppc32_ctx_t, nip));
+    a64_emit_str_imm_w(b, addr_w, A64_XCTX, (uint32_t)offsetof(ppc32_ctx_t, fault_addr));
+    a64_emit_movz_w(b, A64_TMP1, PPC32_EXIT_FAULT, 0U);
+    a64_emit_ret(b);
+}
+
 /* Parallel add/sub and saturating-arithmetic lowering were dropped:
  * PowerPC has no Q/GE flags; SPE/vector saturating packs arrive with
  * the Phase 3 DBT. */

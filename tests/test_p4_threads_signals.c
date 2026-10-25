@@ -69,7 +69,7 @@ __asm__(
 "    mr 4,6\n"
 "    li 5,0\n"
 "    li 6,8\n"
-"    li 0,174\n"
+"    li 0,173\n"
 "    .long 0x44000002\n"
 /* ---- raise SIGUSR1 at self ---- */
 "    li 0,20\n"
@@ -105,7 +105,7 @@ __asm__(
 "    mr 4,6\n"
 "    li 5,0\n"
 "    li 6,8\n"
-"    li 0,174\n"
+"    li 0,173\n"
 "    .long 0x44000002\n"
 /* ---- faulting load; handler skips it, r4 becomes 1 ---- */
 "    li 4,0\n"

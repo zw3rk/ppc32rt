@@ -603,6 +603,7 @@ static int ei_lwarx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     size_t fb_idx;
 
     ei_ea_x(b, in->ra, in->rb);
+    ei_guard_low(b, pc);
     a64_emit_mov_imm32(b, EI_A, 3U);
     a64_emit_and_reg_w(b, true, A64_ZR, A64_ADDR, EI_A, A64_SHIFT_LSL, 0U);
     patch_mis = a64_emit_b_cond_placeholder(b, A64_COND_NE);
@@ -638,6 +639,7 @@ static int ei_stwcx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     size_t fail_idx;
 
     ei_ea_x(b, in->ra, in->rb);
+    ei_guard_low(b, pc);
     a64_emit_mov_imm32(b, EI_A, 3U);
     a64_emit_and_reg_w(b, true, A64_ZR, A64_ADDR, EI_A, A64_SHIFT_LSL, 0U);
     patch_mis = a64_emit_b_cond_placeholder(b, A64_COND_NE);
@@ -686,11 +688,12 @@ static int ei_stwcx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     return PPC32_EMIT_NEXT;
 }
 
-static int ei_dcbz(a64_buf_t *b, const ppc32_insn_t *in)
+static int ei_dcbz(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc)
 {
     uint32_t k;
 
     ei_ea_x(b, in->ra, in->rb);
+    ei_guard_low(b, pc);
     a64_emit_mov_imm32(b, EI_A, 31U);
     a64_emit_bic_reg_w(b, false, A64_ADDR, A64_ADDR, EI_A, A64_SHIFT_LSL,
         0U);
@@ -813,13 +816,13 @@ int ppc32_emit_int(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn, uint32_t pc)
     case PPC32_OP_LHZU:
     case PPC32_OP_LHAU:
     case PPC32_OP_STHU:
-        return ei_mem(b, insn, false);
+        return ei_mem(b, insn, false, pc);
     case PPC32_OP_LMW:
     case PPC32_OP_STMW:
         return ei_multi(b, insn, pc, e);
     case PPC32_OP_LSWI:
     case PPC32_OP_STSWI:
-        return ei_string(b, insn);
+        return ei_string(b, insn, pc);
     case PPC32_OP_LWZX:
     case PPC32_OP_LWZUX:
     case PPC32_OP_LBZX:
@@ -838,7 +841,7 @@ int ppc32_emit_int(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn, uint32_t pc)
     case PPC32_OP_LHBRX:
     case PPC32_OP_STWBRX:
     case PPC32_OP_STHBRX:
-        return ei_mem(b, insn, true);
+        return ei_mem(b, insn, true, pc);
     case PPC32_OP_LWARX:
         return ei_lwarx(b, insn, pc, e);
     case PPC32_OP_STWCX:
@@ -852,7 +855,7 @@ int ppc32_emit_int(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn, uint32_t pc)
     case PPC32_OP_DCBT:
         return PPC32_EMIT_NEXT; /* cache-hint / barrier nop */
     case PPC32_OP_DCBZ:
-        return ei_dcbz(b, insn);
+        return ei_dcbz(b, insn, pc);
     default:
         /* UNDEF, FPU/SPE families, MULHDU, LSWX/STSWX: no native
          * lowering; the runner single-steps via interp. */

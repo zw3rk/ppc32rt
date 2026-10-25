@@ -20,7 +20,9 @@
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
 #include "interp/interp.h"
+#include "os/signals.h"
 #include "os/syscalls.h"
+#include "os/threads.h"
 #include "dbt/dbt.h"
 #include "dbt/emit_int.h"
 #include "dbt/emit_fp.h"
@@ -245,7 +247,75 @@ static int guest_load(ppc32_ctx_t *ctx, ppc32_elf_info_t *info, uint32_t *sp)
     ctx->nip = info->entry;
     ctx->gpr[PPC32_REG_SP] = *sp;
     ctx->exit_reason = PPC32_EXIT_NONE;
+    /* RC4: register the main thread (slot 0, guest/host tids) before the
+     * first clone; failure is non-fatal (clone then reports EAGAIN). */
+    (void)ppc32_thread_init_main(ctx);
     return 0;
+}
+
+/* RC4: deliver a synchronous guest fault/trap to an installed handler.
+ * FAULT (fault_addr set by the engine) raises SIGSEGV; TRAP (nip at the
+ * trapping insn) raises SIGTRAP. Returns 1 when execution resumes at
+ * the handler (or re-executes on SIG_IGN), 0 when the guest must die
+ * (SIG_DFL or an unbuildable frame). */
+static int deliver_sync(ppc32_ctx_t *ctx)
+{
+    long r;
+
+    if (ctx->exit_reason == PPC32_EXIT_TRAP) {
+        r = ppc32_sig_deliver_sync(ctx, (int)PPC32_SIGTRAP, 0, ctx->nip,
+            0U);
+    } else {
+        r = ppc32_sig_deliver_sync(ctx, (int)PPC32_SIGSEGV, 0,
+            ctx->fault_addr, 0U);
+    }
+    if (r != 0L && r != 1L) {
+        return 0;
+    }
+    ctx->exit_reason = PPC32_EXIT_NONE;
+    return 1;
+}
+
+/* RC4 inline clone child (syscalls.c CLONE): drive `child` to guest
+ * exit on the calling host thread. Returns the guest exit code
+ * (0..255), or a negative guest signal number when a fault/trap goes
+ * undelivered. */
+long ppc32_run_guest_child(ppc32_ctx_t *child)
+{
+    if (child == NULL) {
+        return -(long)PPC32_SIGSEGV;
+    }
+    for (;;) {
+        if (child->engine == PPC32_ENGINE_DBT) {
+            dbt_run(child);
+        } else {
+            interp_run(child);
+        }
+        if (child->exit_reason == PPC32_EXIT_SYSCALL) {
+            uint32_t nr = child->gpr[0];
+
+            if (ppc32_syscall_is_exit(nr)) {
+                ppc32_syscall(child);
+                return (long)(child->exit_arg & 0xFFU);
+            }
+            ppc32_syscall(child);
+            child->exit_reason = PPC32_EXIT_NONE;
+            continue;
+        }
+        if (child->exit_reason == PPC32_EXIT_FAULT ||
+            child->exit_reason == PPC32_EXIT_TRAP) {
+            int trap = (child->exit_reason == PPC32_EXIT_TRAP);
+
+            if (deliver_sync(child)) {
+                continue;
+            }
+            return trap ? -(long)PPC32_SIGTRAP : -(long)PPC32_SIGSEGV;
+        }
+        if (child->exit_reason == PPC32_EXIT_NONE) {
+            continue;
+        }
+        return -(long)PPC32_SIGILL;
+    }
 }
 
 /* Dispatch one stopped-at-sc state; returns guest status on exit calls. */
@@ -281,6 +351,12 @@ static int run_interp(ppc32_ctx_t *ctx)
         if (ctx->exit_reason == PPC32_EXIT_NONE) {
             continue; /* budget/page stop: keep going */
         }
+        if (ctx->exit_reason == PPC32_EXIT_FAULT ||
+            ctx->exit_reason == PPC32_EXIT_TRAP) {
+            if (deliver_sync(ctx)) {
+                continue;
+            }
+        }
         if (ctx->exit_reason != PPC32_EXIT_SYSCALL) {
             fprintf(stderr, "ppc32rt: stopped, reason %u at nip 0x%08X\n",
                 ctx->exit_reason, ctx->nip);
@@ -311,6 +387,12 @@ static int run_dbt(ppc32_ctx_t *ctx)
         dbt_run(ctx);
         if (ctx->exit_reason == PPC32_EXIT_NONE) {
             continue;
+        }
+        if (ctx->exit_reason == PPC32_EXIT_FAULT ||
+            ctx->exit_reason == PPC32_EXIT_TRAP) {
+            if (deliver_sync(ctx)) {
+                continue;
+            }
         }
         if (ctx->exit_reason != PPC32_EXIT_SYSCALL) {
             fprintf(stderr, "ppc32rt: stopped, reason %u at nip 0x%08X\n",
@@ -427,6 +509,25 @@ static void difftest_sync_dut(ppc32_ctx_t *dut, const ppc32_ctx_t *ref)
     dut->exit_reason = PPC32_EXIT_NONE;
 }
 
+/* Refresh the difftest snapshot after state-changing work on ref
+ * (syscall dispatch or signal-frame delivery): free the old segments
+ * and re-snapshot the post-change writable state. Returns 0, or 2 with
+ * an INCONCLUSIVE report when the snapshot has a gap. */
+static int difftest_refresh(ppc32_ctx_t *ctx, difftest_snap_t *snap,
+    size_t *n)
+{
+    bool incomplete = false;
+
+    difftest_snap_free(snap, *n);
+    *n = difftest_snapshot(ctx, snap, DIFFTEST_SNAP_CAP, &incomplete);
+    if (incomplete) {
+        printf("DIFFTEST: INCONCLUSIVE (snapshot gap)\n");
+        difftest_snap_free(snap, *n);
+        return 2;
+    }
+    return 0;
+}
+
 /*
  * RC2 differential driver: the interp oracle (ref) and the dbt DUT share
  * one window/memory and run to the same syscall boundaries, where full
@@ -526,13 +627,34 @@ static int run_difftest(ppc32_ctx_t *ctx)
             /* Dispatch can reshape memory (brk/mmap/mprotect): refresh
              * the snapshot so the next restore reverts the oracle's
              * next-segment writes against the true post-dispatch state. */
-            difftest_snap_free(snap, snap_n);
-            snap_n = difftest_snapshot(ctx, snap, DIFFTEST_SNAP_CAP,
-                &incomplete);
-            if (incomplete) {
-                printf("DIFFTEST: INCONCLUSIVE (snapshot gap)\n");
+            {
+                int rc = difftest_refresh(ctx, snap, &snap_n);
+
+                if (rc != 0) {
+                    return rc;
+                }
+            }
+            ref.exit_reason = PPC32_EXIT_NONE;
+            continue;
+        }
+        if (ref.exit_reason == PPC32_EXIT_FAULT ||
+            ref.exit_reason == PPC32_EXIT_TRAP) {
+            /* RC4: deliver once on ref (the frame lives in shared
+             * memory), sync the DUT onto the handler entry, and refresh
+             * the snapshot so the frame survives the next restore. */
+            if (!deliver_sync(&ref)) {
+                printf("DIFFTEST: DIVERGENCE fatal stop %u at nip 0x%08X\n",
+                    ref.exit_reason, ref.nip);
                 difftest_snap_free(snap, snap_n);
-                return 2;
+                return 1;
+            }
+            difftest_sync_dut(ctx, &ref);
+            {
+                int rc = difftest_refresh(ctx, snap, &snap_n);
+
+                if (rc != 0) {
+                    return rc;
+                }
             }
             ref.exit_reason = PPC32_EXIT_NONE;
             continue;
