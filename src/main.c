@@ -244,7 +244,9 @@ static int guest_load(ppc32_ctx_t *ctx, ppc32_elf_info_t *info, uint32_t *sp)
         fprintf(stderr, "ppc32rt: stack setup failed\n");
         return 1;
     }
-    ctx->nip = info->entry;
+    /* RC5: start at the interpreter entry when PT_INTERP is present
+     * (ctx->elf_entry tracks the interp entry; info->entry is the app). */
+    ctx->nip = ctx->elf_entry;
     ctx->gpr[PPC32_REG_SP] = *sp;
     ctx->exit_reason = PPC32_EXIT_NONE;
     /* RC4: register the main thread (slot 0, guest/host tids) before the
@@ -552,7 +554,7 @@ static int run_difftest(ppc32_ctx_t *ctx)
     ref.vm_ready = true;
     ref.profile = ctx->profile;
     ref.host_info = ctx->host_info;
-    ref.nip = info.entry;
+    ref.nip = ctx->elf_entry;
     ref.gpr[PPC32_REG_SP] = sp;
     ref.exit_reason = PPC32_EXIT_NONE;
     /* Prime the ref VM mirrors from the shared globals. */

@@ -365,7 +365,8 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         return -ENOMEM;
     }
     ppc32_proc_redetect_profile(ctx, info.text_start, info.text_end);
-    ctx->nip = info.entry;
+    /* RC5: interpreter entry when PT_INTERP is present (see main.c). */
+    ctx->nip = ctx->elf_entry;
     ctx->gpr[PPC32_REG_SP] = sp;
     ctx->exit_reason = PPC32_EXIT_NONE;
     /* The new vectors back guest_argv/host_envp from here on (ownership
