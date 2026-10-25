@@ -113,8 +113,13 @@ run_engine() {
         $STEP_TIMEOUT 200s $PIN qemu-ppc -cpu 750 "$BIN" $ARGS "$ITERS" $TAIL \
             >"$OUTDIR/$lg" 2>&1
     else
+        # 900 s budget: --interp needs ~390 s for the fixed 6000-iter
+        # -O0 run on a moderately loaded host (15.4 it/s measured) and
+        # more when sibling sessions saturate the machine; the gate
+        # asserts validity/CRCs and dbt > interp, never absolute rates.
+        # A hang still fails the budget, only slower.
         # shellcheck disable=SC2086
-        $STEP_TIMEOUT 280s $PIN "$PPC32RT" "$1" -- "$BIN" $ARGS "$ITERS" $TAIL \
+        $STEP_TIMEOUT 900s $PIN "$PPC32RT" "$1" -- "$BIN" $ARGS "$ITERS" $TAIL \
             >"$OUTDIR/$lg" 2>&1
     fi
 }
@@ -147,10 +152,32 @@ check_algo_crcs() {
 
 BIN="$COREMARK_SRC/h3-o0/coremark.exe"
 
+# Auto-calibration picks the iteration count from a short timing probe,
+# so a host that changes speed mid-run can land just under the 10 s
+# validity rule (observed: dbt-o2-auto 2000 iters in 9.18 s with correct
+# CRCs). Recalibrate boundedly: rerun an auto log while it misses
+# validation, up to 2 extra attempts. Fixed-work logs (ITERS=6000)
+# never retry — their workload is deterministic.
+retry_auto() {
+    lg=$1
+    shift
+    tries=0
+    while [ "$tries" -lt 2 ] \
+        && ! grep -q "Correct operation validated" "$OUTDIR/$lg"; do
+        tries=$((tries + 1))
+        log "recalibrating $lg (attempt $tries)"
+        # shellcheck disable=SC2086
+        run_engine "$lg" "$@" || fail "$lg recalibration run failed"
+    done
+}
+
 ITERS=0
 run_engine qemu-o0-auto.log qemu || fail "qemu o0 auto failed"
 run_engine interp-o0-auto.log --interp || fail "interp o0 auto failed"
 run_engine dbt-o0-auto.log --dbt || fail "dbt o0 auto failed"
+retry_auto qemu-o0-auto.log qemu
+retry_auto interp-o0-auto.log --interp
+retry_auto dbt-o0-auto.log --dbt
 
 ITERS=6000
 run_engine qemu-o0-f6000.log qemu || fail "qemu o0 f6000 failed"
@@ -162,6 +189,9 @@ ITERS=0
 run_engine qemu-o2-auto.log qemu || fail "qemu o2 auto failed"
 run_engine interp-o2-auto.log --interp || fail "interp o2 auto failed"
 run_engine dbt-o2-auto.log --dbt || fail "dbt o2 auto failed"
+retry_auto qemu-o2-auto.log qemu
+retry_auto interp-o2-auto.log --interp
+retry_auto dbt-o2-auto.log --dbt
 
 # Validity + correctness on every run but the documented sub-10 s
 # oracle quick-check (qemu-o0-f6000 finishes in ~5 s by design).

@@ -434,3 +434,47 @@ int ppc32_flock_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
     hs->l_pid = (pid_t)(int32_t)ppc32_be32((uint32_t)gs.l_pid);
     return 0;
 }
+
+int ppc32_flock64_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
+    const struct flock *hs)
+{
+    ppc32_flock64_t gs;
+    uint64_t w;
+
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+        return -EFAULT;
+    }
+    /* Read-modify-write: the 4-byte pad (and any tail bytes) keep
+     * whatever the guest had; the oracle never touches them. */
+    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    gs.l_type = (int16_t)ppc32_be16((uint16_t)hs->l_type);
+    gs.l_whence = (int16_t)ppc32_be16((uint16_t)hs->l_whence);
+    w = ppc32_be64((uint64_t)hs->l_start);
+    memcpy(gs.l_start, &w, sizeof w);
+    w = ppc32_be64((uint64_t)hs->l_len);
+    memcpy(gs.l_len, &w, sizeof w);
+    gs.l_pid = (int32_t)ppc32_be32((uint32_t)hs->l_pid);
+    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
+    return 0;
+}
+
+int ppc32_flock64_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
+    struct flock *hs)
+{
+    ppc32_flock64_t gs;
+    uint64_t w;
+
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+        return -EFAULT;
+    }
+    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    memset(hs, 0, sizeof *hs);
+    hs->l_type = (short)(int16_t)ppc32_be16((uint16_t)gs.l_type);
+    hs->l_whence = (short)(int16_t)ppc32_be16((uint16_t)gs.l_whence);
+    memcpy(&w, gs.l_start, sizeof w);
+    hs->l_start = (off_t)(int64_t)ppc32_be64(w);
+    memcpy(&w, gs.l_len, sizeof w);
+    hs->l_len = (off_t)(int64_t)ppc32_be64(w);
+    hs->l_pid = (pid_t)(int32_t)ppc32_be32((uint32_t)gs.l_pid);
+    return 0;
+}

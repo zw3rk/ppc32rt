@@ -125,3 +125,121 @@ long sys_openat(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
     }
     return (long)fd;
 }
+
+long sys_fcntl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t cmd, uint32_t arg)
+{
+    /* F_* numbers used here are Linux-generic: pass through, except
+     * file-status flags (F_SETFL in, F_GETFL out), whose O_DIRECT and
+     * O_LARGEFILE bits trade places (see above). */
+    switch (cmd) {
+    case 0U: /* F_DUPFD */
+    case 1U: /* F_GETFD */
+    case 2U: /* F_SETFD */
+    {
+        int r = fcntl((int)fd, (int)cmd, (int)arg);
+
+        if (r < 0) {
+            return -(long)errno;
+        }
+        return (long)r;
+    }
+    case 3U: /* F_GETFL */
+    {
+        int r = fcntl((int)fd, (int)cmd);
+
+        if (r < 0) {
+            return -(long)errno;
+        }
+        return (long)(int)ppc32_open_flags_host2ppc((uint32_t)r);
+    }
+    case 4U: /* F_SETFL */
+    {
+        uint32_t host_arg = ppc32_open_flags_ppc2host(arg);
+        int r = fcntl((int)fd, (int)cmd, (int)host_arg);
+
+        if (r < 0) {
+            return -(long)errno;
+        }
+        return (long)r;
+    }
+#ifdef F_DUPFD_CLOEXEC
+    case 1030U: /* F_DUPFD_CLOEXEC */
+    {
+        int r = fcntl((int)fd, F_DUPFD_CLOEXEC, (int)arg);
+
+        if (r < 0) {
+            return -(long)errno;
+        }
+        return (long)r;
+    }
+#endif
+    case 5U: /* F_GETLK */
+    case 6U: /* F_SETLK */
+    case 7U: /* F_SETLKW */
+    {
+#ifdef __linux__
+        struct flock hs;
+        int r;
+
+        if (ppc32_flock_from_guest(ctx, arg, &hs) != 0) {
+            return -EFAULT;
+        }
+        r = fcntl((int)fd, (int)cmd, &hs);
+        if (r < 0) {
+            return -(long)errno;
+        }
+        if (cmd == 5U && ppc32_flock_to_guest(ctx, arg, &hs) != 0) {
+            return -EFAULT;
+        }
+        return (long)r;
+#else
+        (void)ctx;
+        (void)fd;
+        (void)arg;
+        return -ENOSYS;
+#endif
+    }
+    /* 64-bit lock layout (uapi asm-generic/fcntl.h: F_GETLK64 12,
+     * F_SETLK64 13, F_SETLKW64 14). musl on 32-bit PPC routes every
+     * lock command through these numbers with struct flock64, so the
+     * plain 5/6/7 arms above never fire for musl guests. The host
+     * numbers match (asm-generic on aarch64 too). */
+    case 12U: /* F_GETLK64 */
+    case 13U: /* F_SETLK64 */
+    case 14U: /* F_SETLKW64 */
+    {
+#ifdef __linux__
+        struct flock hs;
+        int host_cmd;
+        int r;
+
+        if (cmd == 12U) {
+            host_cmd = 5; /* F_GETLK */
+        } else if (cmd == 13U) {
+            host_cmd = 6; /* F_SETLK */
+        } else {
+            host_cmd = 7; /* F_SETLKW */
+        }
+        if (ppc32_flock64_from_guest(ctx, arg, &hs) != 0) {
+            return -EFAULT;
+        }
+        r = fcntl((int)fd, host_cmd, &hs);
+        if (r < 0) {
+            return -(long)errno;
+        }
+        if (cmd == 12U && ppc32_flock64_to_guest(ctx, arg, &hs) != 0) {
+            return -EFAULT;
+        }
+        return (long)r;
+#else
+        (void)ctx;
+        (void)fd;
+        (void)arg;
+        return -ENOSYS;
+#endif
+    }
+    default:
+        break;
+    }
+    return -ENOSYS;
+}

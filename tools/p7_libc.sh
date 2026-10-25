@@ -155,16 +155,20 @@ fail=0
 pass=0
 
 # run3_lc <name> — enforced libc-test: rc 0 + identical bytes on all three.
+# 280 s budget (build-step grade): store-heavy libc tests need ~90 s
+# under --dbt on this host (measured: lc-string_memset 88 s idle), so a
+# 60 s budget times out green tests instead of catching hangs. A hang
+# still fails the budget, only slower.
 run3_lc() {
     nm=$1
     bin="$BIN_DIR/lc-$nm"
     base="$OUT_DIR/lc-$nm"
     set +e
-    $STEP_TIMEOUT 60s qemu-ppc -cpu 750 "$bin" >"$base-oracle.out" 2>&1
+    $STEP_TIMEOUT 280s qemu-ppc -cpu 750 "$bin" >"$base-oracle.out" 2>&1
     orc=$?
-    $STEP_TIMEOUT 60s "$PPC32RT" --interp -- "$bin" >"$base-interp.out" 2>&1
+    $STEP_TIMEOUT 280s "$PPC32RT" --interp -- "$bin" >"$base-interp.out" 2>&1
     irc=$?
-    $STEP_TIMEOUT 60s "$PPC32RT" --dbt -- "$bin" >"$base-dbt.out" 2>&1
+    $STEP_TIMEOUT 280s "$PPC32RT" --dbt -- "$bin" >"$base-dbt.out" 2>&1
     drc=$?
     set -e
     if [ "$orc" = 0 ] && [ "$irc" = 0 ] && [ "$drc" = 0 ] \
@@ -331,10 +335,10 @@ expect_hang() {
 }
 
 ENFORCED_LC_STRING="string string_memcpy string_memset string_strchr string_strstr string_strcspn string_memmem"
-ENFORCED_LC_FUNC="setjmp qsort snprintf random clock_gettime stat time memstream fdopen search_tsearch strtod inet_pton env ungetc strptime"
+ENFORCED_LC_FUNC="setjmp qsort snprintf random clock_gettime stat time memstream fdopen search_tsearch strtod inet_pton env ungetc strptime fcntl"
 ENFORCED_LC_THR="pthread_tsd"
 SKIP_LC="fnmatch sscanf ipc_sem strftime strtol wordexp swprintf pthread_cancel-points pthread_robust"
-GAP_LC_FUNC="fcntl vfork socket ipc_msg ipc_shm sem_init sem_open utime popen spawn"
+GAP_LC_FUNC="vfork socket ipc_msg ipc_shm sem_init sem_open utime popen spawn"
 ENFORCED_LTP="pipe/pipe04 pipe/pipe05 pipe/pipe09 mmap/mmap11 sigaction/sigaction02"
 
 log "building enforced + skip + fast-gap libc-test binaries"
@@ -359,23 +363,23 @@ done
 
 log "phase B: oracle skips (must still not pass on oracle)"
 expect_oracle_nonpass "lc-func-fnmatch" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-fnmatch"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-fnmatch"
 expect_oracle_nonpass "lc-func-sscanf" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-sscanf"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-sscanf"
 expect_oracle_nonpass "lc-func-ipc_sem" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-ipc_sem"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-ipc_sem"
 expect_oracle_nonpass "lc-func-strftime" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-strftime"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-strftime"
 expect_oracle_nonpass "lc-func-strtol" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-strtol"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-strtol"
 expect_oracle_nonpass "lc-func-wordexp" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-wordexp"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-wordexp"
 expect_oracle_nonpass "lc-func-swprintf" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-swprintf"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-swprintf"
 expect_oracle_nonpass "lc-functional-pthread_cancel-points" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-functional-pthread_cancel-points"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-pthread_cancel-points"
 expect_oracle_nonpass "lc-functional-pthread_robust" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-functional-pthread_robust"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-pthread_robust"
 LTP_SC="$LTP_DIR/testcases/kernel/syscalls"
 expect_oracle_nonpass "ltp-waitpid01" \
     sh -c "cd '$LTP_SC' && exec qemu-ppc -cpu 750 -L '$SYSROOT' ./waitpid/waitpid01"
@@ -460,17 +464,17 @@ log "phase D: gap probes (must still fail on translator as documented)"
 for t in acos asin atan2 cos exp log pow sin sqrt fmod; do
     build_lc "$t" math
     expect_translator_blocked "lc-math-$t" \
-        "$BIN_DIR/lc-math-$t" \
-        --interp "$BIN_DIR/lc-math-$t" --dbt "$BIN_DIR/lc-math-$t"
+        "$BIN_DIR/lc-$t" \
+        --interp "$BIN_DIR/lc-$t" --dbt "$BIN_DIR/lc-$t"
 done
 build_lc isless math
 expect_translator_blocked "lc-math-isless" \
-    "$BIN_DIR/lc-math-isless" \
-    --interp "$BIN_DIR/lc-math-isless" --dbt "$BIN_DIR/lc-math-isless"
+    "$BIN_DIR/lc-isless" \
+    --interp "$BIN_DIR/lc-isless" --dbt "$BIN_DIR/lc-isless"
 build_lc fpclassify math
-expect_dbt_only_gap "lc-math-fpclassify" "$BIN_DIR/lc-math-fpclassify"
+expect_dbt_only_gap "lc-math-fpclassify" "$BIN_DIR/lc-fpclassify"
 set +e
-$STEP_TIMEOUT 60s "$PPC32RT" --interp -- "$BIN_DIR/lc-math-sqrt" \
+$STEP_TIMEOUT 60s "$PPC32RT" --interp -- "$BIN_DIR/lc-sqrt" \
     >"$OUT_DIR/lc-math-sqrt-interp.out" 2>&1
 sqrt_rc=$?
 set -e
@@ -483,38 +487,38 @@ else
     fail=$((fail + 1))
 fi
 build_lc tgmath func
-expect_dbt_only_gap "lc-functional-tgmath" "$BIN_DIR/lc-functional-tgmath"
+expect_dbt_only_gap "lc-functional-tgmath" "$BIN_DIR/lc-tgmath"
 for t in pthread_mutex pthread_cond pthread_cancel pthread_mutex_pi; do
     build_lc "$t" func
 done
 for t in pthread_mutex pthread_cond pthread_cancel; do
     expect_oracle_pass "lc-thr-$t/oracle" \
-        qemu-ppc -cpu 750 "$BIN_DIR/lc-thr-$t"
+        qemu-ppc -cpu 750 "$BIN_DIR/lc-$t"
 done
 expect_oracle_pass "lc-functional-pthread_mutex_pi/oracle" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-functional-pthread_mutex_pi"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-pthread_mutex_pi"
 expect_oracle_pass "lc-func-popen/oracle" \
-    qemu-ppc -cpu 750 "$BIN_DIR/lc-func-popen"
+    qemu-ppc -cpu 750 "$BIN_DIR/lc-popen"
 expect_hang "lc-thr-pthread_mutex/interp" 25 \
-    "$PPC32RT" --interp -- "$BIN_DIR/lc-thr-pthread_mutex"
+    "$PPC32RT" --interp -- "$BIN_DIR/lc-pthread_mutex"
 expect_hang "lc-thr-pthread_mutex/dbt" 25 \
-    "$PPC32RT" --dbt -- "$BIN_DIR/lc-thr-pthread_mutex"
+    "$PPC32RT" --dbt -- "$BIN_DIR/lc-pthread_mutex"
 expect_hang "lc-thr-pthread_cond/interp" 25 \
-    "$PPC32RT" --interp -- "$BIN_DIR/lc-thr-pthread_cond"
+    "$PPC32RT" --interp -- "$BIN_DIR/lc-pthread_cond"
 expect_hang "lc-thr-pthread_cancel/interp" 25 \
-    "$PPC32RT" --interp -- "$BIN_DIR/lc-thr-pthread_cancel"
+    "$PPC32RT" --interp -- "$BIN_DIR/lc-pthread_cancel"
 expect_hang "lc-functional-pthread_mutex_pi/interp" 25 \
     "$PPC32RT" --interp -- \
-    "$BIN_DIR/lc-functional-pthread_mutex_pi"
-for t in fcntl vfork socket ipc_msg ipc_shm sem_init sem_open utime spawn; do
+    "$BIN_DIR/lc-pthread_mutex_pi"
+for t in vfork socket ipc_msg ipc_shm sem_init sem_open utime spawn; do
     expect_translator_blocked "lc-func-$t" \
-        "$BIN_DIR/lc-func-$t" \
-        --interp "$BIN_DIR/lc-func-$t" --dbt "$BIN_DIR/lc-func-$t"
+        "$BIN_DIR/lc-$t" \
+        --interp "$BIN_DIR/lc-$t" --dbt "$BIN_DIR/lc-$t"
 done
 expect_hang "lc-func-popen/interp" 25 \
-    "$PPC32RT" --interp -- "$BIN_DIR/lc-func-popen"
+    "$PPC32RT" --interp -- "$BIN_DIR/lc-popen"
 expect_hang "lc-func-popen/dbt" 25 \
-    "$PPC32RT" --dbt -- "$BIN_DIR/lc-func-popen"
+    "$PPC32RT" --dbt -- "$BIN_DIR/lc-popen"
 set +e
 (cd "$LTP_DIR/testcases/kernel/syscalls" && \
     $STEP_TIMEOUT 60s "$PPC32RT" --interp --sysroot "$SYSROOT" \
@@ -588,7 +592,7 @@ else
             fail=$((fail + 1))
         fi
     done
-    if grep -q 'Enforced pass: 28/28' "$report" \
+    if grep -q 'Enforced pass: 29/29' "$report" \
         && grep -q 'Unexpected failures: 0' "$report"; then
         log "report summary lines present"
         pass=$((pass + 1))

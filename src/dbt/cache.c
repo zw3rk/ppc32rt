@@ -58,6 +58,54 @@ static ppc32_block_t *s_table[PPC32_DBT_HT_SIZE];
 static uint32_t s_page_ver[PPC32_DBT_NPAGES];
 static uint32_t g_cache_epoch = 1U;
 
+/* RC-H perf: one occupancy bit per guest 4 KiB page (1M bits = 128 KiB).
+ * Set when a translated range covers the page, cleared only by
+ * invalidate_all (which evicts everything, so the map is exact again
+ * afterwards). The H1 post-store hook consults it first: a store to
+ * pages with no translated code returns without the two full-table
+ * sweeps (the common case — data pages never hold code). Stale set bits
+ * (range eviction and replacement eviction do not clear) only cause
+ * extra sweeps, never a missed invalidation: marks are a superset of
+ * live-block pages, so an unmarked page provably holds no live block.
+ * Range-granular clearing is deliberately absent: see the NOTE in
+ * ppc32_cache_invalidate_range_skip. */
+#define PPC32_CODE_PAGE_WORDS (PPC32_DBT_NPAGES / 64U)
+
+static uint64_t s_code_pages[PPC32_CODE_PAGE_WORDS];
+
+static void code_pages_mark(uint32_t start, uint32_t end)
+{
+    uint32_t pg;
+
+    if (end <= start) {
+        return;
+    }
+    for (pg = start >> 12U; ; pg++) {
+        s_code_pages[pg >> 6U] |= 1ULL << (pg & 63U);
+        if (pg == ((end - 1U) >> 12U) || pg == 0xFFFFFU) {
+            break;
+        }
+    }
+}
+
+static bool code_pages_any(uint32_t start, uint32_t end)
+{
+    uint32_t pg;
+
+    if (end <= start) {
+        return false;
+    }
+    for (pg = start >> 12U; ; pg++) {
+        if ((s_code_pages[pg >> 6U] & (1ULL << (pg & 63U))) != 0ULL) {
+            return true;
+        }
+        if (pg == ((end - 1U) >> 12U) || pg == 0xFFFFFU) {
+            break;
+        }
+    }
+    return false;
+}
+
 uint32_t *ppc32_cache_epoch_ptr(void)
 {
     return &g_cache_epoch;
@@ -184,6 +232,11 @@ void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
     if (e == NULL) {
         return;
     }
+    /* Every install path funnels through here: mark the covered pages
+     * (even past the 4096 snapshot cap — the store hook must still
+     * evict over-long blocks by range overlap). Empty ranges mark
+     * nothing. */
+    code_pages_mark(start, end);
     e->pad0[1] = (uint64_t)start;
     e->pad0[2] = (uint64_t)end;
     e->pad0[3] = (uint64_t)0;
@@ -387,6 +440,13 @@ void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
             break;
         }
     }
+    /* NOTE: pages stay marked here even though the sweep below evicts
+     * the range. Unmarking would need per-page live-block accounting:
+     * a surviving block overlapped-but-not-evicted (its start lies
+     * outside [start, end)) still needs its marks, and a later store
+     * to a prematurely unmarked page would skip the sweep that must
+     * evict it. Stale marks only cost extra sweeps on pages that once
+     * held code (rare); the next invalidate_all resets the map. */
     for (uint32_t i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
         ppc32_block_t *e = s_table[i];
 
@@ -458,6 +518,12 @@ void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
         ppc32_cache_invalidate_all(ctx);
         return;
     }
+    /* Fast path: no translated code on the touched pages, so the two
+     * full-table sweeps below would evict and sever nothing. Data
+     * writes (the overwhelmingly common store) return here. */
+    if (!code_pages_any(ea, (uint32_t)end)) {
+        return;
+    }
     ppc32_cache_invalidate_range_skip(ctx, ea, (uint32_t)end,
         (ppc32_block_t *)cur);
 }
@@ -470,6 +536,8 @@ void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx)
         block_free(s_table[i]);
         s_table[i] = NULL;
     }
+    /* No live block survives: clear the occupancy map with it. */
+    memset(s_code_pages, 0, sizeof s_code_pages);
     /* Retire every emitted epoch check at once. */
     g_cache_epoch++;
     if (g_cache_epoch == 0U) {

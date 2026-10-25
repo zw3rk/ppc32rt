@@ -106,6 +106,24 @@ typedef struct ppc32_flock {
     int32_t  l_pid;
 } ppc32_flock_t;
 
+/* Guest struct flock64 (powerpc uapi: short, short, 4-byte pad,
+ * 64-bit start, 64-bit len, 32-bit pid; 28 bytes). The pad keeps the
+ * 64-bit fields 8-aligned at guest offsets 8 and 16 with l_pid at 24
+ * (verified against the qemu-ppc oracle: GETLK reports the holder pid
+ * at offset 24, and offsets 4..7 come back untouched). Raw BE byte
+ * arrays avoid host alignment padding. glibc on 32-bit PPC issues all
+ * lock commands (F_GETLK/F_SETLK/F_SETLKW) as their 64-bit numbers
+ * 12/13/14 with this layout (its struct flock is this plus 4 bytes of
+ * tail padding, 32 bytes total). */
+typedef struct ppc32_flock64 {
+    int16_t  l_type;
+    int16_t  l_whence;
+    uint8_t  l_pad[4];
+    uint8_t  l_start[8];
+    uint8_t  l_len[8];
+    int32_t  l_pid;
+} ppc32_flock64_t;
+
 typedef struct ppc32_termios {
     uint32_t c_iflag;
     uint32_t c_oflag;
@@ -140,6 +158,10 @@ _Static_assert(offsetof(ppc32_stat64_t, st_blocks) == 0x40, "stat64 st_blocks of
 _Static_assert(offsetof(ppc32_stat64_t, st_atime) == 0x48, "stat64 st_atime offset");
 _Static_assert(offsetof(ppc32_stat64_t, st_mtime) == 0x50, "stat64 st_mtime offset");
 _Static_assert(offsetof(ppc32_stat64_t, st_ctime) == 0x58, "stat64 st_ctime offset");
+_Static_assert(sizeof(ppc32_flock64_t) == 28, "ppc32 struct flock64 must be 28 bytes");
+_Static_assert(offsetof(ppc32_flock64_t, l_start) == 8, "flock64 l_start offset");
+_Static_assert(offsetof(ppc32_flock64_t, l_len) == 16, "flock64 l_len offset");
+_Static_assert(offsetof(ppc32_flock64_t, l_pid) == 24, "flock64 l_pid offset");
 
 /* Guest range check: len bytes at va stay inside the 4 GiB window without
  * wrapping, and a nonzero access never touches the low guard page. */
@@ -190,6 +212,11 @@ int ppc32_winsize_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
 int ppc32_flock_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
     const struct flock *hs);
 int ppc32_flock_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
+    struct flock *hs);
+/* 64-bit lock layout (F_GETLK64/F_SETLK64/F_SETLKW64 = 12/13/14). */
+int ppc32_flock64_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
+    const struct flock *hs);
+int ppc32_flock64_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
     struct flock *hs);
 
 #endif /* PPC32_CONVERT_H */

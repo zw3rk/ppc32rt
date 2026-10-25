@@ -98,3 +98,22 @@ every assertion above holds; total wall time is about five minutes
 (the `-O0` fixed-work `interp` run alone takes ~2 minutes).
 `make check` and `make check-line-limits` pass; no `.c`/`.h` files
 were added or changed.
+
+## RC-H re-verification (coordinator, final `master` code)
+
+`sh tools/p7_coremark.sh` re-run on the merged tree exits 0
+(`PASS: all H3 assertions hold`):
+
+- fixed-work `-O0` (6000 iters): qemu 772.50 | interp 35.84 |
+  dbt 154.36 it/s (`dbt`/`interp` 4.3x, `crcfinal` equal).
+- auto `-O0`: qemu 773.56 | interp 29.68 | dbt 121.33 it/s (4.1x).
+- auto `-O2`: qemu 4178.0 | interp 151.13 | dbt 201.87 it/s (1.34x).
+
+Two coordinator changes since the lane run: (1) the H1 SMC
+post-store hook swept two full hash tables per guest store, which
+collapsed `dbt` CoreMark throughput to 0.24 it/s; a code-page
+occupancy bitmap in `src/dbt/cache.c` now fast-paths stores to
+pages with no translated code (300x recovery, `P7-SMC-OK`
+unchanged); (2) the gate gained a 900 s per-run budget and bounded
+auto-recalibration retries (host contention tolerance — assertions
+are validity/CRC/ratio only, never absolute rates).

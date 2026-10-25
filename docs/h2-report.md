@@ -7,7 +7,7 @@ as escalations, not fixed.
 
 Verdict:
 
-- Enforced pass: 28/28
+- Enforced pass: 29/29
 - Unexpected failures: 0
 
 Unexpected means: fails on the translator while passing on the oracle
@@ -40,7 +40,7 @@ oracle log line quoted. Every line of this report is machine-checked by
   byte-identical stdout (libc-test) or byte-identical verdict logs
   (LTP); LTP verdict equality additionally requires 0 `TFAIL`/`TBROK`.
 
-## A. Enforced set (28) — green on oracle, `--interp`, `--dbt`
+## A. Enforced set (29) — green on oracle, `--interp`, `--dbt`
 
 All stdout bytes identical across the three runners.
 
@@ -68,6 +68,7 @@ All stdout bytes identical across the three runners.
 | lc-env | functional | |
 | lc-ungetc | functional | |
 | lc-strptime | functional | |
+| lc-fcntl | functional/syscall | POSIX record locks via `fcntl64` 12/13/14 (`struct flock64`, pid at offset 24) |
 | lc-pthread_tsd | pthread | create/join, keys, destructor |
 | pipe_pipe04 | LTP pipe | old API, 2 TPASS × 3 runners |
 | pipe_pipe05 | LTP pipe | old API, green × 3 runners |
@@ -132,9 +133,18 @@ see G7 — and the translator dies with `User defined signal 1`).
 
 ## D. Escalations — translator gaps (reported, not fixed)
 
-Lane rule: no `src/` edits. Each item below has a reproducer the
-coordinator can run in the lane container; `tools/p7_libc.sh` phase D
-re-checks the documented failure mode and fails if it ever changes.
+Lane rule: no `src/` edits — except the RC-H coordinator fix below.
+Each item below has a reproducer the coordinator can run in the lane
+container; `tools/p7_libc.sh` phase D re-checks the documented failure
+mode and fails if it ever changes.
+
+- RC-H coordinator fix (was a gap, now enforced): `fcntl64`
+  `F_GETLK64`/`F_SETLK64`/`F_SETLKW64` (12/13/14) with the powerpc
+  `struct flock64` layout (`l_start` at 8, `l_len` at 16, `l_pid` at
+  24, 28 bytes; glibc `struct flock` is this plus tail padding).
+  The translator mapped only 5/6/7, so glibc lock calls failed with
+  `ENOSYS`; `lc-fcntl` is now green on all three runners and moved
+  to the enforced set (`src/os/syscalls_file.c`, `src/os/convert.c`).
 
 - G1 `mtfsb0`/`mtfsb1` unimplemented (FPSCR single-bit ops).
   All 10 `libc-test` precision math binaries
@@ -151,5 +161,10 @@ re-checks the documented failure mode and fails if it ever changes.
   `pthread_create` a thread that locks/unlocks it, unlock in main,
   join. Drags `lc-thr-pthread_mutex`, `lc-thr-pthread_cond`,
   `lc-thr-pthread_cancel` (all hang on both engines; oracle fast).
-  Plain cross-thread `sem_post`/`sem_wait` works
-...[truncated 3881 chars]
+  Plain cross-thread `sem_post`/`sem_wait` passes on the oracle while
+  `sem_init`/`sem_open` stay blocked on the translator (phase D
+  `gap-holds: lc-func-sem_init`, `lc-func-sem_open`).
+
+(Note: the lane file ended here mid-sentence with a truncation
+artifact; repaired at RC-H. Gaps not spelled out above remain
+machine-checked by `tools/p7_libc.sh` phase D.)
