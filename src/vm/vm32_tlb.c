@@ -32,15 +32,12 @@
 #include "vm/vm32.h"
 
 #include <errno.h>
+#include <sched.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define VM32_PAGE_COUNT (VM32_WINDOW_SIZE / VM32_GUEST_PAGE_SIZE)
-
-#define VM32_PAGE_UNMAPPED 0U
-#define VM32_PAGE_ANON 1U
-#define VM32_PAGE_COW_CLEAN 2U
-#define VM32_PAGE_COW_DIRTY 3U
-#define VM32_PAGE_SHARED 4U
 
 #define VM32_PAGE_HAS_CODE 0x01U
 #define VM32_PAGE_HAS_RESERVATION 0x02U
@@ -176,6 +173,15 @@ int vm32_tlb_miss(ppc32_ctx_t *ctx, uint32_t gva, bool is_store,
         ok = false;
     } else if (!is_store) {
         ok = (g_page_prot[vpn] & 0x1U) != 0U;
+    } else if (g_page_state[vpn] == VM32_PAGE_COW_CLEAN &&
+        (g_page_prot[vpn] & 0x2U) != 0U &&
+        (g_page_flags[vpn] &
+            (VM32_PAGE_HAS_CODE | VM32_PAGE_HAS_RESERVATION)) == 0U) {
+        /* First write to a clean COW page: promote in place
+         * (PAGE_COW_CLEAN -> PAGE_COW_DIRTY) so this very access
+         * succeeds below without a second miss. */
+        g_page_state[vpn] = (uint8_t)VM32_PAGE_COW_DIRTY;
+        ok = true;
     } else {
         ok = page_writable_locked(vpn);
     }
@@ -243,4 +249,303 @@ void vm32_tlb_invalidate_all(void)
     (void)memset(g_page_state, 0, sizeof g_page_state);
     (void)memset(g_page_flags, 0, sizeof g_page_flags);
     tlb_unlock();
+}
+
+/* ---- Regime A2 host-page permission unions (RC-U3 finding 3) ---- */
+
+static _Atomic size_t g_host_page_cached = 0U;
+
+size_t vm32_host_page_size(void)
+{
+    size_t h = atomic_load_explicit(&g_host_page_cached,
+        memory_order_relaxed);
+
+    if (h == 0U) {
+        long v = sysconf(_SC_PAGESIZE);
+
+        h = (v > 0L) ? (size_t)v : (size_t)VM32_GUEST_PAGE_SIZE;
+        atomic_store_explicit(&g_host_page_cached, h,
+            memory_order_relaxed);
+    }
+    return h;
+}
+
+bool vm32_is_a2(void)
+{
+    return vm32_host_page_size() > (size_t)VM32_GUEST_PAGE_SIZE;
+}
+
+/* Invalidate one direct-mapped TLB slot; caller holds tlb_lock. The
+ * table is a direct-mapped cache, so evicting the aliased slot is a
+ * conservative forced miss refilled from the arrays below. */
+static void tlb_evict_slot_locked(uint32_t vpn)
+{
+    uint32_t idx = vpn & (VM32_TLB_SIZE - 1U);
+
+    g_tlb[idx].read_tag = VM32_TLB_INVALID_TAG;
+    g_tlb[idx].write_tag = VM32_TLB_INVALID_TAG;
+}
+
+/* Refill one slot from the recorded arrays (canonical in-place HVA =
+ * arena_base + gva); caller holds tlb_lock. Unmapped or unreadable
+ * pages keep INVALID tags so accesses trap into the miss path. */
+static void tlb_refill_slot_locked(uint32_t vpn, uintptr_t base)
+{
+    uint32_t idx = vpn & (VM32_TLB_SIZE - 1U);
+    uint64_t tag = (uint64_t)vpn << 12U;
+
+    g_tlb[idx].addend = base;
+    if ((g_page_prot[vpn] & (uint8_t)PROT_READ) != 0U) {
+        g_tlb[idx].read_tag = tag;
+    } else {
+        g_tlb[idx].read_tag = VM32_TLB_INVALID_TAG;
+    }
+    if (page_writable_locked(vpn)) {
+        g_tlb[idx].write_tag = tag;
+    } else {
+        g_tlb[idx].write_tag = VM32_TLB_INVALID_TAG;
+    }
+}
+
+/* Clamp [start_gva, end_gva) to the window; false when empty. */
+static bool clamp_range(uint32_t start_gva, uint32_t end_gva,
+    uint32_t *first_out, uint32_t *last_out)
+{
+    uint64_t first = (uint64_t)(start_gva >> 12U);
+    uint64_t last = ((uint64_t)end_gva + (uint64_t)VM32_GUEST_PAGE_MASK) >> 12U;
+
+    if (end_gva <= start_gva || first >= (uint64_t)VM32_PAGE_COUNT) {
+        return false;
+    }
+    if (last > (uint64_t)VM32_PAGE_COUNT) {
+        last = (uint64_t)VM32_PAGE_COUNT;
+    }
+    *first_out = (uint32_t)first;
+    *last_out = (uint32_t)last;
+    return true;
+}
+
+/* Refresh one slot after the arrays changed: refill when the arena
+ * base is published, else evict to force a later miss. */
+static void tlb_refresh_slot_locked(uint32_t vpn, uintptr_t base)
+{
+    if (base == 0U) {
+        tlb_evict_slot_locked(vpn);
+    } else {
+        tlb_refill_slot_locked(vpn, base);
+    }
+}
+
+void vm32_record_map(uint32_t start_gva, uint32_t end_gva, uint8_t prot,
+    uint8_t state)
+{
+    uint32_t first;
+    uint32_t last;
+    uint32_t vpn;
+    uintptr_t base;
+
+    if (state > VM32_PAGE_SHARED) {
+        state = (uint8_t)VM32_PAGE_ANON;
+    }
+    if (!clamp_range(start_gva, end_gva, &first, &last)) {
+        return;
+    }
+    prot = (uint8_t)((uint32_t)prot &
+        ((uint32_t)PROT_READ | (uint32_t)PROT_WRITE));
+    base = vm32_arena_base();
+    tlb_lock();
+    for (vpn = first; vpn < last; vpn++) {
+        g_page_prot[vpn] = prot;
+        g_page_state[vpn] = state;
+        tlb_refresh_slot_locked(vpn, base);
+    }
+    tlb_unlock();
+}
+
+void vm32_record_protect(uint32_t start_gva, uint32_t end_gva,
+    uint8_t prot)
+{
+    uint32_t first;
+    uint32_t last;
+    uint32_t vpn;
+    uintptr_t base;
+
+    if (!clamp_range(start_gva, end_gva, &first, &last)) {
+        return;
+    }
+    prot = (uint8_t)((uint32_t)prot &
+        ((uint32_t)PROT_READ | (uint32_t)PROT_WRITE));
+    base = vm32_arena_base();
+    tlb_lock();
+    for (vpn = first; vpn < last; vpn++) {
+        g_page_prot[vpn] = prot;
+        tlb_refresh_slot_locked(vpn, base);
+    }
+    tlb_unlock();
+}
+
+/* Mark pages beyond a shrunk EOF as EOF_TRAP: accesses trap (the
+ * state is neither readable-map nor writable, so probes miss and the
+ * fault path delivers SIGBUS), while the identity survives for a later
+ * regrow, which re-populates and re-records the range. */
+void vm32_mark_eof_trap(uint32_t start_gva, uint32_t end_gva)
+{
+    uint32_t first;
+    uint32_t last;
+    uint32_t vpn;
+    uintptr_t base;
+
+    if (!clamp_range(start_gva, end_gva, &first, &last)) {
+        return;
+    }
+    base = vm32_arena_base();
+    tlb_lock();
+    for (vpn = first; vpn < last; vpn++) {
+        g_page_prot[vpn] = 0U;
+        g_page_state[vpn] = (uint8_t)VM32_PAGE_EOF_TRAP;
+        tlb_refresh_slot_locked(vpn, base);
+    }
+    tlb_unlock();
+}
+
+void vm32_record_unmap(uint32_t start_gva, uint32_t end_gva)
+{
+    uint32_t first;
+    uint32_t last;
+    uint32_t vpn;
+    uintptr_t base;
+
+    if (!clamp_range(start_gva, end_gva, &first, &last)) {
+        return;
+    }
+    base = vm32_arena_base();
+    tlb_lock();
+    for (vpn = first; vpn < last; vpn++) {
+        g_page_prot[vpn] = 0U;
+        g_page_state[vpn] = (uint8_t)VM32_PAGE_UNMAPPED;
+        tlb_refresh_slot_locked(vpn, base);
+    }
+    tlb_unlock();
+}
+
+void vm32_note_cow_dirty(uint32_t gva_page)
+{
+    uint32_t vpn = gva_page >> 12U;
+    uintptr_t base;
+
+    if (vpn >= VM32_PAGE_COUNT) {
+        return;
+    }
+    base = vm32_arena_base();
+    tlb_lock();
+    if (g_page_state[vpn] == VM32_PAGE_COW_CLEAN) {
+        g_page_state[vpn] = (uint8_t)VM32_PAGE_COW_DIRTY;
+    }
+    /* Refill (or evict when no arena is published) so the promotion
+     * is visible to the very next probe without a forced miss. */
+    tlb_refresh_slot_locked(vpn, base);
+    tlb_unlock();
+}
+
+/* Union of mapped sub-pages' R/W bits over one host page starting at
+ * guest page vpn_first (vpn_first holds H / 4096 sub-pages). Caller
+ * holds tlb_lock. Never includes PROT_EXEC (W^X). */
+static int host_union_locked(uint32_t vpn_first, uint32_t sub_pages)
+{
+    uint32_t k;
+    int uni = 0;
+
+    for (k = 0U; k < sub_pages; k++) {
+        uint32_t vpn = vpn_first + k;
+
+        if (vpn >= VM32_PAGE_COUNT) {
+            break;
+        }
+        if (g_page_state[vpn] == VM32_PAGE_UNMAPPED) {
+            continue;
+        }
+        uni |= (int)(g_page_prot[vpn] &
+            (uint8_t)((uint32_t)PROT_READ | (uint32_t)PROT_WRITE));
+    }
+    return uni;
+}
+
+int vm32_sync_host_range(uint32_t start_gva, uint32_t end_gva)
+{
+    size_t host_page;
+    uint32_t subs_per_host;
+    uintptr_t base;
+    uint64_t first_hp;
+    uint64_t last_hp;
+    uint64_t hp;
+
+    if (end_gva <= start_gva) {
+        return 0;
+    }
+    host_page = vm32_host_page_size();
+    if (host_page <= (size_t)VM32_GUEST_PAGE_SIZE) {
+        return 0;
+    }
+    base = vm32_arena_base();
+    if (base == 0U) {
+        return 0;
+    }
+    subs_per_host = (uint32_t)(host_page / (size_t)VM32_GUEST_PAGE_SIZE);
+    first_hp = (uint64_t)start_gva / (uint64_t)host_page;
+    last_hp = ((uint64_t)end_gva + (uint64_t)host_page - 1U) /
+        (uint64_t)host_page;
+    tlb_lock();
+    for (hp = first_hp; hp < last_hp; hp++) {
+        uint64_t vpn_first64 = hp * (uint64_t)subs_per_host;
+        void *host_addr;
+        int uni;
+
+        if (vpn_first64 >= (uint64_t)VM32_PAGE_COUNT) {
+            break;
+        }
+        uni = host_union_locked((uint32_t)vpn_first64, subs_per_host);
+        host_addr = (void *)(base + hp * (uint64_t)host_page);
+        if (mprotect(host_addr, host_page, uni) != 0) {
+            int e = errno;
+
+            tlb_unlock();
+            return -e;
+        }
+    }
+    tlb_unlock();
+    return 0;
+}
+
+int vm32_protect_union(uint32_t start_gva, uint32_t len, uint8_t prot)
+{
+    uint64_t end64;
+    int rc;
+
+    if (len == 0U) {
+        return 0;
+    }
+    end64 = (uint64_t)start_gva + (uint64_t)len;
+    if (end64 > (uint64_t)VM32_WINDOW_SIZE) {
+        return -EINVAL;
+    }
+    vm32_record_protect(start_gva, (uint32_t)end64, prot);
+    rc = vm32_sync_host_range(start_gva, (uint32_t)end64);
+    return rc;
+}
+
+int vm32_unmap_union(uint32_t start_gva, uint32_t len)
+{
+    uint64_t end64;
+    int rc;
+
+    if (len == 0U) {
+        return 0;
+    }
+    end64 = (uint64_t)start_gva + (uint64_t)len;
+    if (end64 > (uint64_t)VM32_WINDOW_SIZE) {
+        return -EINVAL;
+    }
+    vm32_record_unmap(start_gva, (uint32_t)end64);
+    rc = vm32_sync_host_range(start_gva, (uint32_t)end64);
+    return rc;
 }

@@ -47,7 +47,7 @@
 #endif
 
 static _Atomic int g_regime = VM32_REGIME_UNSET;
-static uintptr_t g_arena_base = 0U;
+static _Atomic uintptr_t g_arena_base = 0U;
 static size_t g_arena_len = 0U;
 
 vm32_regime_t vm32_select_regime(size_t host_page_size)
@@ -71,7 +71,14 @@ vm32_regime_t vm32_current_regime(void)
 
 uintptr_t vm32_arena_base(void)
 {
-    return g_arena_base;
+    return atomic_load_explicit(&g_arena_base, memory_order_seq_cst);
+}
+
+void vm32_shadow_window(uint64_t base)
+{
+    (void)vm32_select_regime(vm32_host_page_size());
+    atomic_store_explicit(&g_arena_base, (uintptr_t)base,
+        memory_order_seq_cst);
 }
 
 void *vm32_hva(const ppc32_ctx_t *ctx, uint32_t gva)
@@ -79,7 +86,7 @@ void *vm32_hva(const ppc32_ctx_t *ctx, uint32_t gva)
     uintptr_t base;
 
     (void)ctx;
-    base = g_arena_base;
+    base = atomic_load_explicit(&g_arena_base, memory_order_seq_cst);
     if (base == 0U) {
         base = (uintptr_t)ctx->guest_base;
     }
@@ -156,7 +163,8 @@ int vm32_init(ppc32_ctx_t *ctx, uint64_t requested_window)
         return rc;
     }
     ctx->guest_base = base;
-    g_arena_base = (uintptr_t)base;
+    atomic_store_explicit(&g_arena_base, (uintptr_t)base,
+        memory_order_seq_cst);
     g_arena_len = (size_t)VM32_WINDOW_SIZE;
     if (vm32_current_regime() == VM32_REGIME_A2_SOFT_TLB) {
         /* A2 starts with a cold TLB: every access misses into

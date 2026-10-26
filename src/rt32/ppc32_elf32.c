@@ -15,6 +15,8 @@
 #define _GNU_SOURCE
 #include "ppc32.h"
 
+#include "vm/vm32.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -178,10 +180,25 @@ static int pread_full(int fd, void *buf, size_t count, off_t offset)
 static int protect_and_record_seg(ppc32_ctx_t *ctx, uint32_t start, uint32_t end,
                                   uint32_t guest_prot, const char *label)
 {
-    if (mprotect(ppc32_guest_ptr(ctx, start), end - start, ppc32_host_prot(ctx, guest_prot)) != 0) {
-        fprintf(stderr, "ppc32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
-                label, start, end, strerror(errno));
-        return -1;
+    /* Regime A2 union path: guest-4K mprotect cannot map 1:1 onto host
+     * pages (EINVAL on H > 4096 hosts), so each affected host page gets
+     * the union of its mapped sub-pages' R/W bits instead. */
+    if (vm32_is_a2()) {
+        int urc = vm32_protect_union(start, end - start,
+            (uint8_t)(guest_prot & 0x7U));
+
+        if (urc != 0) {
+            fprintf(stderr, "ppc32rt: %s: union protect failed on [0x%x, 0x%x): %s\n",
+                    label, start, end, strerror(-urc));
+            return -1;
+        }
+    } else {
+        if (mprotect(ppc32_guest_ptr(ctx, start), end - start, ppc32_host_prot(ctx, guest_prot)) != 0) {
+            fprintf(stderr, "ppc32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
+                    label, start, end, strerror(errno));
+            return -1;
+        }
+        vm32_record_protect(start, end, (uint8_t)(guest_prot & 0x7U));
     }
     ppc32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
     return 0;
@@ -368,11 +385,27 @@ static int load_elf32_image(ppc32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         uint32_t shared_end  = (map_end < map_start) ? map_end : map_start;
         uint32_t merged_prot = highest_mapped_prot | guest_prot;
         if (page_start < map_start) {
-            if (mprotect(ppc32_guest_ptr(ctx, page_start), shared_end - page_start,
+            /* Overlapped sub-page goes RW first (RELRO-style merge);
+             * the segment-final protect below narrows it to merged_prot.
+             * A2 applies the host-page union instead of the 1:1 call. */
+            if (vm32_is_a2()) {
+                int urc = vm32_protect_union(page_start,
+                    shared_end - page_start,
+                    (uint8_t)(PROT_READ | PROT_WRITE));
+
+                if (urc != 0) {
+                    fprintf(stderr, "ppc32rt: %s: union RW failed on shared page [0x%x, 0x%x): %s\n",
+                            label, page_start, shared_end, strerror(-urc));
+                    return -1;
+                }
+            } else if (mprotect(ppc32_guest_ptr(ctx, page_start), shared_end - page_start,
                          PROT_READ | PROT_WRITE) != 0) {
                 fprintf(stderr, "ppc32rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
                         label, page_start, shared_end, strerror(errno));
                 return -1;
+            } else {
+                vm32_record_protect(page_start, shared_end,
+                    (uint8_t)(PROT_READ | PROT_WRITE));
             }
         }
 
@@ -384,6 +417,14 @@ static int load_elf32_image(ppc32_ctx_t *ctx, int fd, uint32_t default_pie_base,
                 fprintf(stderr, "ppc32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
                         label, map_start, map_end, strerror(errno));
                 return -1;
+            }
+            /* Anonymous payload pages (RW until the final segment
+             * protect below); mirror for the A2 union layer. */
+            vm32_record_map(map_start, map_end,
+                (uint8_t)(PROT_READ | PROT_WRITE),
+                (uint8_t)VM32_PAGE_ANON);
+            if (vm32_is_a2()) {
+                (void)vm32_sync_host_range(map_start, map_end);
             }
         }
 

@@ -51,6 +51,17 @@ typedef enum {
     VM32_REGIME_A2_SOFT_TLB = 2 /* H > 4096: 7-insn Soft-TLB */
 } vm32_regime_t;
 
+/* Per-4 KiB guest page state tracked for Regime A2 (section 4.3/4.6).
+ * Prot values reuse the Linux PROT_READ (0x1) / PROT_WRITE (0x2) bits;
+ * PROT_EXEC is never stored: guest X implies host R (ppc32_host_prot),
+ * so the union below never maps a guest data page executable (W^X). */
+#define VM32_PAGE_UNMAPPED 0U
+#define VM32_PAGE_ANON 1U
+#define VM32_PAGE_COW_CLEAN 2U
+#define VM32_PAGE_COW_DIRTY 3U
+#define VM32_PAGE_SHARED 4U
+#define VM32_PAGE_EOF_TRAP 5U
+
 /* ---- Regime selection and window/arena lifetime (src/vm/vm32.c) ---- */
 
 vm32_regime_t vm32_select_regime(size_t host_page_size);
@@ -105,6 +116,61 @@ void vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
 /* Range-selective invalidation (< 512 pages) else full clear (M5). */
 void vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva);
 void vm32_tlb_invalidate_all(void);
+
+/* ---- Regime A2 host-page permission unions (RC-U3 finding 3) ----
+ *
+ * One host page (H > 4096) packs several 4 KiB guest sub-pages, so a
+ * guest-4K mprotect/mmap/munmap cannot map 1:1 onto a host mprotect:
+ * the host page must carry the UNION of its mapped sub-pages' R/W
+ * bits (PROT_READ | PROT_WRITE, never PROT_EXEC), recomputed from the
+ * per-sub-page state below on every permission change. In Regime A1
+ * (H == 4096) the union of one page is the page itself, so the sync
+ * is a no-op and the record calls only keep the Soft-TLB arrays
+ * truthful for a future regime switch; direct host mappings stay
+ * authoritative there.
+ *
+ * Callers mirror state only AFTER the host mapping call succeeds
+ * (section 4.5 Step 3 -> Step 4), so failures mutate zero state.
+ * All functions are no-ops on empty ranges and tolerate unmapped gaps. */
+
+/* Dynamic host page size (sysconf(_SC_PAGESIZE), cached, never
+ * hardcoded) and whether union semantics apply (H > 4096). */
+size_t vm32_host_page_size(void);
+bool vm32_is_a2(void);
+
+/* Publish an already-reserved window base as the union arena without
+ * reserving (the legacy ppc32_vm_init owner path). Selects the regime
+ * from the dynamic host page size. */
+void vm32_shadow_window(uint64_t base);
+
+/* Record a mapping change over [start_gva, end_gva): prot uses the
+ * PROT_READ/PROT_WRITE bits (exec is stripped), state is one of the
+ * VM32_PAGE_* values above (out-of-range states fall back to ANON). */
+void vm32_record_map(uint32_t start_gva, uint32_t end_gva, uint8_t prot,
+    uint8_t state);
+void vm32_record_protect(uint32_t start_gva, uint32_t end_gva,
+    uint8_t prot);
+void vm32_record_unmap(uint32_t start_gva, uint32_t end_gva);
+
+/* Mark one page's COW line dirty after promotion (COW_CLEAN ->
+ * COW_DIRTY) and re-enable its write tag; no-ops on other states. */
+void vm32_note_cow_dirty(uint32_t gva_page);
+void vm32_mark_eof_trap(uint32_t start_gva, uint32_t end_gva);
+
+/* Recompute and apply the union prot of every host page intersecting
+ * [start_gva, end_gva): PROT_NONE where no sub-page is mapped, else
+ * the OR of mapped sub-pages' R/W bits (never PROT_EXEC). Returns 0
+ * or a negative errno. No-op when not in Regime A2. */
+int vm32_sync_host_range(uint32_t start_gva, uint32_t end_gva);
+
+/* A2 permission application for guest mprotect over [start_gva,
+ * start_gva + len): records prot, then applies the per-host-page
+ * unions. A2-only; A1 callers keep their direct host mprotect. */
+int vm32_protect_union(uint32_t start_gva, uint32_t len, uint8_t prot);
+
+/* A2 unmap over [start_gva, start_gva + len): records UNMAPPED, then
+ * downgrades fully-emptied host pages to PROT_NONE via the union. */
+int vm32_unmap_union(uint32_t start_gva, uint32_t len);
 
 /* ---- LL/SC reservation + true atomic RMW (section 4.4) ---- */
 

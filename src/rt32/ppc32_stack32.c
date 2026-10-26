@@ -20,6 +20,8 @@
 #define _GNU_SOURCE
 #include "ppc32.h"
 
+#include "vm/vm32.h"
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -88,6 +90,12 @@ int ppc32_stack_setup(ppc32_ctx_t *ctx, const ppc32_elf_info_t *elf_info,
     ppc32_vm_record_region(ctx, stack_base, PPC32_STACK_TOP,
                            (uint32_t)(PROT_READ | PROT_WRITE), 0x12U,
                            "[stack]");
+    /* Mirror for the A2 union layer (anonymous RW pages). */
+    vm32_record_map(stack_base, PPC32_STACK_TOP,
+        (uint8_t)(PROT_READ | PROT_WRITE), (uint8_t)VM32_PAGE_ANON);
+    if (vm32_is_a2()) {
+        (void)vm32_sync_host_range(stack_base, PPC32_STACK_TOP);
+    }
 
     uint32_t sp = PPC32_STACK_TOP - 64U;
 

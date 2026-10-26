@@ -214,7 +214,7 @@ void vm_file_promote_cow(uint32_t gva_page)
     if (base == 0U || !page_is_file_backed(page)) {
         return;
     }
-    vm32_tlb_invalidate_range(page, page + 4096U);
+    vm32_note_cow_dirty(page);
     vm32_tlb_fill(page, base + (uintptr_t)page, true, true);
     inode_lock();
     for (i = 0U; i < VM_FILE_INODES; i++) {
@@ -288,6 +288,8 @@ static void file_apply_truncate(size_t i, uint64_t new_size)
                     (uint32_t)((uint64_t)gva_base + (map_hi - map_lo));
 
                 vm32_tlb_invalidate_range(glo, ghi);
+                /* Beyond-EOF pages trap (SIGBUS) until regrow. */
+                vm32_mark_eof_trap(glo, ghi);
             }
         }
     }

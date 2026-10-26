@@ -205,6 +205,10 @@ int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
     ctx->mmap_cursor  = PPC32_MMAP_BASE_32;
     ctx->region_count = 0U;
     ctx->vm_ready     = true;
+    /* Publish the reserved window to the Regime A2 union layer (no
+     * reservation: legacy init already owns [G, G+4GiB)). No-op data
+     * on 4K hosts; selects the union regime on H > 4096. */
+    vm32_shadow_window(ctx->guest_base);
     vm_lock_release();
     return 0;
 }
@@ -257,6 +261,10 @@ void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
     /* The old address space is gone: translations and reservations die. */
     vm32_tlb_invalidate_all();
     vm32_ll_note_remap();
+
+    /* The whole window is gone: no recorded prot/state or translation
+     * may outlive the address space (A2 union layer included). */
+    vm32_tlb_invalidate_all();
 
     /* Mirror the cleared state into the caller's ctx.  vdso_base must
      * clear too: ppc32_vdso_map is idempotent on it, and a fork child
@@ -319,10 +327,29 @@ uint32_t ppc32_vm_brk(ppc32_ctx_t *ctx, uint32_t new_brk)
         }
         (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
+        /* Mirror into the A2 union layer; the sync re-applies the host
+         * page union (over-granted by the 4K-granular host mmap above). */
+        vm32_record_map(old_page, new_page,
+            (uint8_t)(PROT_READ | PROT_WRITE),
+            (uint8_t)VM32_PAGE_ANON);
+        if (vm32_is_a2()) {
+            (void)vm32_sync_host_range(old_page, new_page);
+        }
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
-        /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
-        (void)vm_reserve_prot_none(ctx, new_page, len);
+        if (vm32_is_a2()) {
+            /* Host-page-granular union unmap: fully-emptied host pages
+             * drop to PROT_NONE, shared ones keep the survivor union.
+             * The 4K-granular PROT_NONE reserve below would EINVAL on
+             * H > 4096 hosts, so the union path replaces it there.
+             * Best-effort like the reserve it replaces (regions below
+             * stay authoritative). */
+            (void)vm32_unmap_union(new_page, len);
+        } else {
+            /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
+            (void)vm_reserve_prot_none(ctx, new_page, len);
+            vm32_record_unmap(new_page, old_page);
+        }
         vm_unmap_regions_locked(new_page, old_page);
         /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
         vm32_tlb_invalidate_range(new_page, old_page);
@@ -416,6 +443,26 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         (void)vm_file_populate_private(host_target, fd,
             (uint64_t)host_off, (size_t)aligned_len);
     }
+    {
+        uint32_t map_end = (uint32_t)((uint64_t)target_va + aligned_len);
+        uint8_t state = (uint8_t)VM32_PAGE_ANON;
+
+        if ((host_flags & MAP_SHARED) != 0) {
+            state = (uint8_t)VM32_PAGE_SHARED;
+        } else if ((host_flags & MAP_ANONYMOUS) == 0) {
+            /* Private file mapping: Provider-A in-place bytes, clean
+             * until the first write promotes them (vm_file hooks). */
+            state = (uint8_t)VM32_PAGE_COW_CLEAN;
+        }
+        vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U),
+            state);
+        /* Best-effort union repair: the direct host mmap above rounds
+         * to host pages and can over-grant sibling sub-pages on
+         * H > 4096 hosts; the sync re-applies the recorded union. */
+        if (vm32_is_a2()) {
+            (void)vm32_sync_host_range(target_va, map_end);
+        }
+    }
     return target_va;
 }
 
@@ -461,8 +508,24 @@ static int vm_mprotect_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
         return -ENOMEM;
     }
 
-    if (mprotect(ppc32_guest_ptr(ctx, addr), (size_t)aligned_len, ppc32_host_prot(ctx, prot)) != 0) {
-        return -errno;
+    if (vm32_is_a2()) {
+        /* The 4K-granular host mprotect below would EINVAL on H > 4096
+         * hosts (addr/len are guest-4K granular, not host aligned), so
+         * the union engine applies the per-host-page union instead:
+         * every affected host page carries the OR of its mapped
+         * sub-pages' R/W bits, never PROT_EXEC. */
+        int urc = vm32_protect_union(addr, (uint32_t)aligned_len,
+            (uint8_t)(prot & 0x7U));
+
+        if (urc != 0) {
+            return urc;
+        }
+    } else {
+        if (mprotect(ppc32_guest_ptr(ctx, addr), (size_t)aligned_len, ppc32_host_prot(ctx, prot)) != 0) {
+            return -errno;
+        }
+        vm32_record_protect(addr, (uint32_t)end64,
+            (uint8_t)(prot & 0x7U));
     }
 
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
@@ -502,13 +565,26 @@ static int vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
     }
 
     uint32_t start = ppc32_page_down(addr);
-    /* Keep the [G, G+4GiB) reservation intact by replacing unmapped pages with PROT_NONE */
-    int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
-    if (rc != 0) {
-        return rc;
+    uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
+
+    if (vm32_is_a2()) {
+        /* Union unmap replaces the 4K-granular PROT_NONE reserve (which
+         * would EINVAL on H > 4096 hosts): fully-emptied host pages
+         * drop to PROT_NONE, shared ones keep the survivor union. */
+        int urc = vm32_unmap_union(start, (uint32_t)aligned_len);
+
+        if (urc != 0) {
+            return urc;
+        }
+    } else {
+        /* Keep the [G, G+4GiB) reservation intact by replacing unmapped pages with PROT_NONE */
+        int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
+        if (rc != 0) {
+            return rc;
+        }
+        vm32_record_unmap(start, end);
     }
 
-    uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
     vm_unmap_regions_locked(start, end);
     /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
     vm32_tlb_invalidate_range(start, end);
