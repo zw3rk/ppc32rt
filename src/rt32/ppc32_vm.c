@@ -26,6 +26,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "vm/vm32.h"
+
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
@@ -286,6 +288,8 @@ uint32_t ppc32_vm_brk(ppc32_ctx_t *ctx, uint32_t new_brk)
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
         (void)vm_reserve_prot_none(ctx, new_page, len);
         vm_unmap_regions_locked(new_page, old_page);
+        /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
+        vm32_tlb_invalidate_range(new_page, old_page);
     }
 
     g_vm_brk_curr = new_brk;
@@ -418,6 +422,8 @@ static int vm_mprotect_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     }
 
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
+    /* A2 Soft-TLB coherence: a prot change can revoke write_tag. */
+    vm32_tlb_invalidate_range(addr, (uint32_t)end64);
     return 0;
 }
 
@@ -459,6 +465,8 @@ static int vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
 
     uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
     vm_unmap_regions_locked(start, end);
+    /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
+    vm32_tlb_invalidate_range(start, end);
     if (g_vm_mmap_cursor == end && start >= PPC32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
     }

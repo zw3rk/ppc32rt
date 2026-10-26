@@ -55,6 +55,7 @@
 #include "os/threads.h"
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
+#include "vm/vm32.h"
 
 #ifdef __linux__
 #include <sys/ioctl.h>
@@ -118,6 +119,15 @@ static long sys_write(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t c
         return -EFAULT;
     }
     n = write((int)fd, ppc32_guest_ptr(ctx, buf_va), (size_t)count);
+    if (n > 0) {
+        /* Provider-A hook: an extending write moves the inode EOF
+         * forward (no-op until a file mapping registers the fd). */
+        off_t end = lseek((int)fd, 0, SEEK_CUR);
+
+        if (end >= (off_t)0) {
+            (void)vm_file_hook_write((int)fd, (uint64_t)end);
+        }
+    }
     return host_ret(n, errno);
 }
 
@@ -169,6 +179,14 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
             break;
         }
     }
+    if (is_write != 0 && total > 0ULL) {
+        /* Same Provider-A EOF hook as sys_write above. */
+        off_t end = lseek((int)fd, 0, SEEK_CUR);
+
+        if (end >= (off_t)0) {
+            (void)vm_file_hook_write((int)fd, (uint64_t)end);
+        }
+    }
     return (long)total;
 }
 
@@ -204,6 +222,17 @@ static long sys_lseek(uint32_t fd, uint32_t offset, uint32_t whence)
         return -(long)errno;
     }
     return (long)r;
+}
+
+/* Provider-A truncate hook: the host call resizes first; only then
+ * does the mem layer discard/regrow translations (section 4.5). */
+static long sys_ftruncate(uint32_t fd, uint32_t length)
+{
+    if (ftruncate((int)fd, (off_t)length) != 0) {
+        return -(long)errno;
+    }
+    (void)vm_file_on_truncate((uint64_t)length);
+    return 0;
 }
 
 /* Bonus (file I/O): ppc llseek(140) carries the 64-bit offset as a
@@ -726,6 +755,9 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     case PPC32_NR_FCNTL:
     case PPC32_NR_FCNTL64:
         ret = sys_fcntl(ctx, a0, a1, a2);
+        break;
+    case PPC32_NR_FTRUNCATE:
+        ret = sys_ftruncate(a0, a1);
         break;
     case PPC32_NR_IOCTL:
         ret = sys_ioctl(ctx, a0, a1, a2);
