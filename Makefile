@@ -34,13 +34,16 @@ ifeq ($(wildcard src/dbt/*.c),)
 endif
 
 # src/main.c plus every engine/substrate file present; later lanes' globs
-# pick up src/interp, src/os, src/dbt automatically.
+# pick up src/interp, src/os, src/dbt automatically (plus src/vm and
+# src/dbt/aot when those Wave U3 lanes land; empty wildcards are no-ops).
 SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
-        $(wildcard src/os/*.c) $(wildcard src/dbt/*.c)
+        $(wildcard src/os/*.c) $(wildcard src/dbt/*.c) \
+        $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)
 ASMS := $(wildcard src/dbt/*.S)
 HDRS := src/ppc32rt.h include/a32host.h src/os/syscall_nr.h \
         $(wildcard src/rt32/*.h) $(wildcard src/interp/*.h) \
-        $(wildcard src/os/*.h) $(wildcard src/dbt/*.h)
+        $(wildcard src/os/*.h) $(wildcard src/dbt/*.h) \
+        $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
 OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS)) \
