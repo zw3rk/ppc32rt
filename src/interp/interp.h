@@ -167,11 +167,25 @@ static inline void res_invalidate(ppc32_ctx_t *ctx)
 }
 
 /* Ordinary guest stores invalidate LL/SC reservations (E06): bump the
- * shared 64-byte line epoch so a peer stwcx. fails, plus the thread
- * epoch for the DBT-side fast check. Loads never bump. */
-static inline void store_bump(ppc32_ctx_t *ctx, uint32_t ea)
+ * shared 64-byte line epoch(s) so a peer stwcx. fails, plus the thread
+ * epoch for the DBT-side fast check. A store wider than one byte can
+ * straddle a 64-byte line boundary (RC-U3-r2 #1): both lines bump, so a
+ * reservation on either side is lost. len is the access width (>= 1);
+ * 32-bit EA wrap is honored by unsigned arithmetic. Loads never bump. */
+static inline void vm32_store_inval(uint32_t ea, uint32_t len)
 {
+    uint32_t first = (ea & ~3U) >> 6U;
+    uint32_t last = ((ea + len - 1U) & ~3U) >> 6U;
+
     vm32_reservation_bump(ea & ~3U);
+    if (last != first) {
+        vm32_reservation_bump((ea + len - 1U) & ~3U);
+    }
+}
+
+static inline void store_bump(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len)
+{
+    vm32_store_inval(ea, len);
     ctx->reservation_epoch++;
 }
 
@@ -222,7 +236,7 @@ static inline uint32_t ld32r(const ppc32_ctx_t *ctx, uint32_t ea)
 static inline void st8(ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
 {
     memcpy(ppc32_guest_ptr(ctx, ea), &v, 1);
-    store_bump(ctx, ea);
+    store_bump(ctx, ea, 1U);
 }
 
 static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
@@ -230,13 +244,13 @@ static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
     uint16_t r = ppc32_be16(v);
 
     memcpy(ppc32_guest_ptr(ctx, ea), &r, sizeof(r));
-    store_bump(ctx, ea);
+    store_bump(ctx, ea, 2U);
 }
 
 static inline void st16r(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 {
     memcpy(ppc32_guest_ptr(ctx, ea), &v, sizeof(v));
-    store_bump(ctx, ea);
+    store_bump(ctx, ea, 2U);
 }
 
 static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
@@ -244,13 +258,13 @@ static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
     uint32_t r = ppc32_be32(v);
 
     memcpy(ppc32_guest_ptr(ctx, ea), &r, sizeof(r));
-    store_bump(ctx, ea);
+    store_bump(ctx, ea, 4U);
 }
 
 static inline void st32r(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 {
     memcpy(ppc32_guest_ptr(ctx, ea), &v, sizeof(v));
-    store_bump(ctx, ea);
+    store_bump(ctx, ea, 4U);
 }
 
 static inline uint32_t fetch_raw(const ppc32_ctx_t *ctx)
@@ -434,53 +448,64 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
     ctx->nip += 4U;
 }
 
+/* X-form update loads/stores (LBZUX/LHZUX/LHAUX/LWZUX/STBUX/STHUX/
+ * STWUX): the base writeback lands AFTER the access (RC-U3-r2 #2), so a
+ * faulting EA leaves ra untouched for the oracle frame. The access runs
+ * first into scratch: loads stage the value in `loaded` (rt == ra keeps
+ * the loaded value, as before), stores read rs before the writeback
+ * (rs == ra stores the old value, matching the DBT overlap capture). */
 static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
     const ppc32_insn_t *insn)
 {
     uint32_t ea = (insn->ra == 0U ? 0U : ctx->gpr[insn->ra]) +
         ctx->gpr[insn->rb];
+    bool update = false;
+    bool is_load = false;
+    uint32_t loaded = 0U;
 
-    if (insn->ra != 0U) {
-        switch (insn->op) {
-        case PPC32_OP_LBZUX:
-        case PPC32_OP_LHZUX:
-        case PPC32_OP_LHAUX:
-        case PPC32_OP_LWZUX:
-        case PPC32_OP_STBUX:
-        case PPC32_OP_STHUX:
-        case PPC32_OP_STWUX:
-            ctx->gpr[insn->ra] = ea;
-            break;
-        default:
-            break;
+    switch (insn->op) {
+    case PPC32_OP_LBZUX:
+    case PPC32_OP_LHZUX:
+    case PPC32_OP_LHAUX:
+    case PPC32_OP_LWZUX:
+        if (insn->ra == 0U) {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+            return;
         }
-    } else if (insn->op == PPC32_OP_LBZUX ||
-        insn->op == PPC32_OP_LHZUX || insn->op == PPC32_OP_LHAUX ||
-        insn->op == PPC32_OP_LWZUX) {
-        ctx->exit_reason = PPC32_EXIT_UNDEF;
-        return;
+        update = true;
+        break;
+    case PPC32_OP_STBUX:
+    case PPC32_OP_STHUX:
+    case PPC32_OP_STWUX:
+        update = insn->ra != 0U;
+        break;
+    default:
+        break;
     }
     switch (insn->op) {
     case PPC32_OP_LBZX:
     case PPC32_OP_LBZUX:
+        is_load = true;
         if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] = ld8(ctx, ea);
+        loaded = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZX:
     case PPC32_OP_LHZUX:
+        is_load = true;
         if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] = ld16(ctx, ea);
+        loaded = ld16(ctx, ea);
         break;
     case PPC32_OP_LHAX:
     case PPC32_OP_LHAUX:
+        is_load = true;
         if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] =
-            (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
+        loaded = (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZX:
     case PPC32_OP_LWZUX:
+        is_load = true;
         if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] = ld32(ctx, ea);
+        loaded = ld32(ctx, ea);
         break;
     case PPC32_OP_STBX:
     case PPC32_OP_STBUX:
@@ -496,6 +521,12 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
         st32(ctx, ea, ctx->gpr[insn->rs]);
         break;
+    }
+    if (update) {
+        ctx->gpr[insn->ra] = ea;
+    }
+    if (is_load) {
+        ctx->gpr[insn->rt] = loaded;
     }
     ctx->nip += 4U;
 }

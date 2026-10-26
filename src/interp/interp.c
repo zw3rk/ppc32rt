@@ -4,15 +4,10 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements SPEC 2.2 Book I integer ISA (classic 32-bit; FPU/SPE in
- * Phase 3): ALU with XER.CA/OV/SO and CR0 on Rc=1, rotate/mask (MB>ME
- * wrap, sraw CA dropped-bit rule, E02), CR ops, mfspr/mtspr, branches,
- * sc, string/multiple/byte-reverse and update-form loads/stores, and
- * lwarx/stwcx. (SPEC 2.1 slot, E06). Raw-field layouts: SH/MB/ME, TO,
- * NB, SPR, CRM, crD/crS/BA/BB, BF/L. XER: SO/OV/CA = 0x80000000/
- * 0x40000000/0x20000000; CR0.SO = 0x10000000 (E01). Guest memory is
- * big-endian (ppc32_be16/32); unaligned accesses go through memcpy,
- * lmw/stmw/lwarx/stwcx. need word-aligned EA (else FAULT with EA).
+ * SPEC 2.2 Book I integer ISA (FPU/SPE in Phase 3): ALU, CR/SPR ops,
+ * branches, sc, string/multiple/update memops, lwarx/stwcx. (E06).
+ * BE guest; unaligned access via memcpy; lmw/stmw/lwarx/stwcx. fault
+ * on misaligned EA.
  */
 
 #include <stdatomic.h>
@@ -27,11 +22,17 @@
 #include "vm/vm32.h"
 
 /* lwarx/stwcx. lines (Wave U3 §4.4): SEQ_CST epoch + owner/addr/val snapshot (vm/vm32.h). */
-typedef struct { uint64_t epoch; uint64_t snap; const ppc32_ctx_t *owner; uint32_t addr; uint32_t val; } ppc32_ll_line_t;
+typedef struct { uint64_t epoch; uint64_t snap; uint64_t gensnap; const ppc32_ctx_t *owner; uint32_t addr; uint32_t val; } ppc32_ll_line_t;
 static ppc32_ll_line_t g_ll_table[1024];
 
-/* STWCX. as one SEQ_CST compare-exchange (vm/vm32.h): gate checks plus a
- * single atomic store; the reservation is consumed either way. */
+/* Shared mapping generation (RC-U3-r2 #1): guest-mm teardowns bump it
+ * via vm32_ll_note_remap, so a pre-teardown reservation can never
+ * succeed after it (line epochs alone cannot see a remap). */
+static uint64_t g_ll_generation;
+void vm32_ll_note_remap(void) { __atomic_fetch_add(&g_ll_generation, 1ULL, __ATOMIC_SEQ_CST); }
+
+/* STWCX. as one SEQ_CST compare-exchange (vm/vm32.h): shared mapping
+ * generation + reservation_valid/addr gate the store; consumed either way. */
 bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
 {
     uint32_t al = gva_aligned & ~3U;
@@ -42,11 +43,10 @@ bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
     bool ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx &&
         g_ll_table[h].addr == al && g_ll_table[h].val == ctx->res_val &&
         __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST) == g_ll_table[h].snap &&
+        __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST) == g_ll_table[h].gensnap &&
         __atomic_compare_exchange_n(hva, &exp, des, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 
-    if (ok) {
-        __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST);
-    }
+    if (ok) { __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST); }
     ctx->res_valid = 0;
     g_ll_table[h].owner = NULL;
     ctx->reservation_epoch++;
@@ -60,8 +60,7 @@ void vm32_reservation_bump(uint32_t gva_aligned)
         __ATOMIC_SEQ_CST);
 }
 
-/* Memory/branch/trap helpers live in interp.h for both engines. */
-/* interp_step */
+/* Memory/branch/trap helpers live in interp.h; interp_step below. */
 
 void interp_step(ppc32_ctx_t *ctx)
 {
@@ -804,6 +803,7 @@ void interp_step(ppc32_ctx_t *ctx)
         ctx->res_addr = al; ctx->res_val = ctx->gpr[insn.rt]; ctx->res_valid = 1;
         g_ll_table[h].owner = ctx; g_ll_table[h].addr = al; g_ll_table[h].val = ctx->res_val;
         g_ll_table[h].snap = __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST);
+        g_ll_table[h].gensnap = __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST);
         ctx->nip += 4U; break;
     }
     case PPC32_OP_STWCX: {

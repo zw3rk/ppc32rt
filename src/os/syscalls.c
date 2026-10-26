@@ -69,6 +69,11 @@
 #undef st_mtime
 #undef st_ctime
 
+/* Extended Provider-A helper (defined in src/vm/vm_file.c): identity
+ * truncate matches one (host_fd, st_dev, st_ino) mapping. Declared at
+ * use so the shared vm32.h contract stays untouched (RC-U3-r2 #4). */
+int vm_file_on_truncate_fd(int host_fd, uint64_t new_size);
+
 /* Numbers absent from the frozen os/syscall_nr.h (powerpc syscall.tbl):
  * clock_gettime 246, openat 286, getrandom 359. Guarded so a future
  * header update wins. */
@@ -225,13 +230,14 @@ static long sys_lseek(uint32_t fd, uint32_t offset, uint32_t whence)
 }
 
 /* Provider-A truncate hook: the host call resizes first; only then
- * does the mem layer discard/regrow translations (section 4.5). */
+ * does the mem layer discard/regrow translations (section 4.5). The
+ * identity form moves just the truncated file's mapping (RC-U3-r2 #4). */
 static long sys_ftruncate(uint32_t fd, uint32_t length)
 {
     if (ftruncate((int)fd, (off_t)length) != 0) {
         return -(long)errno;
     }
-    (void)vm_file_on_truncate((uint64_t)length);
+    (void)vm_file_on_truncate_fd((int)fd, (uint64_t)length);
     return 0;
 }
 
