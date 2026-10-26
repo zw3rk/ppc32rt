@@ -612,30 +612,22 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
     } else {
         ei_ea_d(b, in->ra, (uint32_t)in->d);
     }
-    /* Access/update ordering mirrors the interpreter per form: D-forms
-     * (interp_exec_dform_mem) access BEFORE the base update, X-forms
-     * (interp_exec_xform_mem) update first. A faulting D-form access must
-     * therefore leave ra untouched (and a D-form load with rt == ra must
-     * resolve to EA, as the interpreter does), so D-form writeback comes
-     * after the access. A store with rs == ra still captures the source
-     * first (RC2: stwu r1,-32(r1) stored EA instead of the old value).
-     * RC4 low-guard placement matches: D-forms guard before the update,
-     * X-forms guard after it. */
+    /* Access/update ordering mirrors the interpreter: both D-forms
+     * (interp_exec_dform_mem) and X-forms (interp_exec_xform_mem) run
+     * the host access BEFORE the base writeback (RC-U3-r2 #2), so a
+     * faulting access leaves ra untouched for the oracle frame. A store
+     * with rs == ra still captures the source first (RC2: stwu
+     * r1,-32(r1) stored EA instead of the old value). Load writeback
+     * placement keeps rt == ra parity with the interpreter: X-form
+     * writeback lands before the rt store (loaded value wins), D-form
+     * after it (EA wins). The low guard always precedes the access. */
     bool overlap = !load && ei_is_update(in->op) && in->rs == in->ra;
     bool wb_first = ei_is_update(in->op) && is_x;
     bool wb_last = ei_is_update(in->op) && !is_x;
     if (overlap) {
         ei_ld(b, EI_B, in->rs);
     }
-    if (!is_x) {
-        ei_guard_low(b, pc);
-    }
-    if (wb_first) {
-        a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
-    }
-    if (is_x) {
-        ei_guard_low(b, pc);
-    }
+    ei_guard_low(b, pc);
     if (load) {
         if (width == 2U) {
             a64_emit_guest_ldr_w(b, EI_B, A64_ADDR);
@@ -652,6 +644,9 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
             }
         } else {
             a64_emit_guest_ldrb_w(b, EI_B, A64_ADDR);
+        }
+        if (wb_first) {
+            a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
         }
         ei_st(b, EI_B, in->rt);
         if (wb_last) {
@@ -675,7 +670,7 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
     } else {
         a64_emit_guest_strb_w(b, EI_B, A64_ADDR);
     }
-    if (wb_last) {
+    if (wb_first || wb_last) {
         a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
     }
     return PPC32_EMIT_NEXT;

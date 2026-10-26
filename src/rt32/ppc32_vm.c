@@ -108,6 +108,41 @@ static int try_reserve_window(uint64_t base)
     return 0;
 }
 
+/* Shared LL/SC generation lives with the reservation table
+ * (src/interp/interp.c); mapping teardowns bump it so a pre-teardown
+ * lwarx can never succeed after its page was unmapped (RC-U3-r2 #1). */
+void vm32_ll_note_remap(void);
+
+/* Publish the two-regime state when the legacy probe owns the window:
+ * regime from the live host page size, A2 TLB armed empty. */
+static void vm32_attach_legacy(void)
+{
+    long host_page = sysconf(_SC_PAGESIZE);
+
+    if (host_page > 0L) {
+        (void)vm32_select_regime((size_t)host_page);
+    }
+    vm32_tlb_invalidate_all();
+}
+
+/* Reserve one window candidate (RC-U3-r2 #4): the two-regime vm32 layer
+ * owns the [G, G+4GiB) reservation when the platform allows it (regime
+ * select + arena publish + A2 TLB arm inside vm32_init); otherwise the
+ * legacy PROT_NONE probe keeps the G=0 guard-hole layout and the regime
+ * is published around it. Exactly one owner reserves per boot. */
+static int reserve_window(ppc32_ctx_t *ctx, uint64_t base)
+{
+    if (base != 0ULL && vm32_init(ctx, base) == 0) {
+        return 0;
+    }
+    if (try_reserve_window(base) != 0) {
+        return -1;
+    }
+    ctx->guest_base = base;
+    vm32_attach_legacy();
+    return 0;
+}
+
 int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
 {
     if (!ctx) {
@@ -134,24 +169,22 @@ int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
     }
 
     if (has_explicit) {
-        if (try_reserve_window(base) != 0) {
+        if (reserve_window(ctx, base) != 0) {
             fprintf(stderr, "ppc32rt: failed to reserve guest window at 0x%llx\n",
                     (unsigned long long)base);
             return -1;
         }
-        ctx->guest_base = base;
     } else if (ctx->has_host_info && ctx->host_info.window_hint != 0ULL &&
-               try_reserve_window(ctx->host_info.window_hint) == 0) {
-        ctx->guest_base = ctx->host_info.window_hint;
+               reserve_window(ctx, ctx->host_info.window_hint) == 0) {
+        /* reserve_window published ctx->guest_base. */
     } else {
         /* Try G = 0 first; if occupied, scan 4 GiB-aligned windows [4G, 64G). */
-        if (try_reserve_window(0ULL) == 0) {
-            ctx->guest_base = 0ULL;
+        if (reserve_window(ctx, 0ULL) == 0) {
+            /* reserve_window published ctx->guest_base. */
         } else {
             bool found = false;
             for (uint64_t cand = 0x100000000ULL; cand < 0x1000000000ULL; cand += 0x100000000ULL) {
-                if (try_reserve_window(cand) == 0) {
-                    ctx->guest_base = cand;
+                if (reserve_window(ctx, cand) == 0) {
                     found = true;
                     break;
                 }
@@ -221,6 +254,9 @@ void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
      * the vDSO and the stack, and the new image loads fresh pages. */
     (void)munmap((void *)(uintptr_t)PPC32_LOW_GUARD_SIZE,
                  (size_t)(PPC32_WINDOW_SIZE - (uint64_t)PPC32_LOW_GUARD_SIZE));
+    /* The old address space is gone: translations and reservations die. */
+    vm32_tlb_invalidate_all();
+    vm32_ll_note_remap();
 
     /* Mirror the cleared state into the caller's ctx.  vdso_base must
      * clear too: ppc32_vdso_map is idempotent on it, and a fork child
@@ -290,6 +326,7 @@ uint32_t ppc32_vm_brk(ppc32_ctx_t *ctx, uint32_t new_brk)
         vm_unmap_regions_locked(new_page, old_page);
         /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
         vm32_tlb_invalidate_range(new_page, old_page);
+        vm32_ll_note_remap();
     }
 
     g_vm_brk_curr = new_brk;
@@ -372,6 +409,13 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
     }
     (void)vm_record_region_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
                                   prot & 0x7U, flags, "[mmap]");
+    if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
+        /* Provider-A (RC-U3-r2 #4): register the inode mapping and load
+         * file content into the canonical slot so later write/truncate
+         * hooks resolve this fd. A fresh mapping shares no lines yet. */
+        (void)vm_file_populate_private(host_target, fd,
+            (uint64_t)host_off, (size_t)aligned_len);
+    }
     return target_va;
 }
 
@@ -424,6 +468,7 @@ static int vm_mprotect_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
     /* A2 Soft-TLB coherence: a prot change can revoke write_tag. */
     vm32_tlb_invalidate_range(addr, (uint32_t)end64);
+    vm32_ll_note_remap();
     return 0;
 }
 
@@ -467,6 +512,7 @@ static int vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
     vm_unmap_regions_locked(start, end);
     /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
     vm32_tlb_invalidate_range(start, end);
+    vm32_ll_note_remap();
     if (g_vm_mmap_cursor == end && start >= PPC32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
     }

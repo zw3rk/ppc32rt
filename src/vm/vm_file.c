@@ -38,6 +38,7 @@
 
 #include <errno.h>
 #include <sched.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -146,7 +147,8 @@ int vm_file_populate_private(void *hva, int host_fd, uint64_t file_offset,
             (uint32_t)(((uint64_t)(gva - gva_base) + (uint64_t)len +
                 4095ULL) / 4096ULL);
 
-        file_register(host_fd, gva_base, pages, file_offset);
+        file_register(host_fd, gva_base, pages,
+            file_offset - (uint64_t)(gva - gva_base));
     }
     while (done < len) {
         ssize_t r = pread(host_fd,
@@ -169,87 +171,174 @@ int vm_file_populate_private(void *hva, int host_fd, uint64_t file_offset,
     return 0;
 }
 
+/* True when the 4 KiB page belongs to a registered file mapping. */
+static bool page_is_file_backed(uint32_t page)
+{
+    size_t i;
+    bool hit = false;
+
+    inode_lock();
+    for (i = 0U; i < VM_FILE_INODES; i++) {
+        uint64_t span;
+
+        if (g_inodes[i].in_use == 0U || g_inodes[i].pages == 0U) {
+            continue;
+        }
+        span = (uint64_t)g_inodes[i].pages * 4096ULL;
+        if ((uint64_t)page >= (uint64_t)g_inodes[i].gva_base &&
+            (uint64_t)page < (uint64_t)g_inodes[i].gva_base + span) {
+            hit = true;
+            break;
+        }
+    }
+    inode_unlock();
+    return hit;
+}
+
 void vm_file_promote_cow(uint32_t gva_page)
 {
     /* The bytes already sit at the canonical HVA (populated at mmap
-     * time); promotion only enables the write tag. HVA and every cached
-     * addend are unchanged by construction. The CLEAN->DIRTY state flip
+     * time); promotion flips PAGE_COW_CLEAN to PAGE_COW_DIRTY. HVA and
+     * every cached addend are unchanged by construction. The state flip
      * itself lives in the mem layer (g_page_state, src/vm/vm32_tlb.c);
-     * the invalidate below drops any stale write_tag == ~0 entry so the
-     * re-fill publishes the tag once the layer marks the page DIRTY. */
+     * the invalidate below drops any stale write_tag == ~0 entry, the
+     * re-fill publishes the write tag once the layer marks the page
+     * DIRTY, and the generation bump drops DBT code compiled under
+     * CLEAN assumptions. Pages outside any registered file mapping are
+     * left alone: filling a translation for them would arm a tag the
+     * mem layer never backing-marked. */
     uintptr_t base = vm32_arena_base();
     uint32_t page = gva_page & ~(uint32_t)4095U;
+    size_t i;
 
-    if (base == 0U) {
+    if (base == 0U || !page_is_file_backed(page)) {
         return;
     }
     vm32_tlb_invalidate_range(page, page + 4096U);
     vm32_tlb_fill(page, base + (uintptr_t)page, true, true);
+    inode_lock();
+    for (i = 0U; i < VM_FILE_INODES; i++) {
+        uint64_t span;
+
+        if (g_inodes[i].in_use == 0U || g_inodes[i].pages == 0U) {
+            continue;
+        }
+        span = (uint64_t)g_inodes[i].pages * 4096ULL;
+        if ((uint64_t)page >= (uint64_t)g_inodes[i].gva_base &&
+            (uint64_t)page < (uint64_t)g_inodes[i].gva_base + span) {
+            atomic_fetch_add_explicit(&g_inodes[i].code_generation, 1U,
+                memory_order_seq_cst);
+        }
+    }
+    inode_unlock();
 }
 
 /* (dev,ino) lookup for the near-EOF fstat refresh on Soft-TLB misses
  * (m4) lands with the miss-path lane; hooks below key on host_fd. */
 
+static uint64_t clamp_u64(uint64_t v, uint64_t lo, uint64_t hi)
+{
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+/* Apply one EOF change to inode slot i (caller holds inode_lock).
+ * Zeroes the resized span inside the mapping (the partial tail on
+ * shrink, the regrown span on grow) and drops translations for pages
+ * wholly beyond the new EOF so accesses there trap (PAGE_EOF_TRAP),
+ * then publishes size/seq/generation. Direct A1 readers see zeroes
+ * instead of stale bytes; A2 readers miss into -EACCES. The seq bumps
+ * serialize concurrent near-EOF refreshes on Soft-TLB misses (m4). */
+static void file_apply_truncate(size_t i, uint64_t new_size)
+{
+    uintptr_t base = vm32_arena_base();
+    uint64_t cur = atomic_load_explicit(&g_inodes[i].file_size,
+        memory_order_seq_cst);
+
+    if (new_size == cur) {
+        return;
+    }
+    if (base != 0U && g_inodes[i].pages != 0U) {
+        uint64_t map_lo = g_inodes[i].map_offset;
+        uint64_t map_hi = map_lo +
+            (uint64_t)g_inodes[i].pages * 4096ULL;
+        uint64_t lo = clamp_u64(new_size < cur ? new_size : cur, map_lo,
+            map_hi);
+        uint64_t hi = clamp_u64(new_size < cur ? cur : new_size, map_lo,
+            map_hi);
+        uint32_t gva_base = g_inodes[i].gva_base;
+
+        if (hi > lo) {
+            (void)memset((char *)base + (uintptr_t)gva_base +
+                (uintptr_t)(lo - map_lo), 0, (size_t)(hi - lo));
+        }
+        {
+            uint64_t eof = clamp_u64((new_size + 4095ULL) & ~4095ULL,
+                map_lo, map_hi);
+
+            if (map_hi > eof) {
+                uint32_t glo =
+                    (uint32_t)((uint64_t)gva_base + (eof - map_lo));
+                uint32_t ghi =
+                    (uint32_t)((uint64_t)gva_base + (map_hi - map_lo));
+
+                vm32_tlb_invalidate_range(glo, ghi);
+            }
+        }
+    }
+    atomic_store_explicit(&g_inodes[i].file_size, new_size,
+        memory_order_seq_cst);
+    atomic_fetch_add_explicit(&g_inodes[i].resize_seq, 1U,
+        memory_order_seq_cst);
+    atomic_fetch_add_explicit(&g_inodes[i].code_generation, 1U,
+        memory_order_seq_cst);
+}
+
 int vm_file_on_truncate(uint64_t new_size)
 {
-    /* Ordered shrink-then-regrow (section 5.1): shrinking first discards
-     * translations for pages wholly beyond the new EOF (partial final
-     * dirty pages keep their bytes via the mem layer); regrowing then
-     * zero-fills the mapped span as clean pages. The seq bumps serialize
-     * concurrent near-EOF refreshes on Soft-TLB misses (m4). */
-    uintptr_t base = vm32_arena_base();
+    /* Broadcast form (section 5.1): every registered mapping moves.
+     * Prefer vm_file_on_truncate_fd, which matches one identity. */
     size_t i;
 
     inode_lock();
     for (i = 0U; i < VM_FILE_INODES; i++) {
-        uint64_t cur;
-
         if (g_inodes[i].in_use == 0U) {
             continue;
         }
-        cur = atomic_load_explicit(&g_inodes[i].file_size,
-            memory_order_seq_cst);
-        if (new_size == cur) {
+        file_apply_truncate(i, new_size);
+    }
+    inode_unlock();
+    return 0;
+}
+
+/* Identity truncate (RC-U3-r2 #4): only the mapping whose host_fd,
+ * st_dev, and st_ino match the truncated description moves. A stale
+ * record left behind by a closed fd reused for another file can no
+ * longer corrupt an unrelated mapping. */
+int vm_file_on_truncate_fd(int host_fd, uint64_t new_size)
+{
+    struct stat hs;
+    size_t i;
+
+    if (host_fd < 0) {
+        return -EINVAL;
+    }
+    if (fstat(host_fd, &hs) != 0) {
+        return -errno;
+    }
+    inode_lock();
+    for (i = 0U; i < VM_FILE_INODES; i++) {
+        if (g_inodes[i].in_use == 0U || g_inodes[i].host_fd != host_fd ||
+            g_inodes[i].dev != (uint64_t)hs.st_dev ||
+            g_inodes[i].ino != (uint64_t)hs.st_ino) {
             continue;
         }
-        if (base != 0U && g_inodes[i].pages != 0U) {
-            uint64_t map_lo = g_inodes[i].map_offset;
-            uint64_t map_hi = map_lo +
-                (uint64_t)g_inodes[i].pages * 4096ULL;
-
-            if (new_size < cur) {
-                uint64_t lo = (new_size > map_lo) ? new_size : map_lo;
-                uint64_t hi = (cur < map_hi) ? cur : map_hi;
-
-                if (hi > lo) {
-                    uint32_t glo = g_inodes[i].gva_base +
-                        (uint32_t)(lo - map_lo);
-                    uint32_t ghi = g_inodes[i].gva_base +
-                        (uint32_t)(hi - map_lo);
-
-                    glo &= ~(uint32_t)4095U;
-                    ghi = (ghi + 4095U) & ~(uint32_t)4095U;
-                    if (ghi > glo) {
-                        vm32_tlb_invalidate_range(glo, ghi);
-                    }
-                }
-            } else {
-                uint64_t lo = (cur > map_lo) ? cur : map_lo;
-                uint64_t hi = (new_size < map_hi) ? new_size : map_hi;
-
-                if (hi > lo) {
-                    (void)memset((char *)base +
-                        (uintptr_t)g_inodes[i].gva_base +
-                        (uintptr_t)(lo - map_lo), 0, (size_t)(hi - lo));
-                }
-            }
-        }
-        atomic_store_explicit(&g_inodes[i].file_size, new_size,
-            memory_order_seq_cst);
-        atomic_fetch_add_explicit(&g_inodes[i].resize_seq, 1U,
-            memory_order_seq_cst);
-        atomic_fetch_add_explicit(&g_inodes[i].code_generation, 1U,
-            memory_order_seq_cst);
+        file_apply_truncate(i, new_size);
     }
     inode_unlock();
     return 0;
