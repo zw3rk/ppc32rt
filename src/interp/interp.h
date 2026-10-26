@@ -195,37 +195,64 @@ static inline void store_bump(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len)
 
 static inline void fault(ppc32_ctx_t *ctx, uint32_t ea);
 
-/* RC-U3-r4: every guest access goes through the Soft-TLB miss path so
+/* RC-U3-r4/r5: every guest access goes through the Soft-TLB miss path so
  * EOF_TRAP pages trap and clean COW pages promote on first write, even
  * on A1 where the fast path is a direct [x20, wAddr, uxtw] access.
- * Returns NULL after recording the fault (SIGBUS for beyond-EOF pages,
- * SIGSEGV otherwise); callers must not touch guest memory then. */
+ * Multi-byte accesses that cross a 4 KiB boundary validate and promote
+ * the second page too (faulting at the second page's address, SIGBUS
+ * when it is beyond EOF). Returns NULL after recording the fault;
+ * callers must not touch guest memory then. */
 static inline void *ppc32_access_checked(ppc32_ctx_t *ctx, uint32_t ea,
-    bool is_store)
+    uint32_t width, bool is_store)
 {
     void *hva = NULL;
+    uint32_t last;
 
-    if (vm32_tlb_miss(ctx, ea, is_store, &hva) == 0 && hva != NULL) {
-        if (is_store) {
-            vm_file_promote_cow(ea & ~(uint32_t)4095U);
-        }
-        return hva;
-    }
-    if (vm32_page_is_eof_trap(ea)) {
-        ctx->fault_addr = ea;
-        ctx->fault_signo = (uint32_t)PPC32_SIGBUS;
-        ctx->exit_reason = PPC32_EXIT_FAULT;
-        res_invalidate(ctx);
-    } else {
+    if (width < 1U || width > 4U) {
         fault(ctx, ea);
+        return NULL;
     }
-    return NULL;
+    if (vm32_tlb_miss(ctx, ea, is_store, &hva) != 0 || hva == NULL) {
+        if (vm32_page_is_eof_trap(ea)) {
+            ctx->fault_addr = ea;
+            ctx->fault_signo = (uint32_t)PPC32_SIGBUS;
+            ctx->exit_reason = PPC32_EXIT_FAULT;
+            res_invalidate(ctx);
+        } else {
+            fault(ctx, ea);
+        }
+        return NULL;
+    }
+    last = ea + width - 1U;
+    if (width > 1U && ((ea ^ last) >> 12U) != 0U) {
+        void *hva_last = NULL;
+
+        if (vm32_tlb_miss(ctx, last, is_store, &hva_last) != 0 ||
+            hva_last == NULL) {
+            if (vm32_page_is_eof_trap(last)) {
+                ctx->fault_addr = last;
+                ctx->fault_signo = (uint32_t)PPC32_SIGBUS;
+                ctx->exit_reason = PPC32_EXIT_FAULT;
+                res_invalidate(ctx);
+            } else {
+                fault(ctx, last);
+            }
+            return NULL;
+        }
+        if (is_store) {
+            vm_file_promote_cow(last & ~(uint32_t)4095U);
+        }
+    }
+    if (is_store) {
+        vm_file_promote_cow(ea & ~(uint32_t)4095U);
+    }
+    return hva;
 }
 
 static inline uint8_t ld8(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint8_t v = 0;
-    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, 1U, false);
 
     if (hva == NULL) {
         return 0U;
@@ -237,7 +264,7 @@ static inline uint8_t ld8(const ppc32_ctx_t *ctx, uint32_t ea)
 static inline uint16_t ld16(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint16_t r = 0;
-    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, 2U, false);
 
     if (hva == NULL) {
         return 0U;
@@ -249,7 +276,7 @@ static inline uint16_t ld16(const ppc32_ctx_t *ctx, uint32_t ea)
 static inline uint16_t ld16r(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint16_t r = 0;
-    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, 2U, false);
 
     if (hva == NULL) {
         return 0U;
@@ -261,7 +288,7 @@ static inline uint16_t ld16r(const ppc32_ctx_t *ctx, uint32_t ea)
 static inline uint32_t ld32(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint32_t r = 0;
-    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, 4U, false);
 
     if (hva == NULL) {
         return 0U;
@@ -273,7 +300,7 @@ static inline uint32_t ld32(const ppc32_ctx_t *ctx, uint32_t ea)
 static inline uint32_t ld32r(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint32_t r = 0;
-    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, 4U, false);
 
     if (hva == NULL) {
         return 0U;
@@ -284,7 +311,7 @@ static inline uint32_t ld32r(const ppc32_ctx_t *ctx, uint32_t ea)
 
 static inline void st8(ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
 {
-    void *hva = ppc32_access_checked(ctx, ea, true);
+    void *hva = ppc32_access_checked(ctx, ea, 1U, true);
 
     if (hva == NULL) {
         return;
@@ -296,7 +323,7 @@ static inline void st8(ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
 static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 {
     uint16_t r = ppc32_be16(v);
-    void *hva = ppc32_access_checked(ctx, ea, true);
+    void *hva = ppc32_access_checked(ctx, ea, 2U, true);
 
     if (hva == NULL) {
         return;
@@ -307,7 +334,7 @@ static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 
 static inline void st16r(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 {
-    void *hva = ppc32_access_checked(ctx, ea, true);
+    void *hva = ppc32_access_checked(ctx, ea, 2U, true);
 
     if (hva == NULL) {
         return;
@@ -319,7 +346,7 @@ static inline void st16r(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 {
     uint32_t r = ppc32_be32(v);
-    void *hva = ppc32_access_checked(ctx, ea, true);
+    void *hva = ppc32_access_checked(ctx, ea, 4U, true);
 
     if (hva == NULL) {
         return;
@@ -330,7 +357,7 @@ static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 
 static inline void st32r(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 {
-    void *hva = ppc32_access_checked(ctx, ea, true);
+    void *hva = ppc32_access_checked(ctx, ea, 4U, true);
 
     if (hva == NULL) {
         return;
