@@ -193,77 +193,149 @@ static inline void store_bump(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len)
 /* Guest memory (big-endian; unaligned byte/half/word access is OK)   */
 /* ------------------------------------------------------------------ */
 
+static inline void fault(ppc32_ctx_t *ctx, uint32_t ea);
+
+/* RC-U3-r4: every guest access goes through the Soft-TLB miss path so
+ * EOF_TRAP pages trap and clean COW pages promote on first write, even
+ * on A1 where the fast path is a direct [x20, wAddr, uxtw] access.
+ * Returns NULL after recording the fault (SIGBUS for beyond-EOF pages,
+ * SIGSEGV otherwise); callers must not touch guest memory then. */
+static inline void *ppc32_access_checked(ppc32_ctx_t *ctx, uint32_t ea,
+    bool is_store)
+{
+    void *hva = NULL;
+
+    if (vm32_tlb_miss(ctx, ea, is_store, &hva) == 0 && hva != NULL) {
+        if (is_store) {
+            vm_file_promote_cow(ea & ~(uint32_t)4095U);
+        }
+        return hva;
+    }
+    if (vm32_page_is_eof_trap(ea)) {
+        ctx->fault_addr = ea;
+        ctx->fault_signo = (uint32_t)PPC32_SIGBUS;
+        ctx->exit_reason = PPC32_EXIT_FAULT;
+        res_invalidate(ctx);
+    } else {
+        fault(ctx, ea);
+    }
+    return NULL;
+}
+
 static inline uint8_t ld8(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint8_t v = 0;
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
 
-    memcpy(&v, ppc32_guest_ptr(ctx, ea), 1);
+    if (hva == NULL) {
+        return 0U;
+    }
+    memcpy(&v, hva, 1);
     return v;
 }
 
 static inline uint16_t ld16(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint16_t r = 0;
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
 
-    memcpy(&r, ppc32_guest_ptr(ctx, ea), sizeof(r));
+    if (hva == NULL) {
+        return 0U;
+    }
+    memcpy(&r, hva, sizeof(r));
     return ppc32_be16(r);
 }
 
 static inline uint16_t ld16r(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint16_t r = 0;
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
 
-    memcpy(&r, ppc32_guest_ptr(ctx, ea), sizeof(r));
+    if (hva == NULL) {
+        return 0U;
+    }
+    memcpy(&r, hva, sizeof(r));
     return r;
 }
 
 static inline uint32_t ld32(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint32_t r = 0;
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
 
-    memcpy(&r, ppc32_guest_ptr(ctx, ea), sizeof(r));
+    if (hva == NULL) {
+        return 0U;
+    }
+    memcpy(&r, hva, sizeof(r));
     return ppc32_be32(r);
 }
 
 static inline uint32_t ld32r(const ppc32_ctx_t *ctx, uint32_t ea)
 {
     uint32_t r = 0;
+    const void *hva = ppc32_access_checked((ppc32_ctx_t *)ctx, ea, false);
 
-    memcpy(&r, ppc32_guest_ptr(ctx, ea), sizeof(r));
+    if (hva == NULL) {
+        return 0U;
+    }
+    memcpy(&r, hva, sizeof(r));
     return r;
 }
 
 static inline void st8(ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
 {
-    memcpy(ppc32_guest_ptr(ctx, ea), &v, 1);
+    void *hva = ppc32_access_checked(ctx, ea, true);
+
+    if (hva == NULL) {
+        return;
+    }
+    memcpy(hva, &v, 1);
     store_bump(ctx, ea, 1U);
 }
 
 static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 {
     uint16_t r = ppc32_be16(v);
+    void *hva = ppc32_access_checked(ctx, ea, true);
 
-    memcpy(ppc32_guest_ptr(ctx, ea), &r, sizeof(r));
+    if (hva == NULL) {
+        return;
+    }
+    memcpy(hva, &r, sizeof(r));
     store_bump(ctx, ea, 2U);
 }
 
 static inline void st16r(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 {
-    memcpy(ppc32_guest_ptr(ctx, ea), &v, sizeof(v));
+    void *hva = ppc32_access_checked(ctx, ea, true);
+
+    if (hva == NULL) {
+        return;
+    }
+    memcpy(hva, &v, sizeof(v));
     store_bump(ctx, ea, 2U);
 }
 
 static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 {
     uint32_t r = ppc32_be32(v);
+    void *hva = ppc32_access_checked(ctx, ea, true);
 
-    memcpy(ppc32_guest_ptr(ctx, ea), &r, sizeof(r));
+    if (hva == NULL) {
+        return;
+    }
+    memcpy(hva, &r, sizeof(r));
     store_bump(ctx, ea, 4U);
 }
 
 static inline void st32r(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 {
-    memcpy(ppc32_guest_ptr(ctx, ea), &v, sizeof(v));
+    void *hva = ppc32_access_checked(ctx, ea, true);
+
+    if (hva == NULL) {
+        return;
+    }
+    memcpy(hva, &v, sizeof(v));
     store_bump(ctx, ea, 4U);
 }
 

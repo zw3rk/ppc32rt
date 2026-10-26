@@ -22,6 +22,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "os/hostfault.h"
+#include "vm/vm32.h"
 
 #include <setjmp.h>
 #include <signal.h>
@@ -124,6 +125,12 @@ int ppc32_hostfault_run(ppc32_ctx_t *ctx, ppc32_hostfault_fn_t run)
             (uint32_t)((uintptr_t)hf_addr - (uintptr_t)guest_base);
         rc->fault_signo = (uint32_t)((signo == HF_SIGBUS) ?
             PPC32_SIGBUS : PPC32_SIGSEGV);
+        /* RC-U3-r4: a truncated-file page traps as SIGBUS even when the
+         * host delivered SIGSEGV (PROT_NONE tail), matching Linux
+         * beyond-EOF semantics for both interp and DBT faults. */
+        if (vm32_page_is_eof_trap(rc->fault_addr)) {
+            rc->fault_signo = (uint32_t)PPC32_SIGBUS;
+        }
         rc->exit_reason = PPC32_EXIT_FAULT;
         rc->res_valid = 0;
         rc->reservation_epoch++;

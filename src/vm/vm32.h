@@ -156,6 +156,7 @@ void vm32_record_unmap(uint32_t start_gva, uint32_t end_gva);
  * COW_DIRTY) and re-enable its write tag; no-ops on other states. */
 void vm32_note_cow_dirty(uint32_t gva_page);
 void vm32_mark_eof_trap(uint32_t start_gva, uint32_t end_gva);
+bool vm32_page_is_eof_trap(uint32_t gva);
 
 /* Recompute and apply the union prot of every host page intersecting
  * [start_gva, end_gva): PROT_NONE where no sub-page is mapped, else

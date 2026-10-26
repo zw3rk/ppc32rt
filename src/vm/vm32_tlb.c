@@ -406,6 +406,24 @@ void vm32_mark_eof_trap(uint32_t start_gva, uint32_t end_gva)
         tlb_refresh_slot_locked(vpn, base);
     }
     tlb_unlock();
+    /* Narrow fully-covered host pages to PROT_NONE so direct (A1) and
+     * faulting accesses trap instead of reading stale bytes. Mirrors
+     * the unmap path; on H == 4096 the sync is a no-op. */
+    (void)vm32_sync_host_range(start_gva, end_gva);
+}
+
+bool vm32_page_is_eof_trap(uint32_t gva)
+{
+    uint32_t vpn = gva >> 12U;
+    bool trapped;
+
+    if (vpn >= VM32_PAGE_COUNT) {
+        return false;
+    }
+    tlb_lock();
+    trapped = (g_page_state[vpn] == (uint8_t)VM32_PAGE_EOF_TRAP);
+    tlb_unlock();
+    return trapped;
 }
 
 void vm32_record_unmap(uint32_t start_gva, uint32_t end_gva)
