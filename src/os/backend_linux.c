@@ -18,7 +18,7 @@
  * Curated C11, no x18.
  */
 
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "os/backend.h"
 
