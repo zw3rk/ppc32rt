@@ -36,8 +36,18 @@ endif
 # src/main.c plus every engine/substrate file present; later lanes' globs
 # pick up src/interp, src/os, src/dbt automatically (plus src/vm and
 # src/dbt/aot when those Wave U3 lanes land; empty wildcards are no-ops).
+# Wave U3: exactly one host backend joins the build (both define the same
+# rt_host_* symbols). Selected from the compiler target triple so
+# cross-builds get backend_linux even when the build host is Darwin.
+U3_PROBE_CC := $(or $(CC),cc)
+ifeq ($(findstring darwin,$(shell $(U3_PROBE_CC) -dumpmachine 2>/dev/null)),darwin)
+U3_BACKEND_SRC := src/os/backend_darwin.c
+else
+U3_BACKEND_SRC := src/os/backend_linux.c
+endif
+U3_OS_SRCS := $(filter-out src/os/backend_linux.c src/os/backend_darwin.c,$(wildcard src/os/*.c)) $(U3_BACKEND_SRC)
 SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
-        $(wildcard src/os/*.c) $(wildcard src/dbt/*.c) \
+        $(U3_OS_SRCS) $(wildcard src/dbt/*.c) \
         $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)
 ASMS := $(wildcard src/dbt/*.S)
 HDRS := src/ppc32rt.h include/a32host.h src/os/syscall_nr.h \
