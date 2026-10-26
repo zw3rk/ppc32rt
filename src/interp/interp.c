@@ -25,6 +25,7 @@
  * and report PPC32_EXIT_FAULT otherwise (fault_addr = EA).
  */
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -33,6 +34,13 @@
 #include "ppc32rt.h"
 #include "interp/interp.h"
 #include "interp/fp.h"
+
+/* lwarx/stwcx. line table (Wave U3 §4.4): 1024 64-byte lines, each with
+ * a SEQ_CST epoch plus the owner/address/value snapshot taken at LWARX.
+ * Shared contract in vm/vm32.h; this static copy links until src/vm/
+ * joins SRCS (same pattern as ppc32_dbt_invalidate_range). */
+typedef struct { uint64_t epoch; uint64_t snap; const ppc32_ctx_t *owner; uint32_t addr; uint32_t val; } ppc32_ll_line_t;
+static ppc32_ll_line_t g_ll_table[1024];
 
 /* Internal helpers (guest memory, branches, traps) live in
  * interp.h as static inline so both engines share one copy. */
@@ -771,43 +779,29 @@ void interp_step(ppc32_ctx_t *ctx)
         ctx->nip += 4U;
         break;
     }
-    /* ---- reservation ops (E06) ---------------------------------- */
+    /* ---- reservation ops (E06): SEQ_CST LL/SC over g_ll_table ---- */
     case PPC32_OP_LWARX: {
-        uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) +
-            ctx->gpr[insn.rb];
-        uint32_t al = ea & ~3U;
-
-        if ((ea & 3U) != 0U) {
-            fault(ctx, ea);
-            break;
-        }
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
-        ctx->gpr[insn.rt] = ld32(ctx, ea);
-        ctx->res_addr = al;
-        ctx->res_val = ctx->gpr[insn.rt];
-        ctx->res_valid = 1;
-        ctx->nip += 4U;
-        break;
+        uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) + ctx->gpr[insn.rb];
+        uint32_t al = ea & ~3U, h = (al >> 6U) & 1023U;
+        uint32_t *hva;
+        if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+        hva = (uint32_t *)ppc32_guest_ptr(ctx, al);
+        ctx->gpr[insn.rt] = ppc32_be32(__atomic_load_n(hva, __ATOMIC_SEQ_CST));
+        ctx->res_addr = al; ctx->res_val = ctx->gpr[insn.rt]; ctx->res_valid = 1;
+        g_ll_table[h].owner = ctx; g_ll_table[h].addr = al; g_ll_table[h].val = ctx->res_val;
+        g_ll_table[h].snap = __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST);
+        ctx->nip += 4U; break;
     }
     case PPC32_OP_STWCX: {
-        uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) +
-            ctx->gpr[insn.rb];
-        bool ok = ctx->res_valid != 0U &&
-            ctx->res_addr == (ea & ~3U);
-
-        if ((ea & 3U) != 0U) {
-            fault(ctx, ea);
-            break;
-        }
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
-        if (ok) {
-            st32(ctx, ea, ctx->gpr[insn.rs]);
-        }
-        ctx->res_valid = 0;
-        ctx->reservation_epoch++;
-        set_crf(ctx, 0U, false, false, ok);
-        ctx->nip += 4U;
-        break;
+        uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) + ctx->gpr[insn.rb];
+        uint32_t al = ea & ~3U, h = (al >> 6U) & 1023U;
+        uint32_t *hva; bool ok;
+        if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+        hva = (uint32_t *)ppc32_guest_ptr(ctx, al);
+        ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx && g_ll_table[h].addr == al && g_ll_table[h].val == ctx->res_val && __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST) == g_ll_table[h].snap && ppc32_be32(__atomic_load_n(hva, __ATOMIC_SEQ_CST)) == ctx->res_val;
+        if (ok) { __atomic_store_n(hva, ppc32_be32(ctx->gpr[insn.rs]), __ATOMIC_SEQ_CST); __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST); }
+        ctx->res_valid = 0; g_ll_table[h].owner = NULL; ctx->reservation_epoch++;
+        set_crf(ctx, 0U, false, false, ok); ctx->nip += 4U; break;
     }
     /* ---- traps -------------------------------------------------- */
     case PPC32_OP_TWI:
