@@ -74,8 +74,12 @@ test: ## Run the test suite (none yet; fixtures arrive in Phase 1)
 # macOS hides MAP_ANON (no MAP_ANONYMOUS) once _POSIX_C_SOURCE is
 # defined, which would break the host syntax check below; the Linux/musl
 # cross shell is unaffected either way. CFLAGS keeps the macro for builds.
+ifeq ($(CROSS_CC),)
 ifeq ($(shell uname -s),Darwin)
   CHECK_STD := -std=c11
+else
+  CHECK_STD := -std=c11 -D_POSIX_C_SOURCE=200809L
+endif
 else
   CHECK_STD := -std=c11 -D_POSIX_C_SOURCE=200809L
 endif
@@ -102,10 +106,12 @@ check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
 	fi; \
 	echo "line limits OK (all src .c/.h/.S <= 900 lines)"
 
+HOST_CC ?= cc
+
 check-abi-invariants: ## Build and run tests/check_abi_invariants (lands with lane L0b)
 	@if [ -f tests/check_abi_invariants.c ]; then \
 		mkdir -p $(BUILD_DIR) && \
-		$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Werror=vla -pedantic \
+		$(HOST_CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Werror=vla -pedantic \
 			-Wall -Wextra -Werror -Iinclude -Isrc \
 			tests/check_abi_invariants.c -o $(BUILD_DIR)/check_abi_invariants && \
 		./$(BUILD_DIR)/check_abi_invariants; \

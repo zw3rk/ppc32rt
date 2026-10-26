@@ -111,9 +111,12 @@ _Static_assert(sizeof(struct statx) == DYN_STATX_SIZE,
 static long dyn_put_statx(ppc32_ctx_t *ctx, uint32_t va,
     const struct statx *hs)
 {
+    uint64_t mnt_id;
+
     if (!ppc32_range_ok(va, DYN_STATX_SIZE)) {
         return -EFAULT;
     }
+    memcpy(&mnt_id, (const unsigned char *)hs + 144U, sizeof mnt_id);
     ppc32_st32be(ctx, va + 0U, hs->stx_mask);
     ppc32_st32be(ctx, va + 4U, hs->stx_blksize);
     ppc32_st64be(ctx, va + 8U, hs->stx_attributes);
@@ -137,7 +140,7 @@ static long dyn_put_statx(ppc32_ctx_t *ctx, uint32_t va,
     ppc32_st32be(ctx, va + 132U, hs->stx_rdev_minor);
     ppc32_st32be(ctx, va + 136U, hs->stx_dev_major);
     ppc32_st32be(ctx, va + 140U, hs->stx_dev_minor);
-    ppc32_st64be(ctx, va + 144U, hs->stx_mnt_id);
+    ppc32_st64be(ctx, va + 144U, mnt_id);
     return 0;
 }
 
