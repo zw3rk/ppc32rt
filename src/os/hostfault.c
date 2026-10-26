@@ -30,6 +30,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "os/signals.h"
+
+/* Host signal numbers as seen in si_signo (Linux/aarch64: BUS 10, SEGV 11)
+ * are preserved onto ctx->fault_signo as the GUEST number (SIGBUS 7 /
+ * SIGSEGV 11) so deliver_sync raises the right synchronous signal. */
 #define HF_SIGSEGV 11
 #define HF_SIGBUS 10
 #define HF_WINDOW_SIZE 0x100000000ULL
@@ -117,6 +122,8 @@ int ppc32_hostfault_run(ppc32_ctx_t *ctx, ppc32_hostfault_fn_t run)
         guest_base = rc->guest_base;
         rc->fault_addr =
             (uint32_t)((uintptr_t)hf_addr - (uintptr_t)guest_base);
+        rc->fault_signo = (uint32_t)((signo == HF_SIGBUS) ?
+            PPC32_SIGBUS : PPC32_SIGSEGV);
         rc->exit_reason = PPC32_EXIT_FAULT;
         rc->res_valid = 0;
         rc->reservation_epoch++;

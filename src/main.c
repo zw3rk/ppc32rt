@@ -434,8 +434,12 @@ static int deliver_sync(ppc32_ctx_t *ctx)
         r = ppc32_sig_deliver_sync(ctx, (int)PPC32_SIGTRAP, 0, ctx->nip,
             0U);
     } else {
-        r = ppc32_sig_deliver_sync(ctx, (int)PPC32_SIGSEGV, 0,
-            ctx->fault_addr, 0U);
+        /* FAULT carries the preserved class: host SIGBUS (truncated file
+         * page) delivers guest SIGBUS, everything else SIGSEGV. */
+        uint32_t sig = (ctx->fault_signo == (uint32_t)PPC32_SIGBUS) ?
+            (uint32_t)PPC32_SIGBUS : (uint32_t)PPC32_SIGSEGV;
+
+        r = ppc32_sig_deliver_sync(ctx, (int)sig, 0, ctx->fault_addr, 0U);
     }
     if (r != 0L && r != 1L) {
         return 0;

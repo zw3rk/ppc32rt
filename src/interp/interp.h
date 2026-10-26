@@ -27,6 +27,8 @@
 
 #include "ppc32rt.h"
 #include "interp/decode.h"
+#include "os/signals.h"
+#include "vm/vm32.h"
 
 /* Bounded block length for interp_run (SPEC section 3: DBT translates up
  * to 64 guest instructions per block; the interpreter chunk matches it so
@@ -164,6 +166,15 @@ static inline void res_invalidate(ppc32_ctx_t *ctx)
     ctx->reservation_epoch++;
 }
 
+/* Ordinary guest stores invalidate LL/SC reservations (E06): bump the
+ * shared 64-byte line epoch so a peer stwcx. fails, plus the thread
+ * epoch for the DBT-side fast check. Loads never bump. */
+static inline void store_bump(ppc32_ctx_t *ctx, uint32_t ea)
+{
+    vm32_reservation_bump(ea & ~3U);
+    ctx->reservation_epoch++;
+}
+
 /* ------------------------------------------------------------------ */
 /* Guest memory (big-endian; unaligned byte/half/word access is OK)   */
 /* ------------------------------------------------------------------ */
@@ -208,33 +219,38 @@ static inline uint32_t ld32r(const ppc32_ctx_t *ctx, uint32_t ea)
     return r;
 }
 
-static inline void st8(const ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
+static inline void st8(ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
 {
     memcpy(ppc32_guest_ptr(ctx, ea), &v, 1);
+    store_bump(ctx, ea);
 }
 
-static inline void st16(const ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
+static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 {
     uint16_t r = ppc32_be16(v);
 
     memcpy(ppc32_guest_ptr(ctx, ea), &r, sizeof(r));
+    store_bump(ctx, ea);
 }
 
-static inline void st16r(const ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
+static inline void st16r(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
 {
     memcpy(ppc32_guest_ptr(ctx, ea), &v, sizeof(v));
+    store_bump(ctx, ea);
 }
 
-static inline void st32(const ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
+static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 {
     uint32_t r = ppc32_be32(v);
 
     memcpy(ppc32_guest_ptr(ctx, ea), &r, sizeof(r));
+    store_bump(ctx, ea);
 }
 
-static inline void st32r(const ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
+static inline void st32r(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
 {
     memcpy(ppc32_guest_ptr(ctx, ea), &v, sizeof(v));
+    store_bump(ctx, ea);
 }
 
 static inline uint32_t fetch_raw(const ppc32_ctx_t *ctx)
@@ -311,10 +327,13 @@ static inline bool trap_cond(uint32_t to, uint32_t a, uint32_t b, bool is64,
     return false;
 }
 
-/* Fault helper: records fault_addr, clears the reservation, stops. */
+/* Fault helper: records fault_addr, clears the reservation, stops.
+ * Software faults (low guard, misalignment) are SEGV-class; the
+ * host-fault guard overwrites fault_signo with SEGV/BUS from si_signo. */
 static inline void fault(ppc32_ctx_t *ctx, uint32_t ea)
 {
     ctx->fault_addr = ea;
+    ctx->fault_signo = (uint32_t)PPC32_SIGSEGV;
     ctx->exit_reason = PPC32_EXIT_FAULT;
     res_invalidate(ctx);
 }

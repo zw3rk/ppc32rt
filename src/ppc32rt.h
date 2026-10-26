@@ -228,6 +228,12 @@ typedef struct ppc32_ctx {
      */
     bool vm_ready;
 
+    /* Guest signal number for the last FAULT exit: PPC32_SIGSEGV (software
+     * faults, host SIGSEGV) or PPC32_SIGBUS (host SIGBUS, e.g. truncated
+     * file page). Set by interp fault() and the host-fault guard; read by
+     * deliver_sync. Zero (no fault recorded) delivers as SIGSEGV. */
+    uint32_t fault_signo;
+
 } ppc32_ctx_t;
 
 /* ABI-locked offsets (future trampoline, Phase 3+, must agree). */

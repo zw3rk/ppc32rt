@@ -28,7 +28,11 @@
 
 /* No _POSIX_C_SOURCE here: macOS hides MAP_ANONYMOUS, RTLD_DEFAULT,
  * F_FULLFSYNC and madvise under strict POSIX; the default namespace
- * declares them all. */
+ * declares them all. The frozen build CFLAGS define the macro for every
+ * TU, so drop it for this TU before any system header sees it. */
+#ifdef _POSIX_C_SOURCE
+#undef _POSIX_C_SOURCE
+#endif
 #include "os/backend.h"
 
 #include <errno.h>

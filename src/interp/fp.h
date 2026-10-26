@@ -80,7 +80,7 @@ static inline uint64_t fp_ld64(const ppc32_ctx_t *ctx, uint32_t ea)
     return ((uint64_t)ld32(ctx, ea) << 32) | ld32(ctx, ea + 4u);
 }
 
-static inline void fp_st64(const ppc32_ctx_t *ctx, uint32_t ea, uint64_t v)
+static inline void fp_st64(ppc32_ctx_t *ctx, uint32_t ea, uint64_t v)
 {
     st32(ctx, ea, (uint32_t)(v >> 32));
     st32(ctx, ea + 4u, (uint32_t)v);

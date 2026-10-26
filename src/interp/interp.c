@@ -4,25 +4,15 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements SPEC section 2.2 Book I integer ISA (classic 32-bit
- * semantics; FPU/SPE arrive in Phase 3): arithmetic/logical with XER.CA
- * and XER.OV/SO plus CR0 update on Rc=1, rotate/mask (incl. MB>ME wrap
- * per E02), shifts (sraw/srawi CA per the dropped-bit rule, E02), CR
- * logical ops, mfcr/mtcrf/mfspr/mtspr, branches (BO/BI/LK), sc, string/
- * multiple/byte-reverse loads and stores, load/store with update, and
- * lwarx/stwcx. with the SPEC section 2.1 reservation slot (E06).
- *
- * Field extraction not covered by ppc32_insn_t is decoded here from
- * insn->raw with the standard Book I layouts: SH/MB/ME (M-form),
- * TO (trap D/X-forms), NB (lswi/stswi), SPR (mfspr/mtspr), CRM
- * (mtcrf), crD/crS/BA/BB (CR ops, mcrf), BF/L (cmp/cmpl).
- *
- * XER bit positions (E02): SO=0x80000000, OV=0x40000000, CA=0x20000000.
- * CR field i occupies bits (28-4i)..(31-4i); CR0.SO=0x10000000 (E01).
- * Guest memory is big-endian: every multi-byte guest access byte-swaps
- * (ppc32_be16/32 helpers). Unaligned byte/half/word accesses are legal
- * and go through memcpy; lmw/stmw/lwarx/stwcx. require word-aligned EA
- * and report PPC32_EXIT_FAULT otherwise (fault_addr = EA).
+ * Implements SPEC 2.2 Book I integer ISA (classic 32-bit; FPU/SPE in
+ * Phase 3): ALU with XER.CA/OV/SO and CR0 on Rc=1, rotate/mask (MB>ME
+ * wrap, sraw CA dropped-bit rule, E02), CR ops, mfspr/mtspr, branches,
+ * sc, string/multiple/byte-reverse and update-form loads/stores, and
+ * lwarx/stwcx. (SPEC 2.1 slot, E06). Raw-field layouts: SH/MB/ME, TO,
+ * NB, SPR, CRM, crD/crS/BA/BB, BF/L. XER: SO/OV/CA = 0x80000000/
+ * 0x40000000/0x20000000; CR0.SO = 0x10000000 (E01). Guest memory is
+ * big-endian (ppc32_be16/32); unaligned accesses go through memcpy,
+ * lmw/stmw/lwarx/stwcx. need word-aligned EA (else FAULT with EA).
  */
 
 #include <stdatomic.h>
@@ -34,20 +24,44 @@
 #include "ppc32rt.h"
 #include "interp/interp.h"
 #include "interp/fp.h"
+#include "vm/vm32.h"
 
-/* lwarx/stwcx. line table (Wave U3 §4.4): 1024 64-byte lines, each with
- * a SEQ_CST epoch plus the owner/address/value snapshot taken at LWARX.
- * Shared contract in vm/vm32.h; this static copy links until src/vm/
- * joins SRCS (same pattern as ppc32_dbt_invalidate_range). */
+/* lwarx/stwcx. lines (Wave U3 §4.4): SEQ_CST epoch + owner/addr/val snapshot (vm/vm32.h). */
 typedef struct { uint64_t epoch; uint64_t snap; const ppc32_ctx_t *owner; uint32_t addr; uint32_t val; } ppc32_ll_line_t;
 static ppc32_ll_line_t g_ll_table[1024];
 
-/* Internal helpers (guest memory, branches, traps) live in
- * interp.h as static inline so both engines share one copy. */
+/* STWCX. as one SEQ_CST compare-exchange (vm/vm32.h): gate checks plus a
+ * single atomic store; the reservation is consumed either way. */
+bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
+{
+    uint32_t al = gva_aligned & ~3U;
+    uint32_t h = (al >> 6U) & 1023U;
+    uint32_t *hva = (uint32_t *)ppc32_guest_ptr(ctx, al);
+    uint32_t exp = ppc32_be32(ctx->res_val);
+    uint32_t des = ppc32_be32(val);
+    bool ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx &&
+        g_ll_table[h].addr == al && g_ll_table[h].val == ctx->res_val &&
+        __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST) == g_ll_table[h].snap &&
+        __atomic_compare_exchange_n(hva, &exp, des, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 
-/* ------------------------------------------------------------------ */
-/* interp_step                                                        */
-/* ------------------------------------------------------------------ */
+    if (ok) {
+        __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST);
+    }
+    ctx->res_valid = 0;
+    g_ll_table[h].owner = NULL;
+    ctx->reservation_epoch++;
+    return ok;
+}
+
+/* Store hook: bump the line epoch so a peer stwcx. on the line fails. */
+void vm32_reservation_bump(uint32_t gva_aligned)
+{
+    __atomic_fetch_add(&g_ll_table[((gva_aligned & ~3U) >> 6U) & 1023U].epoch, 1ULL,
+        __ATOMIC_SEQ_CST);
+}
+
+/* Memory/branch/trap helpers live in interp.h for both engines. */
+/* interp_step */
 
 void interp_step(ppc32_ctx_t *ctx)
 {
@@ -794,13 +808,10 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     case PPC32_OP_STWCX: {
         uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) + ctx->gpr[insn.rb];
-        uint32_t al = ea & ~3U, h = (al >> 6U) & 1023U;
-        uint32_t *hva; bool ok;
+        uint32_t al = ea & ~3U;
+        bool ok;
         if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
-        hva = (uint32_t *)ppc32_guest_ptr(ctx, al);
-        ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx && g_ll_table[h].addr == al && g_ll_table[h].val == ctx->res_val && __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST) == g_ll_table[h].snap && ppc32_be32(__atomic_load_n(hva, __ATOMIC_SEQ_CST)) == ctx->res_val;
-        if (ok) { __atomic_store_n(hva, ppc32_be32(ctx->gpr[insn.rs]), __ATOMIC_SEQ_CST); __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST); }
-        ctx->res_valid = 0; g_ll_table[h].owner = NULL; ctx->reservation_epoch++;
+        ok = vm32_sc_attempt(ctx, al, ctx->gpr[insn.rs]);
         set_crf(ctx, 0U, false, false, ok); ctx->nip += 4U; break;
     }
     /* ---- traps -------------------------------------------------- */
@@ -825,9 +836,8 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     /* ---- syscall ------------------------------------------------ */
     case PPC32_OP_SC:
-        /* Leave nip AT the sc: ppc32_syscall_min advances past it on
-         * return (its documented contract). Advancing here too would
-         * skip the instruction after every syscall (RC1). */
+        /* Leave nip AT the sc (E01 contract); advancing here too would skip
+         * the instruction after every syscall (RC1). */
         ctx->exit_reason = PPC32_EXIT_SYSCALL;
         res_invalidate(ctx);
         break;
@@ -870,9 +880,7 @@ void interp_step(ppc32_ctx_t *ctx)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* interp_run                                                         */
-/* ------------------------------------------------------------------ */
+/* interp_run */
 
 void interp_run(ppc32_ctx_t *ctx)
 {

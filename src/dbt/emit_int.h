@@ -612,21 +612,25 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
     } else {
         ei_ea_d(b, in->ra, (uint32_t)in->d);
     }
-    /* Interp (interp_exec_dform_mem) accesses BEFORE the base update, so
-     * a store with rs == ra must capture the source first (RC2: stwu
-     * r1,-32(r1) stored EA instead of the old value). Loads keep EA in
-     * w22 across the update, so only the overlapping store needs this.
-     * RC4 low-guard placement mirrors the interpreter per form: D-forms
-     * guard before the update (interp accesses first), X-forms guard
-     * after it (interp_exec_xform_mem updates first). */
+    /* Access/update ordering mirrors the interpreter per form: D-forms
+     * (interp_exec_dform_mem) access BEFORE the base update, X-forms
+     * (interp_exec_xform_mem) update first. A faulting D-form access must
+     * therefore leave ra untouched (and a D-form load with rt == ra must
+     * resolve to EA, as the interpreter does), so D-form writeback comes
+     * after the access. A store with rs == ra still captures the source
+     * first (RC2: stwu r1,-32(r1) stored EA instead of the old value).
+     * RC4 low-guard placement matches: D-forms guard before the update,
+     * X-forms guard after it. */
     bool overlap = !load && ei_is_update(in->op) && in->rs == in->ra;
+    bool wb_first = ei_is_update(in->op) && is_x;
+    bool wb_last = ei_is_update(in->op) && !is_x;
     if (overlap) {
         ei_ld(b, EI_B, in->rs);
     }
     if (!is_x) {
         ei_guard_low(b, pc);
     }
-    if (ei_is_update(in->op)) {
+    if (wb_first) {
         a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
     }
     if (is_x) {
@@ -650,6 +654,9 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
             a64_emit_guest_ldrb_w(b, EI_B, A64_ADDR);
         }
         ei_st(b, EI_B, in->rt);
+        if (wb_last) {
+            a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
+        }
         return PPC32_EMIT_NEXT;
     }
     if (!overlap) {
@@ -667,6 +674,9 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
         a64_emit_guest_strh_w(b, EI_B, A64_ADDR);
     } else {
         a64_emit_guest_strb_w(b, EI_B, A64_ADDR);
+    }
+    if (wb_last) {
+        a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
     }
     return PPC32_EMIT_NEXT;
 }
