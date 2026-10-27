@@ -216,6 +216,9 @@ static int parse_args(ppc32_ctx_t *ctx, int argc, char **argv)
             i++;
             continue;
         }
+        if (argv[i][0] != '-') {
+            return i;
+        }
         if (i + 1 >= argc) {
             return -1;
         }
@@ -362,7 +365,7 @@ int main(int argc, char **argv)
 
     /* RC2: interp + dbt engines live; --difftest runs dbt-vs-interp. */
     if (getenv("PPC32RT_ENGINE") == NULL && ctx.engine < 0) {
-        ctx.engine = PPC32_ENGINE_INTERP; /* default oracle */
+        ctx.engine = PPC32_ENGINE_DBT;
     }
     if (ctx.difftest) {
         return run_difftest(&ctx);

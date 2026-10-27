@@ -27,7 +27,7 @@
 #define FP_XX 0x02000000U
 #define FP_VXSNAN 0x01000000U
 #define FP_VXCVI 0x00000100U
-#define FP_FPRF_MASK 0x0001F000U
+#define FP_FPRF_MASK 0x0003F000U
 
 /* Classic X-form 10-bit XOs (63). */
 #define FP_XO_FCMPU 0U
@@ -60,28 +60,27 @@
     a64_emit(b, 0xF9000000U | (((off) / 8U) << 10) | \
         ((unsigned)(tb) << 5) | (unsigned)(ts))
 
-/* fpr[] pattern traffic (no REV). S = low word; zero_hi clears upper. */
+/* fpr[] holds IEEE-754 double patterns; S ops convert D<->S at access. */
 static void fp_ld(a64_buf_t *b, unsigned vd, unsigned fr, bool dbl)
 {
-    uint32_t sc = dbl ? 8U : 4U;
-
-    a64_emit(b, (dbl ? 0xFD400000U : 0xBD400000U) |
-        ((FP_OFF(fr) / sc) << 10) | ((unsigned)A64_XCTX << 5) |
-        (vd & 31U));
+    a64_emit(b, 0xFD400000U | ((FP_OFF(fr) / 8U) << 10) |
+        ((unsigned)A64_XCTX << 5) | (vd & 31U));
+    if (!dbl) {
+        a64_emit(b, 0x1E624000U | ((vd & 31U) << 5) | (vd & 31U));
+    }
 }
 
 static void fp_st(a64_buf_t *b, unsigned fr, unsigned vs, bool dbl,
     bool zero_hi)
 {
-    uint32_t sc = dbl ? 8U : 4U;
-
-    a64_emit(b, (dbl ? 0xFD000000U : 0xBD000000U) |
-        ((FP_OFF(fr) / sc) << 10) | ((unsigned)A64_XCTX << 5) |
-        (vs & 31U));
-    if (zero_hi) {
-        a64_emit(b, 0xB9000000U | (((FP_OFF(fr) + 4U) / 4U) << 10) |
-            ((unsigned)A64_XCTX << 5) | (unsigned)A64_ZR);
+    unsigned r = vs & 31U;
+    (void)zero_hi;
+    if (!dbl) {
+        a64_emit(b, 0x1E22C000U | (r << 5) | 3U);
+        r = 3U;
     }
+    a64_emit(b, 0xFD000000U | ((FP_OFF(fr) / 8U) << 10) |
+        ((unsigned)A64_XCTX << 5) | r);
 }
 
 /* SPE scalar-single traffic: low word of the GPR pair. */
@@ -154,7 +153,7 @@ static void fp_accum(a64_buf_t *b, uint32_t ioc_sub)
     a64_emit_and_reg_w(b, false, EI_T, EI_B, EI_T2, A64_SHIFT_LSL, 0U);
     /* Per-bit masks; bit 0 (IOC) takes the caller-supplied sub-bit. */
     static const uint32_t masks[4] = { FP_ZX | FP_FX, FP_OX | FP_FX,
-        FP_UX | FP_FX, FP_XX | FP_FX };
+        FP_UX | FP_FX, FP_XX | FP_FX | 0x00020000U };
 
     skip_all = a64_emit_cbz_w_placeholder(b, false, EI_T);
     for (bit = 0U; bit < 5U; bit++) {
@@ -253,9 +252,10 @@ static int fp_tail(a64_buf_t *b, const ppc32_insn_t *insn)
 }
 
 /* Convert tail: exception accumulation, FPCR restore, shared tail. */
-static int fp_conv_end(a64_buf_t *b, const ppc32_insn_t *insn,
-    uint32_t ioc_sub)
+static int fp_conv_end(a64_buf_t *b, const ppc32_insn_t *insn, uint32_t ioc_sub)
 {
+    a64_emit_mov_imm32(b, EI_X, 0x00020000U);
+    a64_emit_bic_reg_w(b, false, EI_A, EI_A, EI_X, A64_SHIFT_LSL, 0U);
     fp_accum(b, ioc_sub);
     fp_restore_fpcr(b);
     return fp_tail(b, insn);
@@ -265,23 +265,23 @@ static int fp_conv_end(a64_buf_t *b, const ppc32_insn_t *insn,
 static void fp_ldst_mem(a64_buf_t *b, bool is_store, bool dbl, unsigned fr)
 {
     a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
-    if (!is_store) {
-        if (dbl) {
-            FP_LDR_X(15U, A64_TMP2);
-            FP_REV_X(15U);
-        } else {
-            a64_emit_ldr_imm_w(b, 15U, A64_TMP2, 0U);
-            a64_emit_rev_w(b, 15U, 15U);
-        }
+    if (!is_store && dbl) {
+        FP_LDR_X(15U, A64_TMP2);
+        FP_REV_X(15U);
         FP_STR_X_OFF(15U, A64_XCTX, FP_OFF(fr));
-        return;
-    }
-    a64_emit(b, 0xF9400000U | ((unsigned)A64_XCTX << 5) |
-        ((FP_OFF(fr) / 8U) << 10) | 15U);
-    if (dbl) {
+    } else if (!is_store) {
+        a64_emit_ldr_imm_w(b, 15U, A64_TMP2, 0U);
+        a64_emit_rev_w(b, 15U, 15U);
+        a64_emit(b, 0x1E270000U | (15U << 5) | 0U);
+        fp_st(b, fr, 0U, false, false);
+    } else if (dbl) {
+        a64_emit(b, 0xF9400000U | ((unsigned)A64_XCTX << 5) |
+            ((FP_OFF(fr) / 8U) << 10) | 15U);
         FP_REV_X(15U);
         FP_STR_X(15U, A64_TMP2);
     } else {
+        fp_ld(b, 0U, fr, false);
+        a64_emit(b, 0x1E260000U | (0U << 5) | 15U);
         a64_emit_rev_w(b, 15U, 15U);
         a64_emit_str_imm_w(b, 15U, A64_TMP2, 0U);
     }
@@ -489,7 +489,7 @@ static int fp_mffs(a64_buf_t *b, const ppc32_insn_t *insn)
         return PPC32_EMIT_FALLBACK;
     }
     fp_ld_fpscr(b, EI_A);
-    fp_st(b, insn->rt, EI_A, false, true);
+    FP_STR_X_OFF(EI_A, A64_XCTX, FP_OFF(insn->rt));
     if (insn->rc != 0U) {
         fp_cr1(b);
     }

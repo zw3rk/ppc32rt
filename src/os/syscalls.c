@@ -80,6 +80,9 @@ int vm_file_on_truncate_fd(int host_fd, uint64_t new_size);
 #ifndef PPC32_NR_CLOCK_GETTIME
 #define PPC32_NR_CLOCK_GETTIME 246U
 #endif
+#ifndef PPC32_NR_CLOCK_GETTIME64
+#define PPC32_NR_CLOCK_GETTIME64 403U
+#endif
 #ifndef PPC32_NR_OPENAT
 #define PPC32_NR_OPENAT 286U
 #endif
@@ -359,13 +362,26 @@ static long sys_fstat(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t u
     return (long)ppc32_put_stat(ctx, buf_va, &hs);
 }
 
-static long sys_clock_gettime(ppc32_ctx_t *ctx, uint32_t clk, uint32_t ts_va)
+static long sys_clock_gettime(ppc32_ctx_t *ctx, uint32_t clk, uint32_t ts_va,
+    int is64)
 {
     struct timespec ts;
+    clockid_t hclk = (clockid_t)clk;
 
-    /* CLOCK_* ids are Linux-generic: pass through. */
-    if (clock_gettime((clockid_t)clk, &ts) != 0) {
+#ifdef __APPLE__
+    hclk = (clk == 1U || clk == 4U || clk == 6U || clk == 7U) ?
+        CLOCK_MONOTONIC : CLOCK_REALTIME;
+#endif
+    if (clock_gettime(hclk, &ts) != 0) {
         return -(long)errno;
+    }
+    if (is64) {
+        if (!ppc32_range_ok(ts_va, 16U)) {
+            return -EFAULT;
+        }
+        ppc32_st64be(ctx, ts_va, (uint64_t)(int64_t)ts.tv_sec);
+        ppc32_st64be(ctx, ts_va + 8U, (uint64_t)(int64_t)ts.tv_nsec);
+        return 0L;
     }
     return (long)ppc32_put_timespec(ctx, ts_va, &ts);
 }
@@ -750,7 +766,10 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         ret = sys_gettimeofday(ctx, a0);
         break;
     case PPC32_NR_CLOCK_GETTIME:
-        ret = sys_clock_gettime(ctx, a0, a1);
+        ret = sys_clock_gettime(ctx, a0, a1, 0);
+        break;
+    case PPC32_NR_CLOCK_GETTIME64:
+        ret = sys_clock_gettime(ctx, a0, a1, 1);
         break;
     case PPC32_NR_GETRANDOM:
         ret = sys_getrandom(ctx, a0, a1, a2);

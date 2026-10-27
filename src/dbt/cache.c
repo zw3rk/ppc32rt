@@ -41,6 +41,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#endif
 #include <unistd.h>
 
 #include "dbt/dbt.h"
@@ -335,6 +339,18 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
         pagesz = 4096U;
     }
     span = ((nwords * sizeof(uint32_t)) + pagesz - 1U) & ~(pagesz - 1U);
+#ifdef __APPLE__
+    code = mmap(NULL, span, PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+    if (code == MAP_FAILED) {
+        free(e);
+        return NULL;
+    }
+    pthread_jit_write_protect_np(0);
+    memcpy(code, words, nwords * sizeof(uint32_t));
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(code, nwords * sizeof(uint32_t));
+#else
     code = mmap(NULL, span, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code == MAP_FAILED) {
@@ -351,6 +367,7 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     }
     __builtin___clear_cache((char *)code,
         (char *)code + nwords * sizeof(uint32_t));
+#endif
 
     /* Evict the collided occupant first so no live link can reach freed
      * code; sever cross-links and ctx entries by key. */

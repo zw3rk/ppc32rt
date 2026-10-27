@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build test check check-line-limits check-abi-invariants clean
+.PHONY: help all build build-darwin test check check-line-limits check-abi-invariants clean
 
 BUILD_DIR := _build
 
@@ -55,10 +55,10 @@ HDRS := src/ppc32rt.h include/a32host.h src/os/syscall_nr.h \
         $(wildcard src/os/*.h) $(wildcard src/dbt/*.h) \
         $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)
 
-OBJ_DIR    := $(BUILD_DIR)/obj
+OBJ_DIR    ?= $(BUILD_DIR)/obj
 OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS)) \
               $(patsubst src/%.S,$(OBJ_DIR)/%.o,$(ASMS))
-PPC32RT_BIN := $(BUILD_DIR)/ppc32rt
+PPC32RT_BIN ?= $(BUILD_DIR)/ppc32rt
 
 help: ## Show available build and verification targets
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
@@ -68,10 +68,18 @@ all: build ## Build everything (currently just the ppc32rt binary)
 
 build: $(PPC32RT_BIN) ## Build static-PIE aarch64-linux ppc32rt binary
 
+build-darwin: ## Build native macOS arm64 ppc32rt-darwin binary
+	$(MAKE) $(BUILD_DIR)/ppc32rt-darwin \
+		CC=cc \
+		OBJ_DIR=$(BUILD_DIR)/darwin-obj \
+		PPC32RT_BIN=$(BUILD_DIR)/ppc32rt-darwin \
+		CFLAGS="-std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32" \
+		LDFLAGS=""
+
 $(PPC32RT_BIN): $(OBJS)
 	@printf "\033[32m▸ Linking\033[0m $@\n"
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) $(LDLIBS) -o $@
-	@ln -sf ppc32rt $(BUILD_DIR)/ppc32rt-binfmt-p
+	@if [ "$@" = "$(BUILD_DIR)/ppc32rt" ]; then ln -sf ppc32rt $(BUILD_DIR)/ppc32rt-binfmt-p; fi
 
 $(OBJ_DIR)/%.o: src/%.c $(HDRS)
 	@mkdir -p $(dir $@)

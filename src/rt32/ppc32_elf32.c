@@ -410,21 +410,28 @@ static int load_elf32_image(ppc32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
 
         if (map_end > map_start) {
-            void *res = mmap(ppc32_guest_ptr(ctx, map_start), map_end - map_start,
-                             PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-            if (res == MAP_FAILED) {
-                fprintf(stderr, "ppc32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
-                        label, map_start, map_end, strerror(errno));
-                return -1;
-            }
-            /* Anonymous payload pages (RW until the final segment
-             * protect below); mirror for the A2 union layer. */
-            vm32_record_map(map_start, map_end,
-                (uint8_t)(PROT_READ | PROT_WRITE),
-                (uint8_t)VM32_PAGE_ANON);
             if (vm32_is_a2()) {
-                (void)vm32_sync_host_range(map_start, map_end);
+                vm32_record_map(map_start, map_end,
+                    (uint8_t)(PROT_READ | PROT_WRITE),
+                    (uint8_t)VM32_PAGE_ANON);
+                if (vm32_sync_host_range(map_start, map_end) != 0) {
+                    fprintf(stderr, "ppc32rt: %s: failed to sync segment [0x%x, 0x%x)\n",
+                            label, map_start, map_end);
+                    return -1;
+                }
+                memset(ppc32_guest_ptr(ctx, map_start), 0, (size_t)(map_end - map_start));
+            } else {
+                void *res = mmap(ppc32_guest_ptr(ctx, map_start), map_end - map_start,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (res == MAP_FAILED) {
+                    fprintf(stderr, "ppc32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
+                            label, map_start, map_end, strerror(errno));
+                    return -1;
+                }
+                vm32_record_map(map_start, map_end,
+                    (uint8_t)(PROT_READ | PROT_WRITE),
+                    (uint8_t)VM32_PAGE_ANON);
             }
         }
 

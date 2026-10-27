@@ -30,9 +30,14 @@
 
     .text
     .align 4
+#ifdef __APPLE__
+    .globl _ppc32_jit_run_block
+_ppc32_jit_run_block:
+#else
     .globl ppc32_jit_run_block
     .type ppc32_jit_run_block, %function
 ppc32_jit_run_block:
+#endif
     /* Frame for x19-x28 plus fp/lr: 6 pairs = 96 bytes, SP 16-aligned. */
     stp     x29, x30, [sp, #-96]!
     mov     x29, sp
@@ -73,4 +78,6 @@ ppc32_jit_run_block:
     ldp     x29, x30, [sp], #96
     ret
 
+#ifndef __APPLE__
     .size ppc32_jit_run_block, . - ppc32_jit_run_block
+#endif

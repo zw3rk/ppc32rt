@@ -256,7 +256,7 @@ void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
      * which killed the boot with NULL-call threads and "could not load
      * kernel32.dll".  Tear the window down; the next stack setup re-maps
      * the vDSO and the stack, and the new image loads fresh pages. */
-    (void)munmap((void *)(uintptr_t)PPC32_LOW_GUARD_SIZE,
+    (void)munmap((void *)(uintptr_t)(ctx->guest_base + (uint64_t)PPC32_LOW_GUARD_SIZE),
                  (size_t)(PPC32_WINDOW_SIZE - (uint64_t)PPC32_LOW_GUARD_SIZE));
     /* The old address space is gone: translations and reservations die. */
     vm32_tlb_invalidate_all();
@@ -317,24 +317,33 @@ uint32_t ppc32_vm_brk(ppc32_ctx_t *ctx, uint32_t new_brk)
         }
         uint32_t len = new_page - old_page;
         void *host_addr = ppc32_guest_ptr(ctx, old_page);
-        void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (res == MAP_FAILED) {
-            uint32_t curr = g_vm_brk_curr;
-            vm_sync_brk_to_ctx(ctx);
-            vm_lock_release();
-            return curr;
+        if (vm32_is_a2()) {
+            vm32_record_map(old_page, new_page,
+                (uint8_t)(PROT_READ | PROT_WRITE),
+                (uint8_t)VM32_PAGE_ANON);
+            if (vm32_sync_host_range(old_page, new_page) != 0) {
+                vm32_record_unmap(old_page, new_page);
+                uint32_t curr = g_vm_brk_curr;
+                vm_sync_brk_to_ctx(ctx);
+                vm_lock_release();
+                return curr;
+            }
+            memset(host_addr, 0, len);
+        } else {
+            void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (res == MAP_FAILED) {
+                uint32_t curr = g_vm_brk_curr;
+                vm_sync_brk_to_ctx(ctx);
+                vm_lock_release();
+                return curr;
+            }
+            vm32_record_map(old_page, new_page,
+                (uint8_t)(PROT_READ | PROT_WRITE),
+                (uint8_t)VM32_PAGE_ANON);
         }
         (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
-        /* Mirror into the A2 union layer; the sync re-applies the host
-         * page union (over-granted by the 4K-granular host mmap above). */
-        vm32_record_map(old_page, new_page,
-            (uint8_t)(PROT_READ | PROT_WRITE),
-            (uint8_t)VM32_PAGE_ANON);
-        if (vm32_is_a2()) {
-            (void)vm32_sync_host_range(old_page, new_page);
-        }
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
         if (vm32_is_a2()) {
@@ -421,48 +430,59 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         }
     }
 
-    int   host_prot   = ppc32_host_prot(ctx, prot);
-    void *host_target = ppc32_guest_ptr(ctx, target_va);
-    off_t host_off    = (off_t)pgoffset * (off_t)PPC32_PAGE_SIZE;
-    void *res = mmap(host_target, (size_t)aligned_len, host_prot,
-                     host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
-                     (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
-    if (res == MAP_FAILED) {
-        return (uint32_t)(-errno);
+    int      host_prot   = ppc32_host_prot(ctx, prot);
+    void    *host_target = ppc32_guest_ptr(ctx, target_va);
+    off_t    host_off    = (off_t)pgoffset * (off_t)PPC32_PAGE_SIZE;
+    uint32_t map_end     = (uint32_t)((uint64_t)target_va + aligned_len);
+    uint8_t  state       = (uint8_t)VM32_PAGE_ANON;
+    if ((host_flags & MAP_SHARED) != 0) {
+        state = (uint8_t)VM32_PAGE_SHARED;
+    } else if ((host_flags & MAP_ANONYMOUS) == 0) {
+        state = (uint8_t)VM32_PAGE_COW_CLEAN;
+    }
+
+    if (vm32_is_a2()) {
+        if ((host_flags & MAP_ANONYMOUS) == 0 && fd < 0) {
+            return (uint32_t)(-EBADF);
+        }
+        vm32_record_map(target_va, map_end,
+            (uint8_t)(PROT_READ | PROT_WRITE), state);
+        if (vm32_sync_host_range(target_va, map_end) != 0) {
+            vm32_record_unmap(target_va, map_end);
+            return (uint32_t)(-ENOMEM);
+        }
+        if ((host_flags & MAP_ANONYMOUS) != 0) {
+            memset(host_target, 0, (size_t)aligned_len);
+        } else {
+            int prc = vm_file_populate_private(host_target, fd,
+                (uint64_t)host_off, (size_t)aligned_len);
+            if (prc != 0) {
+                vm32_record_unmap(target_va, map_end);
+                (void)vm32_sync_host_range(target_va, map_end);
+                return (uint32_t)prc;
+            }
+        }
+        vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
+        (void)vm32_sync_host_range(target_va, map_end);
+    } else {
+        void *res = mmap(host_target, (size_t)aligned_len, host_prot,
+                         host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
+                         (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
+        if (res == MAP_FAILED) {
+            return (uint32_t)(-errno);
+        }
+        if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
+            (void)vm_file_populate_private(host_target, fd,
+                (uint64_t)host_off, (size_t)aligned_len);
+        }
+        vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
     }
 
     if (update_cursor) {
-        g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
+        g_vm_mmap_cursor = map_end;
     }
-    (void)vm_record_region_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
+    (void)vm_record_region_locked(target_va, map_end,
                                   prot & 0x7U, flags, "[mmap]");
-    if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
-        /* Provider-A (RC-U3-r2 #4): register the inode mapping and load
-         * file content into the canonical slot so later write/truncate
-         * hooks resolve this fd. A fresh mapping shares no lines yet. */
-        (void)vm_file_populate_private(host_target, fd,
-            (uint64_t)host_off, (size_t)aligned_len);
-    }
-    {
-        uint32_t map_end = (uint32_t)((uint64_t)target_va + aligned_len);
-        uint8_t state = (uint8_t)VM32_PAGE_ANON;
-
-        if ((host_flags & MAP_SHARED) != 0) {
-            state = (uint8_t)VM32_PAGE_SHARED;
-        } else if ((host_flags & MAP_ANONYMOUS) == 0) {
-            /* Private file mapping: Provider-A in-place bytes, clean
-             * until the first write promotes them (vm_file hooks). */
-            state = (uint8_t)VM32_PAGE_COW_CLEAN;
-        }
-        vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U),
-            state);
-        /* Best-effort union repair: the direct host mmap above rounds
-         * to host pages and can over-grant sibling sub-pages on
-         * H > 4096 hosts; the sync re-applies the recorded union. */
-        if (vm32_is_a2()) {
-            (void)vm32_sync_host_range(target_va, map_end);
-        }
-    }
     return target_va;
 }
 
@@ -722,7 +742,11 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     }
 
     if ((prot & 0x1U) == 0U) {
-        (void)mprotect(ppc32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
+        if (vm32_is_a2()) {
+            (void)vm32_protect_union(old_addr, (uint32_t)old_aligned, (uint8_t)PROT_READ);
+        } else {
+            (void)mprotect(ppc32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
+        }
     }
     size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
     memcpy(ppc32_guest_ptr(ctx, new_va), ppc32_guest_ptr(ctx, old_addr), copy_bytes);

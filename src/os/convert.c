@@ -37,6 +37,8 @@ static uint32_t stat_nsec_at(const struct stat *hs)
 {
 #ifdef __linux__
     return (uint32_t)hs->st_atim.tv_nsec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    return (uint32_t)hs->st_atimespec.tv_nsec;
 #else
     (void)hs;
     return 0U;
@@ -47,6 +49,8 @@ static uint32_t stat_nsec_mt(const struct stat *hs)
 {
 #ifdef __linux__
     return (uint32_t)hs->st_mtim.tv_nsec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    return (uint32_t)hs->st_mtimespec.tv_nsec;
 #else
     (void)hs;
     return 0U;
@@ -57,6 +61,8 @@ static uint32_t stat_nsec_ct(const struct stat *hs)
 {
 #ifdef __linux__
     return (uint32_t)hs->st_ctim.tv_nsec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    return (uint32_t)hs->st_ctimespec.tv_nsec;
 #else
     (void)hs;
     return 0U;
@@ -68,6 +74,8 @@ static int32_t stat_sec_at(const struct stat *hs)
 {
 #ifdef __linux__
     return (int32_t)hs->st_atim.tv_sec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    return (int32_t)hs->st_atimespec.tv_sec;
 #else
     return (int32_t)hs->st_atime;
 #endif
@@ -77,6 +85,8 @@ static int32_t stat_sec_mt(const struct stat *hs)
 {
 #ifdef __linux__
     return (int32_t)hs->st_mtim.tv_sec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    return (int32_t)hs->st_mtimespec.tv_sec;
 #else
     return (int32_t)hs->st_mtime;
 #endif
@@ -86,6 +96,8 @@ static int32_t stat_sec_ct(const struct stat *hs)
 {
 #ifdef __linux__
     return (int32_t)hs->st_ctim.tv_sec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    return (int32_t)hs->st_ctimespec.tv_sec;
 #else
     return (int32_t)hs->st_ctime;
 #endif
