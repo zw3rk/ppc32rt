@@ -223,9 +223,10 @@ static void dbt_emit_smc_call(a64_buf_t *b)
  * page (ea >> 12) and the end page ((ea + size - 1) >> 12) are tested
  * so cross-page stores never miss an invalidation, and 32-bit wrap of
  * (ea + size) takes the slow path (which flushes everything).
- * Scratch is w3-w6 plus x2/x5/x6: w0-w7 are never live across emitted
- * instructions and NZCV is dead at every call site, while x19-x22/x27
- * (ctx, xG, EA, entry) survive untouched until the call setup. */
+ * Scratch is w3-w6 plus x5/x6/x7 (w2 holds len across the hook):
+ * w0-w7 are never live across emitted instructions and NZCV is dead
+ * at every call site, while x19-x22/x27 (ctx, xG, EA, entry) survive
+ * untouched until the call setup. */
 static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
 {
     uintptr_t base = (uintptr_t)ppc32_code_pages_base();
@@ -245,14 +246,15 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
         a64_emit_mov_w(b, 1U, 22U);
     }
     a64_emit_mov_imm32(b, 2U, len);
-    /* x2 = code-page bitmap base (absolute host address, fixed). */
+    /* x7 = code-page bitmap base (absolute host address, fixed).
+     * w2 keeps len for the ea+len add below. */
     a64_emit(b, 0xD2800000U | ((uint32_t)3U << 21) |
-        (b3 << 5) | 2U); /* movz x2, #b3, lsl #48 */
+        (b3 << 5) | 7U); /* movz x7, #b3, lsl #48 */
     a64_emit(b, 0xF2800000U | ((uint32_t)2U << 21) |
-        (b2 << 5) | 2U); /* movk x2, #b2, lsl #32 */
+        (b2 << 5) | 7U); /* movk x7, #b2, lsl #32 */
     a64_emit(b, 0xF2800000U | ((uint32_t)1U << 21) |
-        (b1 << 5) | 2U); /* movk x2, #b1, lsl #16 */
-    a64_emit(b, 0xF2800000U | (b0 << 5) | 2U); /* movk x2, #b0 */
+        (b1 << 5) | 7U); /* movk x7, #b1, lsl #16 */
+    a64_emit(b, 0xF2800000U | (b0 << 5) | 7U); /* movk x7, #b0 */
     /* w3 = start page (ea >> 12). */
     a64_emit_ubfm_w(b, 3U, 1U, 12U, 31U);
     /* w4 = ea + len; carry means 32-bit wrap past 4 GiB. */
@@ -264,7 +266,7 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
     /* w5 = start-page bit: half (page >> 5) holds bit (page & 31). */
     a64_emit_ubfm_w(b, 5U, 3U, 5U, 31U);
     a64_emit_shift_imm_w(b, 5U, 5U, A64_SHIFT_LSL, 2U, false, NULL);
-    a64_emit_add_uxtw_x(b, 5U, 2U, 5U);
+    a64_emit_add_uxtw_x(b, 5U, 7U, 5U);
     a64_emit_ldr_imm_w(b, 5U, 5U, 0U);
     a64_emit_ubfm_w(b, 6U, 3U, 0U, 4U);
     a64_emit_shift_reg_w(b, 5U, 5U, 6U, A64_SHIFT_LSR);
@@ -273,7 +275,7 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
     /* Same test for the end page (covers cross-page straddles). */
     a64_emit_ubfm_w(b, 5U, 4U, 5U, 31U);
     a64_emit_shift_imm_w(b, 5U, 5U, A64_SHIFT_LSL, 2U, false, NULL);
-    a64_emit_add_uxtw_x(b, 5U, 2U, 5U);
+    a64_emit_add_uxtw_x(b, 5U, 7U, 5U);
     a64_emit_ldr_imm_w(b, 5U, 5U, 0U);
     a64_emit_ubfm_w(b, 6U, 4U, 0U, 4U);
     a64_emit_shift_reg_w(b, 5U, 5U, 6U, A64_SHIFT_LSR);

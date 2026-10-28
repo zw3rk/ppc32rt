@@ -390,8 +390,8 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg)
     }
 
     /* .Ltry_ibtc: */
-    /* ubfx w17, w16, #2, #10 (ppc32_ibtc_hash: (nip >> 2) & (IBTC_SIZE-1)) */
-    a64_emit(b, 0x53022E11U);
+    /* ubfx w17, w16, #2, #12 (ppc32_ibtc_hash: (nip >> 2) & (IBTC_SIZE-1)) */
+    a64_emit(b, 0x53023611U);
     /* add x22, x19, x17, lsl #5 */
     a64_emit(b, 0x8B111676U);
     /* ldr x23, [x22, #2552] (offsetof(ppc32_ctx_t, ibtc) + offsetof(ppc32_ibtc_entry_t, entry), uimm = (ibtc_off+16)/8; computed via offsetof) */

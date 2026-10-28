@@ -141,7 +141,9 @@ static void ibtc_fill(ppc32_ctx_t *ctx, uint32_t pc, ppc32_block_t *e)
     slot->key = pc;
     slot->epoch = g_cache_epoch;
     slot->host_code = e->host_code;
-    slot->entry = e->entry;
+    /* The inline IBTC probe loads {key|epoch, host_code} from *entry,
+     * so entry must be the block pointer, not the code address. */
+    slot->entry = (void *)e;
     slot->pad = 0U;
 }
 
