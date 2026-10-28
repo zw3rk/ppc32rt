@@ -30,6 +30,8 @@
 
 #include "os/syscalls.h"
 
+#include "dbt/dbt.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -216,6 +218,9 @@ static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
         }
         n = syscall(SYS_getdents64, (int)fd, buf, (size_t)want);
         if (n < 0) {
+            if (done > 0U) {
+                ppc32_smc_store(ctx, dirp_va, done, NULL);
+            }
             return done > 0U ? (long)done : -(long)errno;
         }
         if (n == 0) {
@@ -254,6 +259,10 @@ static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
         if ((long)off < n) {
             break;
         }
+    }
+    /* P1: dirents landed in guest memory; evict overlapping blocks. */
+    if (done > 0U) {
+        ppc32_smc_store(ctx, dirp_va, done, NULL);
     }
     return (long)done;
 }

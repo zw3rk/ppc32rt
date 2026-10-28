@@ -54,12 +54,8 @@ static int dbt_fallback_emit(a64_buf_t *b, const ppc32_insn_t *insn,
 
 static ppc32_emit_fn s_user_emitter = dbt_fallback_emit;
 
-/* H1 SMC: hook into the translator (defined in cache.c). Emitted
- * stores call back with (ctx, EA, len, cur_entry) right after the
- * store executes. Declared here (not via dbt.h) to keep the lane's
- * footprint inside cache.c/dbt.c. */
-extern void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
-    void *cur);
+/* H1 SMC: snapshot recorder (defined in cache.c; the smc_store
+ * hook and bitmap base now live in dbt.h for the syscall layer). */
 extern void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
     uint32_t start, uint32_t end);
 
@@ -164,17 +160,41 @@ static bool dbt_store_shape(const ppc32_insn_t *insn, uint32_t *len_out,
     return true;
 }
 
-/* H1 SMC: emit the post-store hook after a natively-emitted store.
- * Contract (mirrors emit_int.h design rules): GPRs live in ctx, no
- * guest state survives in host regs across instructions, w0-w7 are
- * never touched by emitted code, and NZCV is dead at every call site,
- * so x0-x2 (args) plus x21 (TMP3 scratch, dead at all call sites) are
- * free. The helper preserves x19-x28/x22/x27 (AAPCS64 callee-saved);
- * w22 still holds the store EA and x27 the current entry. blr writes
- * LR, so the sequence spills/fills it on the host stack: no
- * call-preserved register is free, and the block's final ret must
- * still reach the trampoline resume address. */
-static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
+/* Unconditional branch with later backfill (B, imm26). Mirrors the
+ * B.cond placeholder/patch pair in rt32/ppc32_a64_emit2.c (which has
+ * no unconditional form; B.cond with AL is architecturally reserved). */
+static size_t dbt_emit_b_placeholder(a64_buf_t *b)
+{
+    size_t idx = b->count;
+
+    a64_emit(b, 0x14000000U);
+    return idx;
+}
+
+static void dbt_patch_b(a64_buf_t *b, size_t patch_idx, size_t target_idx)
+{
+    int32_t disp;
+
+    if (patch_idx >= b->count) {
+        return;
+    }
+    disp = (int32_t)target_idx - (int32_t)patch_idx;
+    b->words[patch_idx] = 0x14000000U | ((uint32_t)disp & 0x03FFFFFFU);
+}
+
+/* H1 SMC slow path: call ppc32_smc_store(ctx, EA, len, cur) right after
+ * a natively-emitted store. Contract (mirrors emit_int.h design
+ * rules): GPRs live in ctx, no guest state survives in host regs
+ * across instructions, w0-w7 are never touched by emitted code, and
+ * NZCV is dead at every call site. The helper preserves x19-x28/x22/
+ * x27 (AAPCS64 callee-saved); w1 holds the range start, w2 the length,
+ * and x27 the current entry on entry. blr writes LR, so the sequence
+ * spills/fills it on the host stack: no call-preserved register is
+ * free, and the block's final ret must still reach the trampoline
+ * resume address. SP stays 16-byte aligned throughout (the trampoline
+ * aligned it; emitted code never touches it), and the spill touches
+ * neither NZCV nor any live register. */
+static void dbt_emit_smc_call(a64_buf_t *b)
 {
     uintptr_t fn = (uintptr_t)ppc32_smc_store;
     uint32_t hi3 = (uint32_t)((fn >> 48U) & 0xFFFFU);
@@ -182,13 +202,6 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
     uint32_t hi1 = (uint32_t)((fn >> 16U) & 0xFFFFU);
     uint32_t lo = (uint32_t)(fn & 0xFFFFU);
 
-    if (back != 0U) {
-        /* w1 = w22 - back (range start for strided stores). */
-        a64_emit_sub_imm_w(b, false, 1U, 22U, (uint16_t)back, 0U);
-    } else {
-        a64_emit_mov_w(b, 1U, 22U);
-    }
-    a64_emit_mov_imm32(b, 2U, len);
     a64_emit(b, 0xAA1303E0U); /* mov x0, x19 (ctx) */
     a64_emit(b, 0xAA1B03E3U); /* mov x3, x27 (cur entry) */
     a64_emit(b, 0xD2800000U | ((uint32_t)3U << 21) |
@@ -198,16 +211,81 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
     a64_emit(b, 0xF2800000U | ((uint32_t)1U << 21) |
         (hi1 << 5) | 21U); /* movk x21, #hi1, lsl #16 */
     a64_emit(b, 0xF2800000U | (lo << 5) | 21U); /* movk x21, #lo */
-    /* blr writes LR, but the block's final ret must still reach the
-     * trampoline resume address the trampoline's own blr left there.
-     * Spill/fill LR on the host stack: no call-preserved register is
-     * free (x0-x4/x21 are caller-saved scratch here; x19-x28 carry the
-     * translator contract). SP stays 16-byte aligned throughout (the
-     * trampoline aligned it; emitted code never touches it), and the
-     * spill touches neither NZCV nor any live register. */
     a64_emit(b, 0xF81F0FFEU); /* str x30, [sp, #-16]! */
     a64_emit(b, 0xD63F02A0U); /* blr x21 */
     a64_emit(b, 0xF84107FEU); /* ldr x30, [sp], #16 */
+}
+
+/* P1: emit the post-store hook after a natively-emitted store, guarded
+ * by an inline code-page occupancy check. Data-page stores (the hot
+ * path) skip the C call entirely; only a store touching a page marked
+ * in the bitmap falls through to dbt_emit_smc_call. Both the start
+ * page (ea >> 12) and the end page ((ea + size - 1) >> 12) are tested
+ * so cross-page stores never miss an invalidation, and 32-bit wrap of
+ * (ea + size) takes the slow path (which flushes everything).
+ * Scratch is w3-w6 plus x2/x5/x6: w0-w7 are never live across emitted
+ * instructions and NZCV is dead at every call site, while x19-x22/x27
+ * (ctx, xG, EA, entry) survive untouched until the call setup. */
+static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
+{
+    uintptr_t base = (uintptr_t)ppc32_code_pages_base();
+    uint32_t b3 = (uint32_t)((base >> 48U) & 0xFFFFU);
+    uint32_t b2 = (uint32_t)((base >> 32U) & 0xFFFFU);
+    uint32_t b1 = (uint32_t)((base >> 16U) & 0xFFFFU);
+    uint32_t b0 = (uint32_t)(base & 0xFFFFU);
+    size_t wrap;
+    size_t start_hit;
+    size_t end_hit;
+    size_t done;
+
+    if (back != 0U) {
+        /* w1 = w22 - back (range start for strided stores). */
+        a64_emit_sub_imm_w(b, false, 1U, 22U, (uint16_t)back, 0U);
+    } else {
+        a64_emit_mov_w(b, 1U, 22U);
+    }
+    a64_emit_mov_imm32(b, 2U, len);
+    /* x2 = code-page bitmap base (absolute host address, fixed). */
+    a64_emit(b, 0xD2800000U | ((uint32_t)3U << 21) |
+        (b3 << 5) | 2U); /* movz x2, #b3, lsl #48 */
+    a64_emit(b, 0xF2800000U | ((uint32_t)2U << 21) |
+        (b2 << 5) | 2U); /* movk x2, #b2, lsl #32 */
+    a64_emit(b, 0xF2800000U | ((uint32_t)1U << 21) |
+        (b1 << 5) | 2U); /* movk x2, #b1, lsl #16 */
+    a64_emit(b, 0xF2800000U | (b0 << 5) | 2U); /* movk x2, #b0 */
+    /* w3 = start page (ea >> 12). */
+    a64_emit_ubfm_w(b, 3U, 1U, 12U, 31U);
+    /* w4 = ea + len; carry means 32-bit wrap past 4 GiB. */
+    a64_emit_add_reg_w(b, true, 4U, 1U, 2U, A64_SHIFT_LSL, 0U);
+    wrap = a64_emit_b_cond_placeholder(b, A64_COND_CS);
+    /* w4 = end page ((ea + len - 1) >> 12); len is never 0 here. */
+    a64_emit_sub_imm_w(b, false, 4U, 4U, 1U, 0U);
+    a64_emit_ubfm_w(b, 4U, 4U, 12U, 31U);
+    /* w5 = start-page bit: half (page >> 5) holds bit (page & 31). */
+    a64_emit_ubfm_w(b, 5U, 3U, 5U, 31U);
+    a64_emit_shift_imm_w(b, 5U, 5U, A64_SHIFT_LSL, 2U, false, NULL);
+    a64_emit_add_uxtw_x(b, 5U, 2U, 5U);
+    a64_emit_ldr_imm_w(b, 5U, 5U, 0U);
+    a64_emit_ubfm_w(b, 6U, 3U, 0U, 4U);
+    a64_emit_shift_reg_w(b, 5U, 5U, 6U, A64_SHIFT_LSR);
+    a64_emit_ubfm_w(b, 5U, 5U, 0U, 0U);
+    start_hit = a64_emit_cbz_w_placeholder(b, true, 5U);
+    /* Same test for the end page (covers cross-page straddles). */
+    a64_emit_ubfm_w(b, 5U, 4U, 5U, 31U);
+    a64_emit_shift_imm_w(b, 5U, 5U, A64_SHIFT_LSL, 2U, false, NULL);
+    a64_emit_add_uxtw_x(b, 5U, 2U, 5U);
+    a64_emit_ldr_imm_w(b, 5U, 5U, 0U);
+    a64_emit_ubfm_w(b, 6U, 4U, 0U, 4U);
+    a64_emit_shift_reg_w(b, 5U, 5U, 6U, A64_SHIFT_LSR);
+    a64_emit_ubfm_w(b, 5U, 5U, 0U, 0U);
+    end_hit = a64_emit_cbz_w_placeholder(b, true, 5U);
+    /* Neither page holds code: skip the slow-path call. */
+    done = dbt_emit_b_placeholder(b);
+    a64_patch_b_cond(b, wrap, b->count);
+    a64_patch_cbz_w(b, start_hit, b->count);
+    a64_patch_cbz_w(b, end_hit, b->count);
+    dbt_emit_smc_call(b);
+    dbt_patch_b(b, done, b->count);
 }
 
 /* H1 SMC wrapper: every translation goes through here. Native
@@ -421,10 +499,11 @@ int dbt_run(ppc32_ctx_t *ctx)
              * syscall layer advances past exactly once. */
             ctx->nip = ctx->exit_dest - 4U;
             ctx->exit_reason = PPC32_EXIT_SYSCALL;
-            /* H1 SMC: syscalls can write guest memory outside the
-             * JIT hooks (read/recv/sigframe via the VM layer), so a
-             * chained re-entry must not trust prior translations. */
-            ppc32_cache_invalidate_all(ctx);
+            /* P1: no unconditional flush here. Guest-memory copyouts
+             * (read/pread64/readv/getdents64) report their exact
+             * ranges via ppc32_smc_store, the JIT store hooks cover
+             * natively-emitted stores, and dispatch re-verifies the
+             * snapshot on the next lookup. */
             return (int)ctx->exit_reason;
         case PPC32_EXIT_UNDEF: {
             /* H1 SMC: the single step below has no store hook; when

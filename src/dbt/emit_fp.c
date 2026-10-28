@@ -113,6 +113,8 @@ static void fp_st_fpscr(a64_buf_t *b, unsigned ws)
 /* FPCR rounding sync: fpscr in EI_A/w9; clobbers w10/w11/x15/x16. */
 static void fp_sync_fpcr(a64_buf_t *b)
 {
+    a64_emit_ubfm_w(b, EI_B, EI_A, 0U, 2U); /* w10 = fpscr[NI,RN] */
+    size_t skip_msr = a64_emit_cbz_w_placeholder(b, false, EI_B);
     a64_emit(b, 0xD53B4400U | 16U); /* mrs x16, fpcr (saved copy) */
     a64_emit_ubfm_w(b, EI_B, EI_A, 0U, 0U); /* rn0 */
     a64_emit_shift_imm_w(b, EI_B, EI_B, A64_SHIFT_LSL, 1U, false, NULL);
@@ -127,17 +129,16 @@ static void fp_sync_fpcr(a64_buf_t *b)
     a64_emit_bic_reg_w(b, false, 15U, 15U, A64_TMP3, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, 15U, 15U, EI_B, A64_SHIFT_LSL, 22U);
     a64_emit(b, 0xD51B4400U | 15U); /* msr fpcr, x15 */
-    a64_emit(b, 0xD5033FDFU); /* isb */
-    /* Fresh cumulative FPSR: later mrs readers must see only this
-     * op's sticky bits. ISB required for mrs visibility. NZCV safe. */
+    a64_patch_cbz_w(b, skip_msr, b->count);
     a64_emit(b, 0xD51B4420U | 31U); /* msr fpsr, xzr */
-    a64_emit(b, 0xD5033FDFU); /* isb */
 }
 
 static void fp_restore_fpcr(a64_buf_t *b)
 {
+    a64_emit_ubfm_w(b, EI_B, EI_A, 0U, 2U);
+    size_t skip = a64_emit_cbz_w_placeholder(b, false, EI_B);
     a64_emit(b, 0xD51B4400U | 16U); /* msr fpcr, x16 */
-    a64_emit(b, 0xD5033FDFU); /* isb */
+    a64_patch_cbz_w(b, skip, b->count);
 }
 
 /* FPSR cumulative -> FPSCR accumulation (fpscr in w9; ioc_sub selects

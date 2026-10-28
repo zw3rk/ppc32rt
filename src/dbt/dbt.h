@@ -130,6 +130,13 @@ void ppc32_dbt_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
 void ppc32_dbt_set_emitter(ppc32_emit_fn fn);
 
 /* ---- cache.c internals (shared with dbt.c only) ---- */
+/* H1 SMC post-store hook (src/dbt/cache.c): evict translations
+ * overlapping [ea, ea + len) so chained re-entry runs fresh bytes.
+ * cur is the executing entry (link-severed, never unmapped). */
+void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
+    void *cur);
+/* P1 inline-guard base: occupancy bitmap over guest 4 KiB pages. */
+const uint64_t *ppc32_code_pages_base(void);
 ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc);
 ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     const uint32_t *words, size_t nwords, const uint32_t *slot_pcs,

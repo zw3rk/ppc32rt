@@ -115,6 +115,14 @@ uint32_t *ppc32_cache_epoch_ptr(void)
     return &g_cache_epoch;
 }
 
+/* P1 inline-guard base (see dbt_emit_smc_hook in dbt.c): the bitmap
+ * address is fixed for the process lifetime; invalidate_all clears the
+ * bits in place, so baked-in addresses stay valid. */
+const uint64_t *ppc32_code_pages_base(void)
+{
+    return s_code_pages;
+}
+
 static uint32_t cache_index(uint32_t pc)
 {
     return (pc >> 2U) & (PPC32_DBT_HT_SIZE - 1U);

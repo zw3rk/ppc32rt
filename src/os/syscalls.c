@@ -30,6 +30,7 @@
 #endif
 
 #include "os/syscalls.h"
+#include "dbt/dbt.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -108,14 +109,21 @@ static long host_ret(ssize_t n, int err)
     return (long)n;
 }
 
-static long sys_read(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
+/* P1: read/pread64 helper; landed bytes evict overlapping blocks. */
+static long sys_read_at(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
+    uint32_t count, bool use_pread, int64_t off)
 {
     ssize_t n;
 
     if (count > 0U && !ppc32_range_ok(buf_va, count)) {
         return -EFAULT;
     }
-    n = read((int)fd, ppc32_guest_ptr(ctx, buf_va), (size_t)count);
+    n = use_pread ? pread((int)fd, ppc32_guest_ptr(ctx, buf_va),
+        (size_t)count, (off_t)off) :
+        read((int)fd, ppc32_guest_ptr(ctx, buf_va), (size_t)count);
+    if (n > 0) {
+        ppc32_smc_store(ctx, buf_va, (uint32_t)n, NULL);
+    }
     return host_ret(n, errno);
 }
 
@@ -185,6 +193,16 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
         done += n;
         if ((uint64_t)got < (uint64_t)want) {
             break;
+        }
+    }
+    if (is_write == 0 && total > 0ULL) { /* P1: readv landed; evict. */
+        uint32_t i;
+        for (i = 0U; i < count && total > 0ULL; i++) {
+            uint32_t len = ppc32_ld32be(ctx, iov_va + i * 8U + 4U);
+            uint32_t hit = len > total ? (uint32_t)total : len;
+            ppc32_smc_store(ctx, ppc32_ld32be(ctx, iov_va + i * 8U), hit,
+                NULL);
+            total -= hit;
         }
     }
     if (is_write != 0 && total > 0ULL) {
@@ -687,7 +705,11 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         ret = (long)(int32_t)ctx->exit_arg;
         break;
     case PPC32_NR_READ:
-        ret = sys_read(ctx, a0, a1, a2);
+        ret = sys_read_at(ctx, a0, a1, a2, false, 0);
+        break;
+    case PPC32_NR_PREAD64:
+        ret = sys_read_at(ctx, a0, a1, a2, true,
+            ((int64_t)(int32_t)a3 << 32) | (int64_t)a4);
         break;
     case PPC32_NR_WRITE:
         ret = sys_write(ctx, a0, a1, a2);
