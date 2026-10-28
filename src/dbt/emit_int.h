@@ -24,11 +24,10 @@
  *   REV (32-bit) or REV16 (16-bit) fix-up; *brx forms skip it.
  * - Guest addresses wrap in 32-bit W registers before adding xG: all
  *   memory traffic goes through [x20, w22, uxtw] (A64_ADDR == 22).
- * - Guest GPRs live in ctx->gpr[] (SPEC 2.1); no guest state is kept
- *   live in host registers across instructions. Within one instruction,
- *   w9..w14 are operand/flag temporaries. w0..w7 are never touched
- *   (L2b's guest-live window), x18 is never touched, and x19 (xCtx) /
- *   x20 (xG) keep their frozen roles.
+ * - Guest GPRs live write-through in ctx->gpr[] (SPEC 2.1) with a
+ *   Wave P12 8-slot cache in w0..w7 (slot r&7) live across instructions.
+ *   Within one instruction, w9..w14 are operand/flag temporaries,
+ *   x18 is never touched, and x19 (xCtx) / x20 (xG) keep frozen roles.
  * - XER (SO/OV/CA) and CR0/CR-field updates mirror interp.c, including
  *   the sraw dropped-bit CA rule and MB>ME wrap masks.
  * - Anything without a native lowering (FPU/SPE families, MULHDU,
@@ -90,7 +89,8 @@ void ppc32_emit_fallback(ppc32_emit_ctx_t *e, uint32_t pc);
 /* Scratch map inside one instruction (nothing survives it): w9..w14
  * hold operands/flags; w22 is the guest effective address; w15/w16 are
  * transient (never live across a helper that uses A64_TMP* internally).
- * w0..w7, x18, x19, x20 are never touched. */
+ * w0..w7 hold the Wave P12 write-through GPR cache (slot r&7);
+ * x18, x19, x20 are never touched. */
 #define EI_A  9U
 #define EI_B  10U
 #define EI_R  11U
@@ -107,12 +107,35 @@ static inline uint32_t ei_gpr_off(unsigned r)
 
 static inline void ei_ld(a64_buf_t *b, unsigned wd, unsigned rs)
 {
-    a64_emit_ldr_imm_w(b, wd, A64_XCTX, ei_gpr_off(rs));
+    unsigned slot = rs & 7U;
+    unsigned creg = slot;
+
+    if ((((b->gpr_cache_valid >> slot) & 1U) != 0U) &&
+        b->gpr_cache_reg[slot] == (uint8_t)rs) {
+        if (wd != creg) {
+            a64_emit_mov_w(b, wd, creg);
+        }
+        return;
+    }
+    a64_emit_ldr_imm_w(b, creg, A64_XCTX, ei_gpr_off(rs));
+    b->gpr_cache_valid |= (uint8_t)(1U << slot);
+    b->gpr_cache_reg[slot] = (uint8_t)rs;
+    if (wd != creg) {
+        a64_emit_mov_w(b, wd, creg);
+    }
 }
 
 static inline void ei_st(a64_buf_t *b, unsigned ws, unsigned rd)
 {
+    unsigned slot = rd & 7U;
+    unsigned creg = slot;
+
     a64_emit_str_imm_w(b, ws, A64_XCTX, ei_gpr_off(rd));
+    if (ws != creg) {
+        a64_emit_mov_w(b, creg, ws);
+    }
+    b->gpr_cache_valid |= (uint8_t)(1U << slot);
+    b->gpr_cache_reg[slot] = (uint8_t)rd;
 }
 
 static inline void ei_ctx_ld(a64_buf_t *b, unsigned wd, uint32_t off)
@@ -646,11 +669,11 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
             a64_emit_guest_ldrb_w(b, EI_B, A64_ADDR);
         }
         if (wb_first) {
-            a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
+            ei_st(b, A64_ADDR, in->ra);
         }
         ei_st(b, EI_B, in->rt);
         if (wb_last) {
-            a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
+            ei_st(b, A64_ADDR, in->ra);
         }
         return PPC32_EMIT_NEXT;
     }
@@ -671,7 +694,7 @@ static inline int ei_mem(a64_buf_t *b, const ppc32_insn_t *in, bool is_x,
         a64_emit_guest_strb_w(b, EI_B, A64_ADDR);
     }
     if (wb_first || wb_last) {
-        a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, ei_gpr_off(in->ra));
+        ei_st(b, A64_ADDR, in->ra);
     }
     return PPC32_EMIT_NEXT;
 }
@@ -709,6 +732,7 @@ static inline int ei_multi(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     ppc32_emit_fallback(e, pc);
     a64_patch_b_cond(b, patch_mis, fb_idx);
     a64_patch_b_cond(b, patch_skip, b->count);
+    b->gpr_cache_valid = 0;
     return PPC32_EMIT_NEXT;
 }
 

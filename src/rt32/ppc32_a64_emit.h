@@ -25,10 +25,10 @@
 
 /*
  * Host AArch64 register allocation inside translated fragments (PPC DBT):
- *   w0..w7   : Guest r3..r10 (SysV argument window) when live in registers;
- *              the full r0..r31 file is spilled to ctx->gpr[]/gpr_hi[]
- *              (SPEC 2.1); callee-saved discipline arrives with the
- *              Phase 2/3 trampoline
+ *   w0..w7   : 8-slot write-through GPR cache (slot r&7, Wave P12);
+ *              the full r0..r31 file stays exact in ctx->gpr[]
+ *              (SPEC 2.1); d16..d23 mirror it for fpr[]
+ *   w15/x15  : Scratch 0 / exit guest EIP
  *   w15/x15  : Scratch 0 / exit guest EIP
  *   w16/x16  : Scratch 1 / exit reason (PPC32_EXIT_*)
  *   w17/x17  : Scratch 2
@@ -41,7 +41,8 @@
  *   x27      : Current block cache entry pointer (cur_entry)
  *   x28      : Pointer to `g_cache_epoch` (&g_cache_epoch)
  *   x30      : Host link register (points back to the block runner)
- *   v0..v7   : Scratch FP/SIMD registers for x87/SSE lowering
+ *   v0..v7   : Scratch FP/SIMD registers for PPC FPU/SPE lowering
+ *   d16..d23: 8-slot write-through FPR cache (slot fr&7, Wave P12)
  * The Phase 2/3 DBT owns the guest-GPR live-range mapping; the x19/x20
  * (xCtx/xG) and scratch assignments below are frozen for it.
  */
@@ -98,6 +99,10 @@ typedef struct a64_buf {
     unsigned  exit_slot_count;
     bool      fp_batch_open;
     bool      fp_next_is_arith;
+    uint8_t   gpr_cache_valid;
+    uint8_t   gpr_cache_reg[8];
+    uint8_t   fpr_cache_valid;
+    uint8_t   fpr_cache_reg[8];
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)

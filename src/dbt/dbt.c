@@ -183,17 +183,12 @@ static void dbt_patch_b(a64_buf_t *b, size_t patch_idx, size_t target_idx)
 }
 
 /* H1 SMC slow path: call ppc32_smc_store(ctx, EA, len, cur) right after
- * a natively-emitted store. Contract (mirrors emit_int.h design
- * rules): GPRs live in ctx, no guest state survives in host regs
- * across instructions, w0-w7 are never touched by emitted code, and
- * NZCV is dead at every call site. The helper preserves x19-x28/x22/
- * x27 (AAPCS64 callee-saved); w1 holds the range start, w2 the length,
- * and x27 the current entry on entry. blr writes LR, so the sequence
- * spills/fills it on the host stack: no call-preserved register is
- * free, and the block's final ret must still reach the trampoline
- * resume address. SP stays 16-byte aligned throughout (the trampoline
- * aligned it; emitted code never touches it), and the spill touches
- * neither NZCV nor any live register. */
+ * a natively-emitted store. Wave P12: w0..w7/d16..d23 hold the
+ * write-through GPR/FPR caches live across instructions, and the C
+ * helper clobbers caller-saved x0..x7/d16..d23. The cold block spills
+ * them around blr x16 (fast path never touches them, so it keeps the
+ * caches 100% live). x19-x22/x27 survive; NZCV is dead; SP stays
+ * 16-byte aligned; the spill touches neither NZCV nor x19/x27. */
 static void dbt_emit_smc_call(a64_buf_t *b)
 {
     uintptr_t fn = (uintptr_t)ppc32_smc_store;
@@ -202,18 +197,38 @@ static void dbt_emit_smc_call(a64_buf_t *b)
     uint32_t hi1 = (uint32_t)((fn >> 16U) & 0xFFFFU);
     uint32_t lo = (uint32_t)(fn & 0xFFFFU);
 
+    a64_emit(b, 0xD10243FFU); /* sub sp, sp, #144 */
+    a64_emit(b, 0xA90007E0U); /* stp x0, x1, [sp, #0] */
+    a64_emit(b, 0xA9010FE2U); /* stp x2, x3, [sp, #16] */
+    a64_emit(b, 0xA90217E4U); /* stp x4, x5, [sp, #32] */
+    a64_emit(b, 0xA9031FE6U); /* stp x6, x7, [sp, #48] */
+    a64_emit(b, 0x6D0447F0U); /* stp d16, d17, [sp, #64] */
+    a64_emit(b, 0x6D054FF2U); /* stp d18, d19, [sp, #80] */
+    a64_emit(b, 0x6D0657F4U); /* stp d20, d21, [sp, #96] */
+    a64_emit(b, 0x6D075FF6U); /* stp d22, d23, [sp, #112] */
+    a64_emit(b, 0xF90043FEU); /* str x30, [sp, #128] */
     a64_emit(b, 0xAA1303E0U); /* mov x0, x19 (ctx) */
+    a64_emit_mov_w(b, 1U, 9U); /* mov w1, w9 (range start) */
+    a64_emit_mov_w(b, 2U, 10U); /* mov w2, w10 (len) */
     a64_emit(b, 0xAA1B03E3U); /* mov x3, x27 (cur entry) */
     a64_emit(b, 0xD2800000U | ((uint32_t)3U << 21) |
-        (hi3 << 5) | 21U); /* movz x21, #hi3, lsl #48 */
+        (hi3 << 5) | 16U); /* movz x16, #hi3, lsl #48 */
     a64_emit(b, 0xF2800000U | ((uint32_t)2U << 21) |
-        (hi2 << 5) | 21U); /* movk x21, #hi2, lsl #32 */
+        (hi2 << 5) | 16U); /* movk x16, #hi2, lsl #32 */
     a64_emit(b, 0xF2800000U | ((uint32_t)1U << 21) |
-        (hi1 << 5) | 21U); /* movk x21, #hi1, lsl #16 */
-    a64_emit(b, 0xF2800000U | (lo << 5) | 21U); /* movk x21, #lo */
-    a64_emit(b, 0xF81F0FFEU); /* str x30, [sp, #-16]! */
-    a64_emit(b, 0xD63F02A0U); /* blr x21 */
-    a64_emit(b, 0xF84107FEU); /* ldr x30, [sp], #16 */
+        (hi1 << 5) | 16U); /* movk x16, #hi1, lsl #16 */
+    a64_emit(b, 0xF2800000U | (lo << 5) | 16U); /* movk x16, #lo */
+    a64_emit(b, 0xD63F0200U); /* blr x16 */
+    a64_emit(b, 0xF94043FEU); /* ldr x30, [sp, #128] */
+    a64_emit(b, 0x6D4447F0U); /* ldp d16, d17, [sp, #64] */
+    a64_emit(b, 0x6D454FF2U); /* ldp d18, d19, [sp, #80] */
+    a64_emit(b, 0x6D4657F4U); /* ldp d20, d21, [sp, #96] */
+    a64_emit(b, 0x6D475FF6U); /* ldp d22, d23, [sp, #112] */
+    a64_emit(b, 0xA94007E0U); /* ldp x0, x1, [sp, #0] */
+    a64_emit(b, 0xA9410FE2U); /* ldp x2, x3, [sp, #16] */
+    a64_emit(b, 0xA94217E4U); /* ldp x4, x5, [sp, #32] */
+    a64_emit(b, 0xA9431FE6U); /* ldp x6, x7, [sp, #48] */
+    a64_emit(b, 0x910243FFU); /* add sp, sp, #144 */
 }
 
 /* P1: emit the post-store hook after a natively-emitted store, guarded
@@ -222,11 +237,10 @@ static void dbt_emit_smc_call(a64_buf_t *b)
  * in the bitmap falls through to dbt_emit_smc_call. Both the start
  * page (ea >> 12) and the end page ((ea + size - 1) >> 12) are tested
  * so cross-page stores never miss an invalidation, and 32-bit wrap of
- * (ea + size) takes the slow path (which flushes everything).
- * Scratch is w3-w6 plus x5/x6/x7 (w2 holds len across the hook):
- * w0-w7 are never live across emitted instructions and NZCV is dead
- * at every call site, while x19-x22/x27 (ctx, xG, EA, entry) survive
- * untouched until the call setup. */
+ * (ea + size) takes the slow path (which flushes everything). Wave
+ * P12: fast-path scratch is w9-w15/x13-x15 (dead EI/TMP regs), so
+ * w0..w7/d16..d23 caches stay live; w9 holds the range start and w10
+ * the length into the cold call; NZCV is dead; x19-x22/x27 survive. */
 static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
 {
     uintptr_t base = (uintptr_t)ppc32_code_pages_base();
@@ -240,48 +254,39 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
     size_t done;
 
     if (back != 0U) {
-        /* w1 = w22 - back (range start for strided stores). */
-        a64_emit_sub_imm_w(b, false, 1U, 22U, (uint16_t)back, 0U);
+        a64_emit_sub_imm_w(b, false, 9U, 22U, (uint16_t)back, 0U);
     } else {
-        a64_emit_mov_w(b, 1U, 22U);
+        a64_emit_mov_w(b, 9U, 22U);
     }
-    a64_emit_mov_imm32(b, 2U, len);
-    /* x7 = code-page bitmap base (absolute host address, fixed).
-     * w2 keeps len for the ea+len add below. */
+    a64_emit_mov_imm32(b, 10U, len);
     a64_emit(b, 0xD2800000U | ((uint32_t)3U << 21) |
-        (b3 << 5) | 7U); /* movz x7, #b3, lsl #48 */
+        (b3 << 5) | 13U); /* movz x13, #b3, lsl #48 */
     a64_emit(b, 0xF2800000U | ((uint32_t)2U << 21) |
-        (b2 << 5) | 7U); /* movk x7, #b2, lsl #32 */
+        (b2 << 5) | 13U); /* movk x13, #b2, lsl #32 */
     a64_emit(b, 0xF2800000U | ((uint32_t)1U << 21) |
-        (b1 << 5) | 7U); /* movk x7, #b1, lsl #16 */
-    a64_emit(b, 0xF2800000U | (b0 << 5) | 7U); /* movk x7, #b0 */
-    /* w3 = start page (ea >> 12). */
-    a64_emit_ubfm_w(b, 3U, 1U, 12U, 31U);
-    /* w4 = ea + len; carry means 32-bit wrap past 4 GiB. */
-    a64_emit_add_reg_w(b, true, 4U, 1U, 2U, A64_SHIFT_LSL, 0U);
+        (b1 << 5) | 13U); /* movk x13, #b1, lsl #16 */
+    a64_emit(b, 0xF2800000U | (b0 << 5) | 13U); /* movk x13, #b0 */
+    a64_emit_ubfm_w(b, 11U, 9U, 12U, 31U);
+    a64_emit_add_reg_w(b, true, 12U, 9U, 10U, A64_SHIFT_LSL, 0U);
     wrap = a64_emit_b_cond_placeholder(b, A64_COND_CS);
-    /* w4 = end page ((ea + len - 1) >> 12); len is never 0 here. */
-    a64_emit_sub_imm_w(b, false, 4U, 4U, 1U, 0U);
-    a64_emit_ubfm_w(b, 4U, 4U, 12U, 31U);
-    /* w5 = start-page bit: half (page >> 5) holds bit (page & 31). */
-    a64_emit_ubfm_w(b, 5U, 3U, 5U, 31U);
-    a64_emit_shift_imm_w(b, 5U, 5U, A64_SHIFT_LSL, 2U, false, NULL);
-    a64_emit_add_uxtw_x(b, 5U, 7U, 5U);
-    a64_emit_ldr_imm_w(b, 5U, 5U, 0U);
-    a64_emit_ubfm_w(b, 6U, 3U, 0U, 4U);
-    a64_emit_shift_reg_w(b, 5U, 5U, 6U, A64_SHIFT_LSR);
-    a64_emit_ubfm_w(b, 5U, 5U, 0U, 0U);
-    start_hit = a64_emit_cbz_w_placeholder(b, true, 5U);
-    /* Same test for the end page (covers cross-page straddles). */
-    a64_emit_ubfm_w(b, 5U, 4U, 5U, 31U);
-    a64_emit_shift_imm_w(b, 5U, 5U, A64_SHIFT_LSL, 2U, false, NULL);
-    a64_emit_add_uxtw_x(b, 5U, 7U, 5U);
-    a64_emit_ldr_imm_w(b, 5U, 5U, 0U);
-    a64_emit_ubfm_w(b, 6U, 4U, 0U, 4U);
-    a64_emit_shift_reg_w(b, 5U, 5U, 6U, A64_SHIFT_LSR);
-    a64_emit_ubfm_w(b, 5U, 5U, 0U, 0U);
-    end_hit = a64_emit_cbz_w_placeholder(b, true, 5U);
-    /* Neither page holds code: skip the slow-path call. */
+    a64_emit_sub_imm_w(b, false, 12U, 12U, 1U, 0U);
+    a64_emit_ubfm_w(b, 12U, 12U, 12U, 31U);
+    a64_emit_ubfm_w(b, 14U, 11U, 5U, 31U);
+    a64_emit_shift_imm_w(b, 14U, 14U, A64_SHIFT_LSL, 2U, false, NULL);
+    a64_emit_add_uxtw_x(b, 14U, 13U, 14U);
+    a64_emit_ldr_imm_w(b, 14U, 14U, 0U);
+    a64_emit_ubfm_w(b, 15U, 11U, 0U, 4U);
+    a64_emit_shift_reg_w(b, 14U, 14U, 15U, A64_SHIFT_LSR);
+    a64_emit_ubfm_w(b, 14U, 14U, 0U, 0U);
+    start_hit = a64_emit_cbz_w_placeholder(b, true, 14U);
+    a64_emit_ubfm_w(b, 14U, 12U, 5U, 31U);
+    a64_emit_shift_imm_w(b, 14U, 14U, A64_SHIFT_LSL, 2U, false, NULL);
+    a64_emit_add_uxtw_x(b, 14U, 13U, 14U);
+    a64_emit_ldr_imm_w(b, 14U, 14U, 0U);
+    a64_emit_ubfm_w(b, 15U, 12U, 0U, 4U);
+    a64_emit_shift_reg_w(b, 14U, 14U, 15U, A64_SHIFT_LSR);
+    a64_emit_ubfm_w(b, 14U, 14U, 0U, 0U);
+    end_hit = a64_emit_cbz_w_placeholder(b, true, 14U);
     done = dbt_emit_b_placeholder(b);
     a64_patch_b_cond(b, wrap, b->count);
     a64_patch_cbz_w(b, start_hit, b->count);

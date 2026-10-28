@@ -623,6 +623,7 @@ static int ei_lwarx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     ppc32_emit_fallback(e, pc);
     a64_patch_b_cond(b, patch_mis, fb_idx);
     a64_patch_b_cond(b, patch_skip, b->count);
+    b->gpr_cache_valid = 0;
     return PPC32_EMIT_NEXT;
 }
 
@@ -685,6 +686,7 @@ static int ei_stwcx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     a64_patch_b_cond(b, patch_mis, fb_idx);
     a64_patch_b_cond(b, patch_done, fail_idx + 1U); /* over movz to tail */
     a64_patch_b_cond(b, patch_skip, b->count);
+    b->gpr_cache_valid = 0;
     return PPC32_EMIT_NEXT;
 }
 
