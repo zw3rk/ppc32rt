@@ -96,6 +96,8 @@ typedef struct a64_buf {
     size_t    loop_body_offset;
     uint32_t  exit_slot_pcs[A64_MAX_EXIT_SLOTS];
     unsigned  exit_slot_count;
+    bool      fp_batch_open;
+    bool      fp_next_is_arith;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)

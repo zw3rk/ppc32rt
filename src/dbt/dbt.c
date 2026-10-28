@@ -332,6 +332,42 @@ static bool is_block_end(uint32_t op)
         op == PPC32_OP_SC || op == PPC32_OP_UNDEF;
 }
 
+/* Wave P6 FP batching: true when `insn` is A-form FP arithmetic lowered
+ * by fp_arith without FALLBACK (non-SELM XO with valid fields). Mirrors
+ * the fp_arith validation in src/dbt/emit_fp.c so a peeked next word is
+ * guaranteed emittable. */
+static bool dbt_is_fp_arith(const ppc32_insn_t *insn)
+{
+    uint32_t xo5;
+
+    if (insn == NULL || (insn->op != (uint32_t)PPC32_OP_FPU_SINGLE &&
+        insn->op != (uint32_t)PPC32_OP_FPU_DOUBLE)) {
+        return false;
+    }
+    xo5 = insn->xo & 0x1FU;
+    switch (xo5) {
+    case 18U: case 20U: case 21U: case 22U: case 25U:
+    case 28U: case 29U: case 30U: case 31U:
+        break;
+    default:
+        return false;
+    }
+    if (insn->rt >= 32U || insn->ra >= 32U || insn->rb >= 32U ||
+        insn->bi >= 32U) {
+        return false;
+    }
+    if ((xo5 == 21U || xo5 == 20U || xo5 == 18U) && insn->bi != 0U) {
+        return false;
+    }
+    if (xo5 == 25U && insn->rb != 0U) {
+        return false;
+    }
+    if (xo5 == 22U && (insn->ra != 0U || insn->bi != 0U)) {
+        return false;
+    }
+    return true;
+}
+
 /* Translate one block starting at pc; on success the block is installed
  * in the cache and returned. On host-resource failure returns NULL with
  * exit_reason set (FAULT). Guest fetch mirrors interp fetch_raw. */
@@ -362,6 +398,29 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
         if (ppc_decode(raw, &insn) != 0) {
             insn.raw = raw;
             insn.op = PPC32_OP_UNDEF;
+        }
+        /* Wave P6 FP batching: when the current word opens (or continues)
+         * a run of non-Rc A-form FP arithmetic, flag it so fp_arith skips
+         * the per-op FPSCR/FPCR round-trip on intermediates. The peeked
+         * next word is validated emittable and the buffer has 128 words
+         * of headroom, so the run cannot fallback or overflow. */
+        b.fp_next_is_arith = false;
+        if (n + 1U < PPC32_DBT_BLOCK_BUDGET &&
+            ppc32_page_down(cur + 4U) == start_page && insn.rc == 0U &&
+            (insn.op == (uint32_t)PPC32_OP_FPU_SINGLE ||
+             insn.op == (uint32_t)PPC32_OP_FPU_DOUBLE) &&
+            b.count + 128U < b.cap) {
+            uint32_t next_raw;
+            ppc32_insn_t next_insn;
+
+            memcpy(&next_raw, ppc32_guest_ptr(ctx, cur + 4U),
+                sizeof(next_raw));
+            next_raw = ppc32_be32(next_raw);
+            memset(&next_insn, 0, sizeof(next_insn));
+            if (ppc_decode(next_raw, &next_insn) == 0 &&
+                dbt_is_fp_arith(&insn) && dbt_is_fp_arith(&next_insn)) {
+                b.fp_next_is_arith = true;
+            }
         }
         rc = s_emitter(&b, &insn, cur);
         if (rc != 0) {

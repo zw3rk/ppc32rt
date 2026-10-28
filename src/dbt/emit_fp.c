@@ -324,20 +324,15 @@ enum { SP_ADD, SP_SUB, SP_MUL, SP_DIV, SP_ABS, SP_NABS, SP_NEG, SP_SQRT,
     SP_MADD, SP_MSUB, SP_NMADD, SP_NMSUB, SP_SELM, SP_FMOV, SV_ADD = 16,
     SV_SUB, SV_AND, SV_XOR, SV_OR, SV_TRN1, SV_TRN2, SV_EXT10, SV_EXT01 };
 
-/* [op][prec]: S, D, V(.2s pair); 0 = unsupported shape. */
+/* [op][prec]: S, D, V(.2s pair); 0 = unsupported shape. Rows: ADD, SUB,
+ * MUL, DIV, ABS, NABS, NEG, SQRT, MADD, MSUB, NMADD, NMSUB, SELM, FMOV. */
 static const uint32_t fp_base[14][3] = {
-    { 0x1E202800U, 0x1E602800U, 0x0E22D400U }, /* ADD */
-    { 0x1E203800U, 0x1E603800U, 0x0EA2D400U }, /* SUB */
-    { 0x1E200800U, 0x1E600800U, 0x2E22DC00U }, /* MUL */
-    { 0x1E201800U, 0x1E601800U, 0x2E22FC00U }, /* DIV */
-    { 0x1E20C000U, 0x1E60C000U, 0x0EA0B800U }, /* ABS */
-    { 0U, 0U, 0U }, /* NABS */
-    { 0x1E214000U, 0x1E614000U, 0x2EA0B800U }, /* NEG */
-    { 0x1E21C000U, 0x1E61C000U, 0x2EA1F800U }, /* SQRT */
-    { 0x1F000000U, 0x1F400000U, 0U }, /* MADD */
-    { 0x1F008000U, 0x1F408000U, 0U }, /* MSUB */
-    { 0x1F200000U, 0x1F600000U, 0U }, /* NMADD */
-    { 0x1F208000U, 0x1F608000U, 0U }, /* NMSUB */
+    { 0x1E202800U, 0x1E602800U, 0x0E22D400U }, { 0x1E203800U, 0x1E603800U, 0x0EA2D400U },
+    { 0x1E200800U, 0x1E600800U, 0x2E22DC00U }, { 0x1E201800U, 0x1E601800U, 0x2E22FC00U },
+    { 0x1E20C000U, 0x1E60C000U, 0x0EA0B800U }, { 0U, 0U, 0U },
+    { 0x1E214000U, 0x1E614000U, 0x2EA0B800U }, { 0x1E21C000U, 0x1E61C000U, 0x2EA1F800U },
+    { 0x1F000000U, 0x1F400000U, 0U }, { 0x1F008000U, 0x1F408000U, 0U },
+    { 0x1F200000U, 0x1F600000U, 0U }, { 0x1F208000U, 0x1F608000U, 0U },
     { 0x1E200C00U, 0x1E600C00U, 0U }, { 0x1E204000U, 0x1E604000U, 0U },
 };
 
@@ -407,8 +402,10 @@ static int fp_arith(a64_buf_t *b, const ppc32_insn_t *insn, unsigned prec)
         fp_st(b, rt, 0U, dbl, !dbl);
         return fp_tail(b, insn);
     }
-    fp_ld_fpscr(b, EI_A);
-    fp_sync_fpcr(b);
+    if (!b->fp_batch_open) {
+        fp_ld_fpscr(b, EI_A);
+        fp_sync_fpcr(b);
+    }
     if (op == (uint8_t)SP_SQRT) {
         fp_ld(b, 0U, rb, dbl);
     } else if (op == (uint8_t)SP_MUL) {
@@ -429,6 +426,10 @@ static int fp_arith(a64_buf_t *b, const ppc32_insn_t *insn, unsigned prec)
         fp_calc(b, op, prec, 1U, 0U);
     }
     fp_st(b, rt, 0U, dbl, !dbl);
+    if (b->fp_next_is_arith && insn->rc == 0U) {
+        b->fp_batch_open = true; return PPC32_EMIT_NEXT;
+    }
+    if (b->fp_batch_open) { fp_ld_fpscr(b, EI_A); b->fp_batch_open = false; }
     return fp_round_end(b, insn, 0U, dbl);
 }
 
