@@ -107,7 +107,7 @@ endif
 
 # syscall(2) is deprecated on macOS (the /dev/a32host probe only ever runs
 # on Linux); keep the deprecation visible but non-fatal for the host check.
-check: ## Host-cc syntax check of every src file (no link)
+check: check-line-limits check-abi-invariants ## Host-cc syntax check of every src file (no link) + line limits + ABI invariants
 	@for f in $(SRCS); do \
 		$(CC) $(CHECK_STD) -Werror=vla -pedantic \
 			-Wall -Wextra -Werror -Wno-error=deprecated-declarations \
