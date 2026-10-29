@@ -250,7 +250,7 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
     uint32_t b0 = (uint32_t)(base & 0xFFFFU);
     size_t wrap;
     size_t start_hit;
-    size_t end_hit;
+    size_t end_hit = 0U;
     size_t done;
 
     if (back != 0U) {
@@ -279,18 +279,26 @@ static void dbt_emit_smc_hook(a64_buf_t *b, uint32_t len, uint32_t back)
     a64_emit_shift_reg_w(b, 14U, 14U, 15U, A64_SHIFT_LSR);
     a64_emit_ubfm_w(b, 14U, 14U, 0U, 0U);
     start_hit = a64_emit_cbz_w_placeholder(b, true, 14U);
-    a64_emit_ubfm_w(b, 14U, 12U, 5U, 31U);
-    a64_emit_shift_imm_w(b, 14U, 14U, A64_SHIFT_LSL, 2U, false, NULL);
-    a64_emit_add_uxtw_x(b, 14U, 13U, 14U);
-    a64_emit_ldr_imm_w(b, 14U, 14U, 0U);
-    a64_emit_ubfm_w(b, 15U, 12U, 0U, 4U);
-    a64_emit_shift_reg_w(b, 14U, 14U, 15U, A64_SHIFT_LSR);
-    a64_emit_ubfm_w(b, 14U, 14U, 0U, 0U);
-    end_hit = a64_emit_cbz_w_placeholder(b, true, 14U);
-    done = dbt_emit_b_placeholder(b);
+    if (len == 1U) {
+        /* A single byte cannot span pages: the start-page test above
+         * already decides, so the end-page lookup is skipped. */
+        done = dbt_emit_b_placeholder(b);
+    } else {
+        a64_emit_ubfm_w(b, 14U, 12U, 5U, 31U);
+        a64_emit_shift_imm_w(b, 14U, 14U, A64_SHIFT_LSL, 2U, false, NULL);
+        a64_emit_add_uxtw_x(b, 14U, 13U, 14U);
+        a64_emit_ldr_imm_w(b, 14U, 14U, 0U);
+        a64_emit_ubfm_w(b, 15U, 12U, 0U, 4U);
+        a64_emit_shift_reg_w(b, 14U, 14U, 15U, A64_SHIFT_LSR);
+        a64_emit_ubfm_w(b, 14U, 14U, 0U, 0U);
+        end_hit = a64_emit_cbz_w_placeholder(b, true, 14U);
+        done = dbt_emit_b_placeholder(b);
+    }
     a64_patch_b_cond(b, wrap, b->count);
     a64_patch_cbz_w(b, start_hit, b->count);
-    a64_patch_cbz_w(b, end_hit, b->count);
+    if (len != 1U) {
+        a64_patch_cbz_w(b, end_hit, b->count);
+    }
     dbt_emit_smc_call(b);
     dbt_patch_b(b, done, b->count);
 }
@@ -335,6 +343,63 @@ static bool is_block_end(uint32_t op)
     return op == PPC32_OP_B || op == PPC32_OP_BC ||
         op == PPC32_OP_BCLR || op == PPC32_OP_BCCTR ||
         op == PPC32_OP_SC || op == PPC32_OP_UNDEF;
+}
+
+/* Wave P13 FP lookahead: true for ops the open FP batch can be
+ * looked past without disturbing it. Integer ALU ops below never touch
+ * host FPSR/FPCR or guest FPSCR (CR/XER writes are FP-invisible, and
+ * every emitter is total for these shapes); 64-bit FP loads/stores,
+ * single loads and pure moves transfer bits with no FP status update.
+ * Single-precision stores and stfiwx convert through FCVT and can set
+ * host FPSR flags, so they (with every other op: FPSCR observers,
+ * converts, compares, branches, faults, helpers) close the batch.
+ * Update-form FP memory with ra == 0 cannot emit, so it is not
+ * transparent either. The XO numbers mirror emit_fp.c
+ * (FP_XO_FMR/FNEG/FNABS/FABS, indexed k-bit layout); stfiwx decodes
+ * to UNDEF and stops the scan by itself. */
+static bool dbt_fp_passthrough(const ppc32_insn_t *t)
+{
+    switch (t->op) {
+    case PPC32_OP_LFD:
+    case PPC32_OP_STFD:
+    case PPC32_OP_LFS:
+        return true;
+    case PPC32_OP_LFDU:
+    case PPC32_OP_STFDU:
+    case PPC32_OP_LFSU:
+        return t->ra != 0U;
+    case PPC32_OP_FPU_X:
+        switch (t->xo) {
+        case 535U: case 599U: case 663U:
+            return true;
+        case 567U: case 631U: case 695U:
+            return t->ra != 0U;
+        default:
+            return false;
+        }
+    case PPC32_OP_FPU_DOUBLE:
+        if (t->xo == 72U || t->xo == 40U || t->xo == 136U ||
+            t->xo == 264U)
+            return t->ra == 0U;
+        return false;
+    case PPC32_OP_ADDI:
+    case PPC32_OP_ADDIS:
+    case PPC32_OP_ADD:
+    case PPC32_OP_SUBF:
+    case PPC32_OP_ORI:
+    case PPC32_OP_OR:
+    case PPC32_OP_AND:
+    case PPC32_OP_RLWINM:
+        return true;
+    case PPC32_OP_CMP:
+    case PPC32_OP_CMPL:
+    case PPC32_OP_CMPI:
+    case PPC32_OP_CMPLI:
+        /* ei_cmp falls back on L == 1 (rt bit 0). */
+        return (t->rt & 1U) == 0U;
+    default:
+        return false;
+    }
 }
 
 /* Wave P6 FP batching: true when `insn` is A-form FP arithmetic lowered
@@ -404,27 +469,47 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
             insn.raw = raw;
             insn.op = PPC32_OP_UNDEF;
         }
-        /* Wave P6 FP batching: when the current word opens (or continues)
-         * a run of non-Rc A-form FP arithmetic, flag it so fp_arith skips
-         * the per-op FPSCR/FPCR round-trip on intermediates. The peeked
-         * next word is validated emittable and the buffer has 128 words
-         * of headroom, so the run cannot fallback or overflow. */
+        /* Wave P6/P13 FP batching: when the current word opens (or
+         * continues) a run of non-Rc A-form FP arithmetic, flag it so
+         * fp_arith skips the per-op FPSCR/FPCR round-trip on
+         * intermediates. A bounded forward scan looks past transparent
+         * ops (non-observing FP moves/memory, non-trapping integer
+         * ALU) for the next emittable arith word in this page; the
+         * buffer has 128 words of headroom, so the run cannot
+         * fallback or overflow. */
         b.fp_next_is_arith = false;
-        if (n + 1U < PPC32_DBT_BLOCK_BUDGET &&
-            ppc32_page_down(cur + 4U) == start_page && insn.rc == 0U &&
+        if (insn.rc == 0U &&
             (insn.op == (uint32_t)PPC32_OP_FPU_SINGLE ||
              insn.op == (uint32_t)PPC32_OP_FPU_DOUBLE) &&
-            b.count + 128U < b.cap) {
-            uint32_t next_raw;
-            ppc32_insn_t next_insn;
+            dbt_is_fp_arith(&insn) && b.count + 128U < b.cap) {
+            uint32_t fwd = cur + 4U;
+            unsigned k;
 
-            memcpy(&next_raw, ppc32_guest_ptr(ctx, cur + 4U),
-                sizeof(next_raw));
-            next_raw = ppc32_be32(next_raw);
-            memset(&next_insn, 0, sizeof(next_insn));
-            if (ppc_decode(next_raw, &next_insn) == 0 &&
-                dbt_is_fp_arith(&insn) && dbt_is_fp_arith(&next_insn)) {
-                b.fp_next_is_arith = true;
+            for (k = 0U; k < 16U; k++) {
+                uint32_t scan_raw;
+                ppc32_insn_t scan_insn;
+
+                if (n + 1U + k >= PPC32_DBT_BLOCK_BUDGET ||
+                    ppc32_page_down(fwd) != start_page) {
+                    break;
+                }
+                memcpy(&scan_raw, ppc32_guest_ptr(ctx, fwd),
+                    sizeof(scan_raw));
+                scan_raw = ppc32_be32(scan_raw);
+                memset(&scan_insn, 0, sizeof(scan_insn));
+                if (ppc_decode(scan_raw, &scan_insn) != 0) {
+                    break;
+                }
+                if ((scan_insn.op == (uint32_t)PPC32_OP_FPU_SINGLE ||
+                    scan_insn.op == (uint32_t)PPC32_OP_FPU_DOUBLE) &&
+                    dbt_is_fp_arith(&scan_insn)) {
+                    b.fp_next_is_arith = true;
+                    break;
+                }
+                if (!dbt_fp_passthrough(&scan_insn)) {
+                    break;
+                }
+                fwd += 4U;
             }
         }
         rc = s_emitter(&b, &insn, cur);

@@ -66,50 +66,39 @@ static void fp_ld(a64_buf_t *b, unsigned vd, unsigned fr, bool dbl)
 {
     if (dbl) {
         unsigned fs = fr & 7U, fc = 16U + fs;
-        if ((((b->fpr_cache_valid >> fs) & 1U) != 0U) &&
-            b->fpr_cache_reg[fs] == (uint8_t)fr) {
-            if (vd != fc) {
+        if ((((b->fpr_cache_valid >> fs) & 1U) != 0U) && b->fpr_cache_reg[fs] == (uint8_t)fr) {
+            if (vd != fc)
                 a64_emit(b, 0x1E604000U | ((fc & 31U) << 5) | (vd & 31U));
-            }
             return;
         }
-        a64_emit(b, 0xFD400000U | ((FP_OFF(fr) / 8U) << 10) |
-            ((unsigned)A64_XCTX << 5) | (fc & 31U));
+        a64_emit(b, 0xFD400000U | ((FP_OFF(fr) / 8U) << 10) | ((unsigned)A64_XCTX << 5) | (fc & 31U));
         b->fpr_cache_valid |= (uint8_t)(1U << fs);
         b->fpr_cache_reg[fs] = (uint8_t)fr;
-        if (vd != fc) {
+        if (vd != fc)
             a64_emit(b, 0x1E604000U | ((fc & 31U) << 5) | (vd & 31U));
-        }
         return;
     }
-    a64_emit(b, 0xFD400000U | ((FP_OFF(fr) / 8U) << 10) |
-        ((unsigned)A64_XCTX << 5) | (vd & 31U));
+    a64_emit(b, 0xFD400000U | ((FP_OFF(fr) / 8U) << 10) | ((unsigned)A64_XCTX << 5) | (vd & 31U));
     a64_emit(b, 0x1E624000U | ((vd & 31U) << 5) | (vd & 31U));
 }
 
-static void fp_st(a64_buf_t *b, unsigned fr, unsigned vs, bool dbl,
-    bool zero_hi)
+static void fp_st(a64_buf_t *b, unsigned fr, unsigned vs, bool dbl, bool zero_hi)
 {
     unsigned r = vs & 31U;
     (void)zero_hi;
     if (dbl) {
         unsigned fs = fr & 7U, fc = 16U + fs;
-        if (r != fc) {
+        if (r != fc)
             a64_emit(b, 0x1E604000U | ((r & 31U) << 5) | fc);
-        }
-        a64_emit(b, 0xFD000000U | ((FP_OFF(fr) / 8U) << 10) |
-            ((unsigned)A64_XCTX << 5) | (fc & 31U));
+        a64_emit(b, 0xFD000000U | ((FP_OFF(fr) / 8U) << 10) | ((unsigned)A64_XCTX << 5) | (fc & 31U));
         b->fpr_cache_valid |= (uint8_t)(1U << fs);
         b->fpr_cache_reg[fs] = (uint8_t)fr;
         return;
     }
     a64_emit(b, 0x1E22C000U | (r << 5) | 3U);
-    a64_emit(b, 0xFD000000U | ((FP_OFF(fr) / 8U) << 10) |
-        ((unsigned)A64_XCTX << 5) | 3U);
-    if (((b->fpr_cache_valid >> (fr & 7U)) & 1U) != 0U &&
-        b->fpr_cache_reg[fr & 7U] == (uint8_t)fr) {
+    a64_emit(b, 0xFD000000U | ((FP_OFF(fr) / 8U) << 10) | ((unsigned)A64_XCTX << 5) | 3U);
+    if (((b->fpr_cache_valid >> (fr & 7U)) & 1U) != 0U && b->fpr_cache_reg[fr & 7U] == (uint8_t)fr)
         b->fpr_cache_valid &= (uint8_t)~(uint8_t)(1U << (fr & 7U));
-    }
 }
 /* SPE scalar-single traffic: low word of the GPR pair. */
 static void spe_ld_s(a64_buf_t *b, unsigned vs, unsigned r)
@@ -284,23 +273,31 @@ static int fp_conv_end(a64_buf_t *b, const ppc32_insn_t *insn, uint32_t ioc_sub)
     fp_restore_fpcr(b);
     return fp_tail(b, insn);
 }
-/* Guest-memory FP traffic (big-endian wire; EA already in w22). */
+/* Guest-memory FP traffic (big-endian wire; EA already in w22).
+ * Double traffic is write-through cached (lfd populates d16+slot via
+ * FMOV, stfd reads it back); single paths convert and invalidate. */
 static void fp_ldst_mem(a64_buf_t *b, bool is_store, bool dbl, unsigned fr)
 {
+    unsigned fs = fr & 7U;
     a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
     if (!is_store && dbl) {
         FP_LDR_X(15U, A64_TMP2);
         FP_REV_X(15U);
+        a64_emit(b, 0x9E670000U | (15U << 5) | (16U + fs));
         FP_STR_X_OFF(15U, A64_XCTX, FP_OFF(fr));
-        b->fpr_cache_valid &= (uint8_t)~(uint8_t)(1U << (fr & 7U));
+        b->fpr_cache_valid |= (uint8_t)(1U << fs);
+        b->fpr_cache_reg[fs] = (uint8_t)fr;
     } else if (!is_store) {
         a64_emit_ldr_imm_w(b, 15U, A64_TMP2, 0U);
         a64_emit_rev_w(b, 15U, 15U);
         a64_emit(b, 0x1E270000U | (15U << 5) | 0U);
         fp_st(b, fr, 0U, false, false);
     } else if (dbl) {
-        a64_emit(b, 0xF9400000U | ((unsigned)A64_XCTX << 5) |
-            ((FP_OFF(fr) / 8U) << 10) | 15U);
+        if ((((b->fpr_cache_valid >> fs) & 1U) != 0U) &&
+            b->fpr_cache_reg[fs] == (uint8_t)fr)
+            a64_emit(b, 0x9E660000U | (((16U + fs) & 31U) << 5) | 15U);
+        else
+            a64_emit(b, 0xF9400000U | ((unsigned)A64_XCTX << 5) | ((FP_OFF(fr) / 8U) << 10) | 15U);
         FP_REV_X(15U);
         FP_STR_X(15U, A64_TMP2);
     } else {
