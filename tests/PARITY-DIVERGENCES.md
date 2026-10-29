@@ -21,11 +21,20 @@ file ownership), not in `tests/`.
   (`--interp`, `--dbt`, `--difftest`), and `--profile classic`
   `--difftest` (`DIFFTEST: EQUAL`). The SPE `--difftest` leg fails
   because it locksteps the same broken DBT path against interp.
-- Suspect path (not verified by edit): `src/dbt/emit_fp.c`,
-  `spe_scalar()`, `prec == 3U`, `SV_SUB` branch — the only op that
-  clears bit 16 and sets `(1U << 5) | 0U` instead of the common
-  `(1U << 16) | 0U` encoding. Site 42 is the first SPE vector-integer
-  op in the guest, so every vector `evsubfw` under `--dbt` is suspect.
+- Root cause (decoded from the failing values, not fixed here):
+  `src/dbt/emit_fp.c`, `sv_base[]` integer entries `0x0E208400`
+  (ADD) / `0x2E208400` (SUB) carry `size = 00` (bits 23:22) with Q = 0,
+  i.e. an 8-byte arrangement, not `.2S`. The SUB operand order is
+  right (`SUB v0,v1,v0` = B − A) but the width is wrong: per-byte
+  `0x04 − 0x0A = 0xFA` in lane 0 reproduces the observed
+  `got=0x000000fa` exactly. Fix is to set `size = 10` (OR `2U << 22`)
+  on the ADD/SUB entries. `evaddw` is masked, not healthy: small
+  lane values make 8B ADD numerically equal to word ADD, so it passes
+  by luck. AND/OR/XOR survive legitimately (bitwise, size-agnostic);
+  TRN1/TRN2 entries (`0x0EA01C00`/`0x0E802800`) share the 8B
+  arrangement and are suspect for word transpose; both EXT entries
+  emit no index immediate and are untested (guest aborts at site 42).
+  All of this is `src/dbt/` work for the DBT-owning lane.
 
 Reproduction (from the repo root):
 
