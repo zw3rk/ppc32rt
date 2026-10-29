@@ -111,8 +111,6 @@ static void spe_st_s(a64_buf_t *b, unsigned r, unsigned vs)
 {
     a64_emit(b, 0xBD000000U | ((ei_gpr_off(r) / 4U) << 10) |
         ((unsigned)A64_XCTX << 5) | (vs & 31U));
-    a64_emit(b, 0xB9000000U | ((SPE_HI_OFF(r) / 4U) << 10) |
-        ((unsigned)A64_XCTX << 5) | (unsigned)A64_ZR);
     b->gpr_cache_valid = 0;
 }
 
@@ -346,8 +344,8 @@ enum { SP_ADD, SP_SUB, SP_MUL, SP_DIV, SP_ABS, SP_NABS, SP_NEG, SP_SQRT,
 
 /* [op][prec]: S, D, V; rows ADD,SUB,MUL,DIV,ABS,NABS,NEG,SQRT,MADD,MSUB,NMADD,NMSUB,SELM,FMOV. */
 static const uint32_t fp_base[14][3] = {
-    { 0x1E202800U, 0x1E602800U, 0x0E22D400U }, { 0x1E203800U, 0x1E603800U, 0x0EA2D400U },
-    { 0x1E200800U, 0x1E600800U, 0x2E22DC00U }, { 0x1E201800U, 0x1E601800U, 0x2E22FC00U },
+    { 0x1E202800U, 0x1E602800U, 0x0E20D400U }, { 0x1E203800U, 0x1E603800U, 0x0EA0D400U },
+    { 0x1E200800U, 0x1E600800U, 0x2E20DC00U }, { 0x1E201800U, 0x1E601800U, 0x2E20FC00U },
     { 0x1E20C000U, 0x1E60C000U, 0x0EA0B800U }, { 0U, 0U, 0U },
     { 0x1E214000U, 0x1E614000U, 0x2EA0B800U }, { 0x1E21C000U, 0x1E61C000U, 0x2EA1F800U },
     { 0x1F000000U, 0x1F400000U, 0U }, { 0x1F008000U, 0x1F408000U, 0U },
@@ -602,7 +600,8 @@ static int spe_cvtf(a64_buf_t *b, const ppc32_insn_t *insn, unsigned in,
     a64_emit(b, base | (((in >= 3U) ? 11U : 0U) << 5) | 0U);
     if (out_dbl) {
         spe_st_pair(b, insn->rt, 0U);
-        return fp_round_end(b, insn, 0U, true);
+        fp_restore_fpcr(b);
+        return fp_tail(b, insn);
     }
     if (in == 2U) { /* frsp: narrow D->S, widen back to double. */
         a64_emit(b, 0x1E22C000U | (0U << 5) | 0U); /* fcvt d0, s0 */
@@ -610,7 +609,8 @@ static int spe_cvtf(a64_buf_t *b, const ppc32_insn_t *insn, unsigned in,
         return fp_round_end(b, insn, 0U, true);
     }
     spe_st_s(b, insn->rt, 0U);
-    return fp_round_end(b, insn, 0U, false);
+    fp_restore_fpcr(b);
+    return fp_tail(b, insn);
 }
 
 /*
@@ -683,10 +683,12 @@ static int spe_cvti(a64_buf_t *b, const ppc32_insn_t *insn, unsigned in,
         a64_emit(b, 0x93407C00U | (11U << 5) | 11U); /* sxtw */
         FP_STR_X_OFF(11U, A64_XCTX, FP_OFF(insn->rt));
         b->fpr_cache_valid &= (uint8_t)~(uint8_t)(1U << (insn->rt & 7U));
+        return fp_conv_end(b, insn, FP_VXCVI);
     } else {
         spe_st_s(b, insn->rt, 11U);
     }
-    return fp_conv_end(b, insn, FP_VXCVI);
+    fp_restore_fpcr(b);
+    return fp_tail(b, insn);
 }
 
 static int spe_scalar(a64_buf_t *b, const ppc32_insn_t *insn)
@@ -710,16 +712,14 @@ static int spe_scalar(a64_buf_t *b, const ppc32_insn_t *insn)
         /* Arithmetic: v0 = A, v1 = B, v2 = C/D(old). */
         if (prec == 3U) {
             /* Integer pair ops (no rounding state touched). */
-            static const uint32_t sv_base[] = { 0x0E208400U, 0x2E208400U,
+            static const uint32_t sv_base[] = { 0x0EA08400U, 0x2EA08400U,
                 0x0E201C00U, 0x2E201C00U, 0x0EA01C00U, 0x0E802800U,
                 0x0E806800U, 0x2E002000U, 0x2E002000U };
             spe_ld_pair(b, 0U, insn->ra);
             spe_ld_pair(b, 1U, insn->rb);
-            if (op == (uint8_t)SV_SUB) {
-                /* evsubfw is subtract-from (d = B - A, oracle-proven). */
-                a64_emit(b, sv_base[op - SV_ADD] | (0U << 16) |
-                    (1U << 5) | 0U);
-            } else if (op == (uint8_t)SV_EXT01) {
+            if (op == (uint8_t)SV_SUB || op == (uint8_t)SV_TRN1 ||
+                op == (uint8_t)SV_TRN2 || op == (uint8_t)SV_EXT01) {
+                /* evsubfw/evmergehi/evmergelo/evmergelohi: Vn=v1, Vm=v0. */
                 a64_emit(b, sv_base[op - SV_ADD] | (0U << 16) |
                     (1U << 5) | 0U);
             } else {
@@ -746,7 +746,8 @@ static int spe_scalar(a64_buf_t *b, const ppc32_insn_t *insn)
                 fp_calc(b, op, 0U, 1U, 0U);
             }
             spe_st_s(b, insn->rt, 0U);
-            return fp_round_end(b, insn, 0U, false);
+            fp_restore_fpcr(b);
+            return fp_tail(b, insn);
         }
         spe_ld_pair(b, 0U, insn->ra);
         if (op != (uint8_t)SP_ABS && op != (uint8_t)SP_NABS &&
@@ -755,7 +756,8 @@ static int spe_scalar(a64_buf_t *b, const ppc32_insn_t *insn)
         }
         fp_calc(b, op, prec == 1U ? 1U : 2U, 1U, 0U);
         spe_st_pair(b, insn->rt, 0U);
-        return fp_round_end(b, insn, 0U, true);
+        fp_restore_fpcr(b);
+        return fp_tail(b, insn);
     }
     /* Converts: ramax gates RA (wide XOs take RA 0/1, others RA 0). */
     static const struct { uint32_t xo; uint8_t in; uint32_t base; uint8_t out; uint8_t ramax; } cvtf[] = {
