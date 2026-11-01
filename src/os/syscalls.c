@@ -813,15 +813,13 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         ret = ppc32_proc_getpid();
         break;
     case PPC32_NR_KILL:
-    {
-        long killed = 0L;
-
-        if (ppc32_sig_kill(ctx, a0, a1, &killed)) {
+    case PPC32_NR_GETTID:
+    case PPC32_NR_TKILL:
+    case PPC32_NR_TGKILL:
+        if (ppc32_sig_pid_nr(ctx, nr, a0, a1, a2, &ret)) {
             return;
         }
-        ret = killed;
         break;
-    }
     case PPC32_NR_CLONE:
     {
         /* PPC clone arg order (threads.h): flags, stack, parent_tid,

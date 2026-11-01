@@ -267,16 +267,133 @@ static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
     return (long)done;
 }
 #else
+/* Guest Linux AT_* bits (host <fcntl.h> may lack them, e.g. macOS has
+ * no AT_EMPTY_PATH): test the guest value, pass the host macro. */
+#define DYN_AT_EMPTY_PATH 0x1000U
+#define DYN_AT_NOFOLLOW 0x100U
+#define DYN_STATX_BASIC 0x7FFU
+
+/* Non-Linux fallback: synthesize the 256 B statx image from struct stat
+ * (ppc64rt x_fill_statx parity: mask reports exactly the basic stats,
+ * dev split uses the Linux makedev encoding). The guest loader only
+ * needs mode/size/type, but the full basic set is filled. */
+static long dyn_put_stat_fallback(ppc32_ctx_t *ctx, uint32_t va,
+    const struct stat *hs)
+{
+    int64_t sec;
+    uint32_t nsec;
+    uint64_t dev;
+    uint32_t major;
+    uint32_t minor;
+
+    if (!ppc32_range_ok(va, DYN_STATX_SIZE)) {
+        return -EFAULT;
+    }
+    ppc32_st32be(ctx, va + 0U, DYN_STATX_BASIC);
+    ppc32_st32be(ctx, va + 4U, (uint32_t)hs->st_blksize);
+    ppc32_st64be(ctx, va + 8U, 0ULL);
+    ppc32_st32be(ctx, va + 16U, (uint32_t)hs->st_nlink);
+    ppc32_st32be(ctx, va + 20U, (uint32_t)hs->st_uid);
+    ppc32_st32be(ctx, va + 24U, (uint32_t)hs->st_gid);
+    ppc32_st16be(ctx, va + 28U, (uint16_t)hs->st_mode);
+    ppc32_st64be(ctx, va + 32U, (uint64_t)hs->st_ino);
+    ppc32_st64be(ctx, va + 40U, (uint64_t)hs->st_size);
+    ppc32_st64be(ctx, va + 48U, (uint64_t)hs->st_blocks);
+    ppc32_st64be(ctx, va + 56U, 0ULL);
+/* convert.c parity: st_atim on Linux, st_*timespec on Darwin with
+ * _DARWIN_C_SOURCE, plain st_atime siblings under strict -std=c11. */
+#if defined(__linux__)
+    sec = (int64_t)hs->st_atim.tv_sec;
+    nsec = (uint32_t)hs->st_atim.tv_nsec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    sec = (int64_t)hs->st_atimespec.tv_sec;
+    nsec = (uint32_t)hs->st_atimespec.tv_nsec;
+#else
+    sec = (int64_t)hs->st_atime;
+    nsec = 0U;
+#endif
+    ppc32_st64be(ctx, va + 64U, (uint64_t)sec);
+    ppc32_st32be(ctx, va + 72U, nsec);
+#if defined(__linux__)
+    sec = 0;
+    nsec = 0U;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    sec = (int64_t)hs->st_birthtimespec.tv_sec;
+    nsec = (uint32_t)hs->st_birthtimespec.tv_nsec;
+#else
+    sec = 0;
+    nsec = 0U;
+#endif
+    ppc32_st64be(ctx, va + 80U, (uint64_t)sec);
+    ppc32_st32be(ctx, va + 88U, nsec);
+#if defined(__linux__)
+    sec = (int64_t)hs->st_ctim.tv_sec;
+    nsec = (uint32_t)hs->st_ctim.tv_nsec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    sec = (int64_t)hs->st_ctimespec.tv_sec;
+    nsec = (uint32_t)hs->st_ctimespec.tv_nsec;
+#else
+    sec = (int64_t)hs->st_ctime;
+    nsec = 0U;
+#endif
+    ppc32_st64be(ctx, va + 96U, (uint64_t)sec);
+    ppc32_st32be(ctx, va + 104U, nsec);
+#if defined(__linux__)
+    sec = (int64_t)hs->st_mtim.tv_sec;
+    nsec = (uint32_t)hs->st_mtim.tv_nsec;
+#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
+    sec = (int64_t)hs->st_mtimespec.tv_sec;
+    nsec = (uint32_t)hs->st_mtimespec.tv_nsec;
+#else
+    sec = (int64_t)hs->st_mtime;
+    nsec = 0U;
+#endif
+    ppc32_st64be(ctx, va + 112U, (uint64_t)sec);
+    ppc32_st32be(ctx, va + 120U, nsec);
+    dev = (uint64_t)hs->st_rdev;
+    major = (uint32_t)(((dev >> 8) & 0xFFFULL) | ((dev >> 32) & 0xFFFFF000ULL));
+    minor = (uint32_t)((dev & 0xFFULL) | ((dev >> 12) & 0xFFFFFF00ULL));
+    ppc32_st32be(ctx, va + 128U, major);
+    ppc32_st32be(ctx, va + 132U, minor);
+    dev = (uint64_t)hs->st_dev;
+    major = (uint32_t)(((dev >> 8) & 0xFFFULL) | ((dev >> 32) & 0xFFFFF000ULL));
+    minor = (uint32_t)((dev & 0xFFULL) | ((dev >> 12) & 0xFFFFFF00ULL));
+    ppc32_st32be(ctx, va + 136U, major);
+    ppc32_st32be(ctx, va + 140U, minor);
+    ppc32_st64be(ctx, va + 144U, 0ULL);
+    return 0;
+}
+
 static long dyn_statx(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
     uint32_t flags, uint32_t mask, uint32_t buf_va)
 {
-    (void)ctx;
-    (void)dfd_va;
-    (void)path_va;
-    (void)flags;
+    char host[DYN_PATH_MAX];
+    struct stat hs;
+    int nofollow;
+
     (void)mask;
-    (void)buf_va;
-    return -ENOSYS;
+    /* AT_EMPTY_PATH re-opens the dfd itself (ld.so stats its open
+     * libc fd with an empty path): fstat the host fd directly. */
+    if ((flags & DYN_AT_EMPTY_PATH) != 0U) {
+        if (fstat((int)dfd_va, &hs) != 0) {
+            return -(long)errno;
+        }
+        return dyn_put_stat_fallback(ctx, buf_va, &hs);
+    }
+    /* Absolute guest paths resolve against the sysroot; missing
+     * entries fall back to the raw path (qemu -L parity). */
+    {
+        long rc = dyn_resolve(ctx, path_va, host);
+
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    nofollow = (flags & DYN_AT_NOFOLLOW) != 0U ? AT_SYMLINK_NOFOLLOW : 0;
+    if (fstatat(AT_FDCWD, host, &hs, nofollow) != 0) {
+        return -(long)errno;
+    }
+    return dyn_put_stat_fallback(ctx, buf_va, &hs);
 }
 
 static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,

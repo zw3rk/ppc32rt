@@ -26,6 +26,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "ppc32rt.h"
 
@@ -105,6 +106,12 @@ void ppc32_thread_exit(ppc32_ctx_t *child);
  * through. PI ops and FUTEX_FD take -ENOSYS. */
 long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
     uint32_t val, uint32_t timeout_va, uint32_t uaddr2, uint32_t val3);
+
+/* Non-Linux futex emulation (src/os/futex_ulock.c, Darwin __ulock):
+ * same arg shape as the host futex call, guest-visible Linux errno
+ * negatives. Used by threads.c where futex(2) is unavailable. */
+long ppc32_futex_emul(int32_t *uaddr, uint32_t op, int32_t val,
+    const struct timespec *timeout, int32_t *uaddr2, int32_t val3);
 
 /* set_tid_address (nr 232): records clear_child_tid, returns the
  * caller's TID. The robust-list pointer lives in the ctx fields but is

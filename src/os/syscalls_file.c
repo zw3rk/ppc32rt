@@ -104,7 +104,7 @@ long sys_openat(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
         if (ppc32_sysroot_path(ctx, path, host, sizeof host) == 0) {
             int saved;
 
-            host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? -100 :
+            host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? AT_FDCWD :
                 (int)dfd_va;
             fd = openat(host_dfd, host, (int)host_flags,
                 (mode_t)(mode & 07777U));
@@ -117,8 +117,9 @@ long sys_openat(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
             }
         }
     }
-    /* AT_FDCWD (-100) is ABI-identical; anything else is a guest fd. */
-    host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? -100 : (int)dfd_va;
+    /* Guest AT_FDCWD (-100) maps to the host AT_FDCWD (-100 on Linux,
+     * -2 on macOS); anything else is a guest fd (identity-mapped). */
+    host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? AT_FDCWD : (int)dfd_va;
     fd = openat(host_dfd, path, (int)host_flags, (mode_t)(mode & 07777U));
     if (fd < 0) {
         return -(long)errno;

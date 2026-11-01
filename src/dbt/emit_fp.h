@@ -37,4 +37,23 @@
 int ppc32_emit_fp(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn,
     uint32_t pc);
 
+/* FPSCR value-bit masks (shared with emit_fp_class.c). */
+#define FP_FX 0x80000000U
+#define FP_VXVC 0x00080000U /* FPSCR invalid-compare summary bit */
+#define FP_VX 0x20000000U
+#define FP_OX 0x10000000U
+#define FP_UX 0x08000000U
+#define FP_ZX 0x04000000U
+#define FP_XX 0x02000000U
+#define FP_VXSNAN 0x01000000U
+#define FP_VXCVI 0x00000100U
+#define FP_FPRF_MASK 0x0003F000U
+
+/* NZCV (w10) -> PPC [LT,GT,EQ,UN] in EI_R/w11, and the exact FPRF
+ * classify helper (src/dbt/emit_fp_class.c); shared by compare and
+ * arithmetic emitters. */
+struct a64_buf;
+void fp_nzcv_field(struct a64_buf *b);
+void fp_fprf(struct a64_buf *b, unsigned vd, bool dbl);
+
 #endif /* PPC32_EMIT_FP_H */

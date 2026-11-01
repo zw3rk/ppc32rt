@@ -1,0 +1,3 @@
+hello p2 libc
+printf: 42 ok ff
+PASS

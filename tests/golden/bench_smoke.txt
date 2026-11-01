@@ -1,0 +1,6 @@
+BENCH coremark us=N ops_sec=N crc=0x0000edd5 PASS
+BENCH chacha20 us=N ops_sec=N crc=0x5ff8eba4 PASS
+BENCH vfp_simd us=N ops_sec=N crc=0xfffff160 PASS
+BENCH calls_ibtc us=N ops_sec=N crc=0x5b06486e PASS
+BENCH syscalls us=N ops_sec=N crc=0x00000064 PASS
+BENCH total_us=N ALL_PASS

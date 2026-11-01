@@ -1,0 +1,6 @@
+p5 dyn printf: 42 ok ff
+p5 dyn qsort ok
+p5 dyn dlopen ok
+p5 dyn tls ok
+p5 dyn auxv ok
+PASS

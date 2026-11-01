@@ -230,6 +230,8 @@ _Static_assert(sizeof(vm32_mem_site_t) == 24,
 
 int vm_file_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len);
+void vm_file_note_private(int host_fd, uint32_t gva_base, uint32_t pages,
+    uint64_t map_offset);
 void vm_file_promote_cow(uint32_t gva_page);
 int vm_file_on_truncate(uint64_t new_size);
 int vm_file_hook_write(int host_fd, uint64_t end_offset);

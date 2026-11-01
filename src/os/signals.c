@@ -795,3 +795,67 @@ int ppc32_sig_syscall(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
     *out_ret = ret;
     return 1;
 }
+
+/* pid-directed signals for the generic dispatch switch: kill(37), gettid
+ * (207), tkill(238), tgkill(250). glibc raise(3) is gettid + tgkill, so
+ * both must work for threaded guests (tcg_smoke signals). The clone
+ * model runs children inline on the calling host thread, hence only
+ * self-delivery routes into the synchronous kill path; foreign tids
+ * report ESRCH like the kernel. sig == 0 probes existence. Returns 1
+ * when fully applied inside (handler entered, no tail advance), 0 with
+ * *out_ret set. */
+int ppc32_sig_pid_nr(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
+    uint32_t a1, uint32_t a2, long *out_ret)
+{
+    long killed = 0L;
+
+    if (ctx == NULL || out_ret == NULL) {
+        return 0;
+    }
+    if (nr == PPC32_NR_GETTID) {
+        *out_ret = (long)ctx->guest_tid;
+        return 0;
+    }
+    if (nr == PPC32_NR_KILL) {
+        if (ppc32_sig_kill(ctx, a0, a1, &killed)) {
+            return 1;
+        }
+        *out_ret = killed;
+        return 0;
+    }
+    if (nr == PPC32_NR_TKILL) {
+        if (a0 != ctx->guest_tid) {
+            *out_ret = -ESRCH;
+            return 0;
+        }
+        if (a1 == 0U) {
+            *out_ret = 0L;
+            return 0;
+        }
+        if (ppc32_sig_kill(ctx, ctx->guest_pid, a1, &killed)) {
+            return 1;
+        }
+        *out_ret = killed;
+        return 0;
+    }
+    if (nr == PPC32_NR_TGKILL) {
+        if (a0 != ctx->guest_pid) {
+            *out_ret = -ESRCH;
+            return 0;
+        }
+        if (a1 != ctx->guest_tid) {
+            *out_ret = -ESRCH;
+            return 0;
+        }
+        if (a2 == 0U) {
+            *out_ret = 0L;
+            return 0;
+        }
+        if (ppc32_sig_kill(ctx, ctx->guest_pid, a2, &killed)) {
+            return 1;
+        }
+        *out_ret = killed;
+        return 0;
+    }
+    return 0;
+}

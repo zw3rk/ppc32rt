@@ -472,8 +472,15 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             return (uint32_t)(-errno);
         }
         if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
-            (void)vm_file_populate_private(host_target, fd,
-                (uint64_t)host_off, (size_t)aligned_len);
+            /* The file content is already in place via the host mmap
+             * above (the kernel zero-fills the partial EOF page and
+             * faults beyond-EOF pages exactly like the oracle); only
+             * the inode record is still needed for the mutation
+             * hooks. Userspace pread/memset here would fault on
+             * read-only mappings and on pages past EOF. */
+            vm_file_note_private(fd, target_va,
+                (uint32_t)(aligned_len / 4096ULL),
+                (uint64_t)host_off);
         }
         vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
     }

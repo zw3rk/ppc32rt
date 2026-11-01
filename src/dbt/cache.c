@@ -47,6 +47,7 @@
 #endif
 #include <unistd.h>
 
+#include "dbt/aot/aot_run.h"
 #include "dbt/dbt.h"
 
 #ifndef MAP_ANONYMOUS
@@ -446,6 +447,11 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     if (ctx != NULL) {
         ctx->blocks_compiled++;
     }
+    /* Persistent AOT record (Wave C2 row): no-op without --cache. The
+     * freshly emitted words are recorded once per guest pc; warm runs
+     * consult before appending, so the file stays append-only. */
+    ppc32_aot_note_block(ctx, pc, words,
+        (uint32_t)(nwords * sizeof(uint32_t)));
     return e;
 }
 

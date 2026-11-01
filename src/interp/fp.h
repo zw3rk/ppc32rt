@@ -760,6 +760,8 @@ static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
 #define PPC32_FD_MFFS 583u
 #define PPC32_FD_MTFSF 711u
 #define PPC32_FD_MTFSFI 134u
+#define PPC32_FD_MTFSB0 70u
+#define PPC32_FD_MTFSB1 38u
 
 /* ---- e500v2 SPE integer/logical/merge (full 11-bit XO) --------------- */
 #define PPC32_SPE_EVADDW 512u

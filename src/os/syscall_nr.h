@@ -137,6 +137,12 @@
 #define PPC32_NR_VFORK           189U
 #define PPC32_NR_FUTEX           221U
 #define PPC32_NR_SET_TID_ADDRESS 232U
+/* Thread-directed signals (glibc raise(3) = gettid + tgkill; the
+ * translator runs clone children inline, so self-delivery routes to
+ * the synchronous kill path while foreign tids report ESRCH). */
+#define PPC32_NR_GETTID          207U
+#define PPC32_NR_TKILL           238U
+#define PPC32_NR_TGKILL          250U
 /* RC2: exit_group is 234 (glibc _exit does li r0,234; the old 272 value
  * belongs to no ppc32 call and sent every guest exit into the ENOSYS
  * trap slot). Grounded against the linked glibc binary + qemu oracle. */

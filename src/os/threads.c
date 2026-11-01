@@ -263,13 +263,10 @@ static long futex_host(int32_t *uaddr, int op, int32_t val,
     }
     return r;
 #else
-    (void)uaddr;
-    (void)op;
-    (void)val;
-    (void)timeout;
-    (void)uaddr2;
-    (void)val3;
-    return -ENOSYS;
+    /* No futex(2) here: Darwin __ulock emulation (futex_ulock.c),
+     * guest-visible Linux errnos. */
+    return ppc32_futex_emul(uaddr, (uint32_t)op, val, timeout, uaddr2,
+        val3);
 #endif
 }
 

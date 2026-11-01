@@ -460,6 +460,24 @@ static void fp_mtfsf(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     ctx->nip += 4u;
 }
 
+/* mtfsb0/mtfsb1 (XO 70/38): FPSCR bit BT (0 = MSB) <- 0/1
+ * (trixie libm fesetround/feclearexcept; qemu-ppc -cpu 750 executes
+ * them, so the interpreter matches the oracle bit for bit). */
+static void fp_mtfsb(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int set)
+{
+    uint32_t bit = 0x80000000U >> (insn->rt & 31u);
+
+    if (set != 0) {
+        ctx->fpscr |= bit;
+    } else {
+        ctx->fpscr &= ~bit;
+    }
+    if (insn->rc != 0U) {
+        fp_cr1(ctx);
+    }
+    ctx->nip += 4u;
+}
+
 /* mtfsfi: FPSCR 4-bit field BF <- U nibble; Rc -> CR1; no flags. */
 static void fp_mtfsfi(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 {
@@ -511,6 +529,8 @@ static void fp_classic_x(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     case PPC32_FD_MFFS: fp_mffs(ctx, insn); break;
     case PPC32_FD_MTFSF: fp_mtfsf(ctx, insn); break;
     case PPC32_FD_MTFSFI: fp_mtfsfi(ctx, insn); break;
+    case PPC32_FD_MTFSB0: fp_mtfsb(ctx, insn, 0); break;
+    case PPC32_FD_MTFSB1: fp_mtfsb(ctx, insn, 1); break;
     default: fp_classic_ds(ctx, insn, 0); break;
     }
 }

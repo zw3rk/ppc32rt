@@ -173,5 +173,10 @@ long ppc32_sig_deliver_sync(ppc32_ctx_t *ctx, int sig, int code,
  * (handler entered, no tail advance), 0 with *out_ret for the tail. */
 int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
     long *out_ret);
+/* pid-directed signal dispatch for the generic switch (kill, gettid,
+ * tkill, tgkill): 1 when fully applied inside (no tail advance), 0
+ * with *out_ret set for the E01 + nip-advance tail. */
+int ppc32_sig_pid_nr(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
+    uint32_t a1, uint32_t a2, long *out_ret);
 
 #endif /* PPC32RT_OS_SIGNALS_H */

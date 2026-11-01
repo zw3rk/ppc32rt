@@ -46,11 +46,12 @@ else
 U3_BACKEND_SRC := src/os/backend_linux.c
 endif
 U3_OS_SRCS := $(filter-out src/os/backend_linux.c src/os/backend_darwin.c,$(wildcard src/os/*.c)) $(U3_BACKEND_SRC)
-SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
+SRCS := src/main.c src/main_parse.c $(wildcard src/rt32/*.c) \
+        $(wildcard src/interp/*.c) \
         $(U3_OS_SRCS) $(wildcard src/dbt/*.c) \
         $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)
 ASMS := $(wildcard src/dbt/*.S)
-HDRS := src/ppc32rt.h include/a32host.h src/os/syscall_nr.h \
+HDRS := src/ppc32rt.h src/main_parse.h include/a32host.h src/os/syscall_nr.h \
         $(wildcard src/rt32/*.h) $(wildcard src/interp/*.h) \
         $(wildcard src/os/*.h) $(wildcard src/dbt/*.h) \
         $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)

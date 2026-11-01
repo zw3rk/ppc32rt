@@ -1,0 +1,9 @@
+== P3 torture: signal frames, sigaltstack, VM, atomics ==
+PASS [p3]: sig-frame-gpr si_signo/si_code/ucontext + stolen reservation
+PASS [p3]: sig-frame-fpr FP env + values survive async handler
+PASS [p3]: sigaltstack SS_ONSTACK verified
+FAIL [p3]: unaligned-cross-page (straddling load mismatch)
+PASS [p3]: mprotect/munmap immediacy + si_addr page check
+PASS [p3]: atomic-race 2x200000 fetch_add exact
+P3_TORTURE RESULT: pass=5 fail=1 skip=0
+P3_TORTURE FAIL

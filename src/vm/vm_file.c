@@ -131,6 +131,16 @@ static void file_register(int host_fd, uint32_t gva_base, uint32_t pages,
     inode_unlock();
 }
 
+/* Register-only variant for mappings the host kernel already filled
+ * (non-A2 direct mmap): same inode record as populate_private, but no
+ * userspace pread/memset, which would fault on read-only mappings and
+ * on pages past EOF. */
+void vm_file_note_private(int host_fd, uint32_t gva_base, uint32_t pages,
+    uint64_t map_offset)
+{
+    file_register(host_fd, gva_base, pages, map_offset);
+}
+
 int vm_file_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len)
 {
