@@ -23,6 +23,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
 static _Thread_local int g_vm_lock_held = 0;
 
 void vm_lock_acquire(void)
@@ -106,6 +110,23 @@ bool vm_same_backing_fd(int fd_a, int fd_b)
 
 int vm_create_shared_anon_fd(uint64_t size)
 {
+#ifdef __linux__
+    /* Prefer memfd (no /tmp ENOSPC/unwritable failure, no disk-backed
+     * shared memory); fall through to the mkstemp file on failure. */
+    {
+        int memfd = memfd_create("ppc32rt-shm", MFD_CLOEXEC);
+
+        if (memfd >= 0) {
+            if (ftruncate(memfd, (off_t)size) != 0) {
+                int err = -errno;
+
+                (void)close(memfd);
+                return err;
+            }
+            return memfd;
+        }
+    }
+#endif
     char tmpl[] = "/tmp/.ppc32rt-shm-XXXXXX";
     int sh_fd = mkstemp(tmpl);
     if (sh_fd < 0) {
@@ -122,6 +143,27 @@ int vm_create_shared_anon_fd(uint64_t size)
         return err;
     }
     return sh_fd;
+}
+
+/* Grow a shared-anonymous backing file to req_sz without ever shrinking
+ * it: after a split, sibling fragments share the file, so an unconditional
+ * ftruncate would drop their tail pages beyond EOF (later SIGBUS). */
+int vm_grow_shared_anon_fd(int fd, uint64_t req_sz)
+{
+    struct stat st;
+    uint64_t cur_sz;
+
+    if (fd < 0) {
+        return -EBADF;
+    }
+    if (fstat(fd, &st) != 0) {
+        return -errno;
+    }
+    cur_sz = (st.st_size > 0) ? (uint64_t)st.st_size : 0ULL;
+    if (req_sz > cur_sz && ftruncate(fd, (off_t)req_sz) != 0) {
+        return -errno;
+    }
+    return 0;
 }
 
 bool vm_can_modify_range_locked(uint32_t start, uint32_t end, bool insert_mid)

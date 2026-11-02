@@ -70,10 +70,12 @@ _Static_assert(offsetof(ppc32_ucontext_t, uc_mcontext) == 0xC0U, "mc@0xc0");
 _Static_assert(UCONTEXT_OFF == 0x80U, "ucontext@0x80");
 _Static_assert(ABIGAP_OFF == 0x520U, "abigap@0x520");
 
-/* ---- Local guest-memory helpers (BE scalars; byte streams raw) ----
- * convert.h is deliberately not included: its ppc32_stat_t collides with
- * the frozen sigframe header, so the two BE/load helpers needed here are
- * restated on top of ppc32_guest_ptr (same window semantics). */
+/* ---- Local guest-memory helpers (BE scalars over the locked safe-copy
+ * path; each access validates under the VM lock so a concurrent
+ * unmap/mprotect cannot slip between check and copy. convert.h is
+ * deliberately not included: its ppc32_stat_t collides with the frozen
+ * sigframe header, so the BE helpers needed here are restated on top of
+ * ppc32_vm_copyin_safe/ppc32_vm_copyout_safe. */
 
 static int sig_range_ok(uint32_t va, size_t len)
 {
@@ -101,39 +103,72 @@ static int sig_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
     return ppc32_vm_range_prot_ok(ctx, va, len, need_prot) ? 1 : 0;
 }
 
-static uint32_t sig_ld32(const ppc32_ctx_t *ctx, uint32_t va)
-{
-    uint32_t v;
+/* Fail the caller with -EFAULT when a safe guest access fails. */
+#define SIG_MUST(expr) do { if ((expr) != 0) { return -EFAULT; } } while (0)
 
-    memcpy(&v, ppc32_guest_ptr(ctx, va), sizeof v);
-    return ppc32_be32(v);
+static int sig_ld32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t *out)
+{
+    uint32_t raw = 0U;
+    int rc;
+
+    if (out == NULL) {
+        return -EFAULT;
+    }
+    rc = ppc32_vm_copyin_safe(ctx, va, &raw, sizeof raw);
+    if (rc != 0) {
+        return rc;
+    }
+    *out = ppc32_be32(raw);
+    return 0;
 }
 
-static uint64_t sig_ld64(const ppc32_ctx_t *ctx, uint32_t va)
+static int sig_ld64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t *out)
 {
-    uint64_t v;
+    uint64_t raw = 0ULL;
+    int rc;
 
-    memcpy(&v, ppc32_guest_ptr(ctx, va), sizeof v);
-    return ppc32_be64(v);
+    if (out == NULL) {
+        return -EFAULT;
+    }
+    rc = ppc32_vm_copyin_safe(ctx, va, &raw, sizeof raw);
+    if (rc != 0) {
+        return rc;
+    }
+    *out = ppc32_be64(raw);
+    return 0;
 }
 
-static void sig_st32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
+static int sig_st32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
     uint32_t t = ppc32_be32(v);
 
-    memcpy(ppc32_guest_ptr(ctx, va), &t, sizeof t);
+    return ppc32_vm_copyout_safe(ctx, va, &t, sizeof t);
 }
 
-static void sig_st64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t v)
+static int sig_st64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t v)
 {
     uint64_t t = ppc32_be64(v);
 
-    memcpy(ppc32_guest_ptr(ctx, va), &t, sizeof t);
+    return ppc32_vm_copyout_safe(ctx, va, &t, sizeof t);
 }
 
-static void sig_zero(const ppc32_ctx_t *ctx, uint32_t va, size_t len)
+static int sig_zero(const ppc32_ctx_t *ctx, uint32_t va, size_t len)
 {
-    memset(ppc32_guest_ptr(ctx, va), 0, len);
+    static const char zeros[64] = { 0 };
+    uint32_t cur = va;
+    size_t left = len;
+
+    while (left > 0U) {
+        size_t n = (left > sizeof zeros) ? sizeof zeros : left;
+        int rc = ppc32_vm_copyout_safe(ctx, cur, zeros, n);
+
+        if (rc != 0) {
+            return rc;
+        }
+        cur += (uint32_t)n;
+        left -= n;
+    }
+    return 0;
 }
 
 /* Mask word with bit (sig-1) set; 0 when sig is outside 1..64. */
@@ -267,73 +302,69 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
     freg_va = mc_va + (uint32_t)offsetof(ppc32_mcontext_t, mc_fregs);
     vreg_va = mc_va + (uint32_t)offsetof(ppc32_mcontext_t, mc_vregs);
 
-    sig_zero(ctx, frame, sizeof(ppc32_rt_sigframe_t));
+    SIG_MUST(sig_zero(ctx, frame, sizeof(ppc32_rt_sigframe_t)));
 
     /* ---- siginfo: signo/errno/code + fault address, rest zeroed ---- */
-    sig_st32(ctx, info_va + SI_SIGNO_OFF, (uint32_t)sig);
-    sig_st32(ctx, info_va + SI_ERRNO_OFF, 0U);
-    sig_st32(ctx, info_va + SI_CODE_OFF, (uint32_t)code);
-    sig_st32(ctx, info_va + SI_ADDR_OFF, fault_addr);
+    SIG_MUST(sig_st32(ctx, info_va + SI_SIGNO_OFF, (uint32_t)sig));
+    SIG_MUST(sig_st32(ctx, info_va + SI_ERRNO_OFF, 0U));
+    SIG_MUST(sig_st32(ctx, info_va + SI_CODE_OFF, (uint32_t)code));
+    SIG_MUST(sig_st32(ctx, info_va + SI_ADDR_OFF, fault_addr));
 
     /* ---- ucontext header ---- */
     old_mask = ctx->sig_mask;
     old_lo = (uint32_t)(old_mask & 0xFFFFFFFFULL);
     old_hi = (uint32_t)((old_mask >> 32) & 0xFFFFFFFFULL);
-    sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_flags), 0U);
-    sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_link), 0U);
-    sig_st32(ctx,
+    SIG_MUST(sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_flags), 0U));
+    SIG_MUST(sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_link), 0U));
+    SIG_MUST(sig_st32(ctx,
         uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_stack_sp),
-        ctx->altstack_sp);
-    sig_st32(ctx,
+        ctx->altstack_sp));
+    SIG_MUST(sig_st32(ctx,
         uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_stack_flags),
-        (uint32_t)(int32_t)sig_current_stack_flags(ctx));
-    sig_st32(ctx,
+        (uint32_t)(int32_t)sig_current_stack_flags(ctx)));
+    SIG_MUST(sig_st32(ctx,
         uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_stack_size),
-        ctx->altstack_size);
-    sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_regs),
-        greg_va);
-    sig_st32(ctx,
-        uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_sigmask), old_lo);
-    sig_st32(ctx,
+        ctx->altstack_size));
+    SIG_MUST(sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_regs), greg_va));
+    SIG_MUST(sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_sigmask), old_lo));
+    SIG_MUST(sig_st32(ctx,
         uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_sigmask) + 4U,
-        old_hi);
+        old_hi));
 
     /* ---- mcontext: integer state (BE words, kernel mc_gregs order) ---- */
     for (i = 0U; i < 32U; i++) {
-        sig_st32(ctx, greg_va + i * 4U, ctx->gpr[i]);
+        SIG_MUST(sig_st32(ctx, greg_va + i * 4U, ctx->gpr[i]));
     }
-    sig_st32(ctx,
-        greg_va + (uint32_t)PPC32_MC_NIP * 4U, ctx->nip);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_MSR * 4U, 0U);
-    sig_st32(ctx,
-        greg_va + (uint32_t)PPC32_MC_ORIG_R3 * 4U, ctx->gpr[3]);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_CTR * 4U, ctx->ctr);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_LINK * 4U, ctx->lr);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_XER * 4U, ctx->xer);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_CCR * 4U, ctx->cr);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_MQ * 4U, 0U);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_TRAP * 4U, trap);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_DAR * 4U, fault_addr);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_DSISR * 4U, dsisr);
-    sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_RESULT * 4U, 0U);
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_NIP * 4U, ctx->nip));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_MSR * 4U, 0U));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_ORIG_R3 * 4U, ctx->gpr[3]));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_CTR * 4U, ctx->ctr));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_LINK * 4U, ctx->lr));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_XER * 4U, ctx->xer));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_CCR * 4U, ctx->cr));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_MQ * 4U, 0U));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_TRAP * 4U, trap));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_DAR * 4U, fault_addr));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_DSISR * 4U, dsisr));
+    SIG_MUST(sig_st32(ctx, greg_va + (uint32_t)PPC32_MC_RESULT * 4U, 0U));
     /* Remaining mc_gregs words (DSCR/spares) stay zeroed. */
 
     /* ---- mcontext: FP state as opaque BE doubles; fpscr in the high word
      * of slot 32 (kernel stores it via (unsigned int *)&mc_fregs[32]
      * on big-endian). Host FP state is untouched. ---- */
     for (i = 0U; i < 32U; i++) {
-        sig_st64(ctx, freg_va + i * 8U, ctx->fpr[i]);
+        SIG_MUST(sig_st64(ctx, freg_va + i * 8U, ctx->fpr[i]));
     }
-    sig_st64(ctx, freg_va + 32U * 8U, ((uint64_t)ctx->fpscr << 32));
+    SIG_MUST(sig_st64(ctx, freg_va + 32U * 8U, ((uint64_t)ctx->fpscr << 32)));
     /* mc_pad stays zeroed. */
 
     /* ---- mc_vregs: zeroed, then the SPE overlay on e500v2 ---- */
     if (ctx->is_spe != 0U) {
         for (i = 0U; i < 32U; i++) {
-            sig_st32(ctx, vreg_va + i * 4U, ctx->gpr_hi[i]);
+            SIG_MUST(sig_st32(ctx, vreg_va + i * 4U, ctx->gpr_hi[i]));
         }
-        sig_st64(ctx, vreg_va + 128U, ctx->acc);
-        sig_st32(ctx, vreg_va + 136U, ctx->spefscr);
+        SIG_MUST(sig_st64(ctx, vreg_va + 128U, ctx->acc));
+        SIG_MUST(sig_st32(ctx, vreg_va + 136U, ctx->spefscr));
     }
     /* abigap stays zeroed (deterministic; kernel leaves it untouched). */
 
@@ -343,8 +374,9 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
     } else {
         /* Write in-frame RT sigreturn trampoline (li r0,172; sc) into abigap,
          * matching arch/powerpc/kernel/signal_32.c setup_trampoline. */
-        sig_st32(ctx, frame + ABIGAP_OFF, 0x38000000U | PPC32_NR_RT_SIGRETURN);
-        sig_st32(ctx, frame + ABIGAP_OFF + 4U, 0x44000002U);
+        SIG_MUST(sig_st32(ctx, frame + ABIGAP_OFF,
+            0x38000000U | PPC32_NR_RT_SIGRETURN));
+        SIG_MUST(sig_st32(ctx, frame + ABIGAP_OFF + 4U, 0x44000002U));
         lr = frame + ABIGAP_OFF;
     }
     ctx->gpr[PPC32_REG_SP] = frame;
@@ -410,37 +442,51 @@ int ppc32_sig_restore_frame(ppc32_ctx_t *ctx, uint32_t frame_va)
     vreg_va = mc_va + (uint32_t)offsetof(ppc32_mcontext_t, mc_vregs);
 
     /* Blocked mask first (KILL/STOP forced unblocked, as in the kernel). */
-    lo = sig_ld32(ctx,
-        uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_sigmask));
-    hi = sig_ld32(ctx,
-        uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_sigmask) + 4U);
+    SIG_MUST(sig_ld32(ctx,
+        uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_sigmask), &lo));
+    SIG_MUST(sig_ld32(ctx,
+        uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_sigmask) + 4U, &hi));
     mask = ((uint64_t)hi << 32) | (uint64_t)lo;
     mask &= ~(sig_bit((int)PPC32_SIGKILL) | sig_bit((int)PPC32_SIGSTOP));
     ctx->sig_mask = mask;
 
     /* Integer state; msr/orig_r3/trap/dar/dsisr/result are informational. */
     for (i = 0U; i < 32U; i++) {
-        ctx->gpr[i] = sig_ld32(ctx, greg_va + i * 4U);
+        uint32_t w = 0U;
+
+        SIG_MUST(sig_ld32(ctx, greg_va + i * 4U, &w));
+        ctx->gpr[i] = w;
     }
-    ctx->nip = sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_NIP * 4U);
-    ctx->ctr = sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_CTR * 4U);
-    ctx->lr = sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_LINK * 4U);
-    ctx->xer = sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_XER * 4U);
-    ctx->cr = sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_CCR * 4U);
+    SIG_MUST(sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_NIP * 4U, &ctx->nip));
+    SIG_MUST(sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_CTR * 4U, &ctx->ctr));
+    SIG_MUST(sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_LINK * 4U, &ctx->lr));
+    SIG_MUST(sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_XER * 4U, &ctx->xer));
+    SIG_MUST(sig_ld32(ctx, greg_va + (uint32_t)PPC32_MC_CCR * 4U, &ctx->cr));
 
     /* FP state: opaque bit patterns; fpscr from the high word of slot 32. */
     for (i = 0U; i < 32U; i++) {
-        ctx->fpr[i] = sig_ld64(ctx, freg_va + i * 8U);
+        uint64_t d = 0ULL;
+
+        SIG_MUST(sig_ld64(ctx, freg_va + i * 8U, &d));
+        ctx->fpr[i] = d;
     }
-    ctx->fpscr = (uint32_t)(sig_ld64(ctx, freg_va + 32U * 8U) >> 32);
+    {
+        uint64_t fpslot = 0ULL;
+
+        SIG_MUST(sig_ld64(ctx, freg_va + 32U * 8U, &fpslot));
+        ctx->fpscr = (uint32_t)(fpslot >> 32);
+    }
 
     /* SPE overlay only on e500v2 (classic leaves gpr_hi/acc alone). */
     if (ctx->is_spe != 0U) {
         for (i = 0U; i < 32U; i++) {
-            ctx->gpr_hi[i] = sig_ld32(ctx, vreg_va + i * 4U);
+            uint32_t w = 0U;
+
+            SIG_MUST(sig_ld32(ctx, vreg_va + i * 4U, &w));
+            ctx->gpr_hi[i] = w;
         }
-        ctx->acc = sig_ld64(ctx, vreg_va + 128U);
-        ctx->spefscr = sig_ld32(ctx, vreg_va + 136U);
+        SIG_MUST(sig_ld64(ctx, vreg_va + 128U, &ctx->acc));
+        SIG_MUST(sig_ld32(ctx, vreg_va + 136U, &ctx->spefscr));
     }
 
     /* A stale reservation must not survive the handler (SPEC 2.2). */
@@ -558,24 +604,18 @@ static long sys_rt_sigaction(ppc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
     }
     if (old_va != 0U) {
         /* Guest struct sigaction: handler, flags, restorer, mask[2]. */
-        if (!sig_range_prot_ok(ctx, old_va, PPC32_SIGACTION_SIZE, 2U)) {
-            return -EFAULT;
-        }
-        sig_st32(ctx, old_va, old.handler);
-        sig_st32(ctx, old_va + 4U, old.flags);
-        sig_st32(ctx, old_va + 8U, old.restorer);
-        sig_st32(ctx, old_va + 12U, old.mask[0]);
-        sig_st32(ctx, old_va + 16U, old.mask[1]);
+        SIG_MUST(sig_st32(ctx, old_va, old.handler));
+        SIG_MUST(sig_st32(ctx, old_va + 4U, old.flags));
+        SIG_MUST(sig_st32(ctx, old_va + 8U, old.restorer));
+        SIG_MUST(sig_st32(ctx, old_va + 12U, old.mask[0]));
+        SIG_MUST(sig_st32(ctx, old_va + 16U, old.mask[1]));
     }
     if (act_va != 0U) {
-        if (!sig_range_prot_ok(ctx, act_va, PPC32_SIGACTION_SIZE, 1U)) {
-            return -EFAULT;
-        }
-        neu.handler = sig_ld32(ctx, act_va);
-        neu.flags = sig_ld32(ctx, act_va + 4U);
-        neu.restorer = sig_ld32(ctx, act_va + 8U);
-        neu.mask[0] = sig_ld32(ctx, act_va + 12U);
-        neu.mask[1] = sig_ld32(ctx, act_va + 16U);
+        SIG_MUST(sig_ld32(ctx, act_va, &neu.handler));
+        SIG_MUST(sig_ld32(ctx, act_va + 4U, &neu.flags));
+        SIG_MUST(sig_ld32(ctx, act_va + 8U, &neu.restorer));
+        SIG_MUST(sig_ld32(ctx, act_va + 12U, &neu.mask[0]));
+        SIG_MUST(sig_ld32(ctx, act_va + 16U, &neu.mask[1]));
         if (ppc32_sigaction_set_raw((int)sig, &neu) != 0) {
             return -EINVAL;
         }
@@ -593,20 +633,18 @@ static long sys_rt_sigprocmask(ppc32_ctx_t *ctx, uint32_t how,
         return -EINVAL;
     }
     if (old_va != 0U) {
-        if (!sig_range_prot_ok(ctx, old_va, PPC32_SIGSET_SIZE, 2U)) {
-            return -EFAULT;
-        }
-        sig_st32(ctx, old_va,
-            (uint32_t)(ctx->sig_mask & 0xFFFFFFFFULL));
-        sig_st32(ctx, old_va + 4U,
-            (uint32_t)((ctx->sig_mask >> 32) & 0xFFFFFFFFULL));
+        SIG_MUST(sig_st32(ctx, old_va,
+            (uint32_t)(ctx->sig_mask & 0xFFFFFFFFULL)));
+        SIG_MUST(sig_st32(ctx, old_va + 4U,
+            (uint32_t)((ctx->sig_mask >> 32) & 0xFFFFFFFFULL)));
     }
     if (set_va != 0U) {
-        if (!sig_range_prot_ok(ctx, set_va, PPC32_SIGSET_SIZE, 1U)) {
-            return -EFAULT;
-        }
-        set = (uint64_t)sig_ld32(ctx, set_va) |
-            ((uint64_t)sig_ld32(ctx, set_va + 4U) << 32);
+        uint32_t set_lo = 0U;
+        uint32_t set_hi = 0U;
+
+        SIG_MUST(sig_ld32(ctx, set_va, &set_lo));
+        SIG_MUST(sig_ld32(ctx, set_va + 4U, &set_hi));
+        set = (uint64_t)set_lo | ((uint64_t)set_hi << 32);
         /* SIGKILL/SIGSTOP are never blocked. */
         set &= ~(sig_bit((int)PPC32_SIGKILL) |
             sig_bit((int)PPC32_SIGSTOP));
@@ -639,13 +677,11 @@ static long sys_rt_sigpending(ppc32_ctx_t *ctx, uint32_t set_va,
     if (set_va == 0U) {
         return -EFAULT;
     }
-    if (!sig_range_prot_ok(ctx, set_va, PPC32_SIGSET_SIZE, 2U)) {
-        return -EFAULT;
-    }
     /* Blocked-but-raised signals awaiting delivery. */
     pend = ctx->pending_signals & ctx->sig_mask;
-    sig_st32(ctx, set_va, (uint32_t)(pend & 0xFFFFFFFFULL));
-    sig_st32(ctx, set_va + 4U, (uint32_t)((pend >> 32) & 0xFFFFFFFFULL));
+    SIG_MUST(sig_st32(ctx, set_va, (uint32_t)(pend & 0xFFFFFFFFULL)));
+    SIG_MUST(sig_st32(ctx, set_va + 4U,
+        (uint32_t)((pend >> 32) & 0xFFFFFFFFULL)));
     return 0;
 }
 
@@ -666,23 +702,17 @@ static long sys_sigaltstack(ppc32_ctx_t *ctx, uint32_t uss_va,
     uint32_t cur_flags;
 
     if (uoss_va != 0U) {
-        if (!sig_range_prot_ok(ctx, uoss_va, PPC32_SIGSTACK_SIZE, 2U)) {
-            return -EFAULT;
-        }
         cur_flags = sig_current_stack_flags(ctx);
-        sig_st32(ctx, uoss_va, ctx->altstack_sp);
-        sig_st32(ctx, uoss_va + 4U, (uint32_t)(int32_t)cur_flags);
-        sig_st32(ctx, uoss_va + 8U, ctx->altstack_size);
+        SIG_MUST(sig_st32(ctx, uoss_va, ctx->altstack_sp));
+        SIG_MUST(sig_st32(ctx, uoss_va + 4U, (uint32_t)(int32_t)cur_flags));
+        SIG_MUST(sig_st32(ctx, uoss_va + 8U, ctx->altstack_size));
     }
     if (uss_va == 0U) {
         return 0;
     }
-    if (!sig_range_prot_ok(ctx, uss_va, PPC32_SIGSTACK_SIZE, 1U)) {
-        return -EFAULT;
-    }
-    sp = sig_ld32(ctx, uss_va);
-    flags = sig_ld32(ctx, uss_va + 4U);
-    size = sig_ld32(ctx, uss_va + 8U);
+    SIG_MUST(sig_ld32(ctx, uss_va, &sp));
+    SIG_MUST(sig_ld32(ctx, uss_va + 4U, &flags));
+    SIG_MUST(sig_ld32(ctx, uss_va + 8U, &size));
     if ((flags & ~(PPC32_SS_DISABLE | PPC32_SS_ONSTACK)) != 0U) {
         return -EINVAL;
     }

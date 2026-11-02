@@ -46,6 +46,7 @@ void vm_sync_to_ctx(ppc32_ctx_t *ctx);
 int  vm_dup_fd(int fd);
 bool vm_same_backing_fd(int fd_a, int fd_b);
 int  vm_create_shared_anon_fd(uint64_t size);
+int  vm_grow_shared_anon_fd(int fd, uint64_t req_sz);
 bool vm_can_modify_range_locked(uint32_t start, uint32_t end, bool insert_mid);
 void vm_remove_region_at(size_t idx);
 int  vm_insert_region_raw(uint32_t start, uint32_t end, uint32_t prot,
