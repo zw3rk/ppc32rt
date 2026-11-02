@@ -38,7 +38,7 @@
 #define DSISR_STORE_CLASS 0x02000000U
 #define DSISR_LOAD_CLASS 0x40000000U
 
-static int sig_range_ok(uint32_t va, size_t len)
+static inline int sig_range_ok(uint32_t va, size_t len)
 {
     uint64_t end;
 
@@ -55,7 +55,7 @@ static int sig_range_ok(uint32_t va, size_t len)
     return 1;
 }
 
-static int sig_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
+static inline int sig_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
     uint32_t need_prot)
 {
     if (!sig_range_ok(va, len)) {
@@ -67,7 +67,7 @@ static int sig_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
 /* Fail the caller with -EFAULT when a safe guest access fails. */
 #define SIG_MUST(expr) do { if ((expr) != 0) { return -EFAULT; } } while (0)
 
-static int sig_ld32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t *out)
+static inline int sig_ld32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
     uint32_t raw = 0U;
     int rc;
@@ -83,7 +83,7 @@ static int sig_ld32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t *out)
     return 0;
 }
 
-static int sig_ld64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t *out)
+static inline int sig_ld64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t *out)
 {
     uint64_t raw = 0ULL;
     int rc;
@@ -99,21 +99,21 @@ static int sig_ld64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t *out)
     return 0;
 }
 
-static int sig_st32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
+static inline int sig_st32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
     uint32_t t = ppc32_be32(v);
 
     return ppc32_vm_copyout_safe(ctx, va, &t, sizeof t);
 }
 
-static int sig_st64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t v)
+static inline int sig_st64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t v)
 {
     uint64_t t = ppc32_be64(v);
 
     return ppc32_vm_copyout_safe(ctx, va, &t, sizeof t);
 }
 
-static int sig_zero(const ppc32_ctx_t *ctx, uint32_t va, size_t len)
+static inline int sig_zero(const ppc32_ctx_t *ctx, uint32_t va, size_t len)
 {
     static const char zeros[64] = { 0 };
     uint32_t cur = va;
@@ -133,7 +133,7 @@ static int sig_zero(const ppc32_ctx_t *ctx, uint32_t va, size_t len)
 }
 
 /* Mask word with bit (sig-1) set; 0 when sig is outside 1..64. */
-static uint64_t sig_bit(int sig)
+static inline uint64_t sig_bit(int sig)
 {
     if (sig < 1 || sig > (int)PPC32_NSIG) {
         return 0ULL;
@@ -142,7 +142,7 @@ static uint64_t sig_bit(int sig)
 }
 
 /* Current altstack flags for ucontext: SS_ONSTACK when sp is inside it. */
-static uint32_t sig_current_stack_flags(const ppc32_ctx_t *ctx)
+static inline uint32_t sig_current_stack_flags(const ppc32_ctx_t *ctx)
 {
     uint32_t sp = ctx->gpr[PPC32_REG_SP];
 
@@ -158,7 +158,7 @@ static uint32_t sig_current_stack_flags(const ppc32_ctx_t *ctx)
 }
 
 /* Pick the frame base: altstack top with SA_ONSTACK, else current sp. */
-static uint32_t sig_frame_base(const ppc32_ctx_t *ctx, uint32_t flags)
+static inline uint32_t sig_frame_base(const ppc32_ctx_t *ctx, uint32_t flags)
 {
     uint32_t sp = ctx->gpr[PPC32_REG_SP];
 

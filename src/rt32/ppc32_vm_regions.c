@@ -478,6 +478,35 @@ bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
     return false;
 }
 
+/* P32-R3-2: a live A2 MAP_SHARED mapping rounds its host extent up to H
+ * but publishes only [start, end); the [end, H-aligned end) tail stays
+ * shared-backed, so fixed/hint placement intersecting it must be refused. */
+bool ppc32_vm_a2_host_page_busy(uint32_t start, uint32_t end)
+{
+    uint64_t hpsz;
+    size_t i;
+
+    if (start >= end || !vm32_is_a2()) {
+        return false;
+    }
+    hpsz = (uint64_t)vm32_host_page_size();
+    if (hpsz <= (uint64_t)PPC32_PAGE_SIZE) {
+        return false;
+    }
+    for (i = 0U; i < g_vm_region_count; i++) {
+        uint64_t tail = (uint64_t)g_vm_regions[i].end;
+        uint64_t tail_end = (tail + hpsz - 1ULL) & ~(hpsz - 1ULL);
+
+        if ((g_vm_regions[i].flags & 0x01U) == 0U || tail_end == tail) {
+            continue;
+        }
+        if (tail < (uint64_t)end && tail_end > (uint64_t)start) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool vm_check_mapped_range_ex_locked(uint32_t start, uint32_t end,
                                      uint32_t *out_prot, uint32_t *out_flags,
                                      int *out_fd, uint64_t *out_offset,

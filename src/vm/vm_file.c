@@ -476,6 +476,9 @@ int vm_file_shared_acquire(int src_fd, uint64_t file_offset, size_t len,
         }
         if (g_staged[i].file_size != fsz ||
             g_staged[i].mtime != (int64_t)hs.st_mtime) {
+            /* P32-R3-3: write back live alias stores before the refill. */
+            stage_drain_locked(i, file_offset,
+                file_offset + (uint64_t)g_staged[i].staged_len);
             if (g_staged[i].staged_len < need &&
                 ftruncate(g_staged[i].stage_fd, (off_t)need) != 0) {
                 return -errno;

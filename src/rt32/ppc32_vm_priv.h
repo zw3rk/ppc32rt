@@ -66,6 +66,8 @@ int  vm_record_region_ex_locked(uint32_t start, uint32_t end, uint32_t prot,
                                 const char *name);
 int  vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot);
 bool vm_range_overlaps_locked(uint32_t start, uint32_t end);
+/* P32-R3-2: true when [start, end) hits a live A2 shared tail (see below). */
+bool ppc32_vm_a2_host_page_busy(uint32_t start, uint32_t end);
 bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                                   uint32_t *out_prot, uint32_t *out_flags,
                                   char *out_name, size_t name_sz);

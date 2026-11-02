@@ -375,6 +375,9 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         if ((uint64_t)addr + aligned_len > (uint64_t)PPC32_TASK_SIZE_TOP) {
             return (uint32_t)(-ENOMEM);
         }
+        if (ppc32_vm_a2_host_page_busy(addr, (uint32_t)((uint64_t)addr + aligned_len))) {
+            return (uint32_t)(((flags & PPC32_MAP_FIXED_NOREPLACE) != 0U) ? -EEXIST : -ENOMEM);
+        }
         if ((flags & PPC32_MAP_FIXED_NOREPLACE) != 0U &&
             vm_range_overlaps_locked(addr, (uint32_t)((uint64_t)addr + aligned_len))) {
             return (uint32_t)(-EEXIST);
@@ -382,10 +385,10 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         target_va = addr;
     } else {
         uint32_t hint_va = (uint32_t)((uint64_t)addr & ~(gap_align - 1ULL));
-        if (addr != 0U &&
-            hint_va >= PPC32_MMAP_BASE_32 &&
+        if (addr != 0U && hint_va >= PPC32_MMAP_BASE_32 &&
             (uint64_t)hint_va + host_map_len <= (uint64_t)PPC32_MMAP_TOP_32 &&
-            !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + host_map_len))) {
+            !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + host_map_len)) &&
+            !ppc32_vm_a2_host_page_busy(hint_va, (uint32_t)((uint64_t)hint_va + host_map_len))) {
             target_va = hint_va;
         } else if (vm_find_free_gap_aligned_locked(host_map_len, gap_align, &target_va) != 0) {
             return (uint32_t)(-ENOMEM);

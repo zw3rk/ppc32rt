@@ -93,7 +93,7 @@ _Static_assert(UCONTEXT_OFF == 0x80U, "ucontext@0x80");
 _Static_assert(ABIGAP_OFF == 0x520U, "abigap@0x520");
 
 /* BE scalar helpers, sigframe geometry, and SIG_MUST live in
- * signals_priv.h (shared with signals_dispatch.c). */
+ * signals_priv.h (helpers shared by the frame, delivery, and handler paths). */
 
 /* SIGKILL/SIGSTOP can never be caught, blocked, or ignored. */
 int ppc32_sig_is_catchable(int sig)
