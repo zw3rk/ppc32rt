@@ -4,21 +4,9 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements the L4b card of docs/lanes/phase-4.md against the frozen
- * ppc32_ctx_t (src/ppc32rt.h): clone(2) thread creation with
- * CLONE_VM|CLONE_THREAD|CLONE_SETTLS|CLONE_CHILD_CLEARTID, futex
- * WAIT/WAKE/REQUEUE (+PRIVATE), r2 TLS plumbing (E06), set_tid_address,
- * and LL/SC reservation invalidation (SPEC 2.2).
- *
- * Deliberately self-contained: besides ppc32rt.h static inlines this
- * file calls only libc, so it cross-compiles and links on its own
- * (acceptance) and drops into the full binary unchanged. It performs
- * no guest-window mapping changes itself — stacks and thread memory
- * come from the guest via the normal (D19-locked) ppc32_vm_* mmap
- * path — so the only shared mutable state here is the thread table,
- * guarded by its own spinlock. Reservation invalidation is local to
- * each ctx (res_valid + reservation_epoch), which signal delivery
- * (L4a) and engine helpers also bump.
+ * clone(2) thread creation (CLONE_VM|CLONE_THREAD|CLONE_SETTLS|
+ * CLONE_CHILD_CLEARTID), futex WAIT/WAKE/REQUEUE/CMP_REQUEUE, r2 TLS
+ * plumbing, set_tid_address, and LL/SC reservation invalidation.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -49,23 +37,40 @@
  * semantics match ppc32_ld/st32be and ppc32_range_ok for in-window
  * thread words (tid addresses, futex words, TLS area heads). */
 
-static bool thread_range_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len)
+static bool thread_range_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
+    uint32_t need_prot)
 {
     uint64_t end;
 
-    (void)ctx;
+    if (ctx == NULL) {
+        return false;
+    }
     if (len == 0U) {
         return true;
     }
-    if (len > PPC32_TASK_SIZE_TOP) {
+    if (len > PPC32_TASK_SIZE_TOP || va < PPC32_LOW_GUARD_SIZE) {
         return false;
     }
     end = (uint64_t)va + (uint64_t)len;
     if (end > (uint64_t)PPC32_TASK_SIZE_TOP || end < (uint64_t)va) {
         return false;
     }
-    if (va < PPC32_LOW_GUARD_SIZE) {
-        return false;
+    if (ctx->vm_ready || ctx->region_count > 0U) {
+        uint32_t cur = va;
+        size_t i;
+
+        for (i = 0U; i < ctx->region_count && cur < (uint32_t)end; i++) {
+            const ppc32_region_t *r = &ctx->regions[i];
+
+            if (r->end <= cur) {
+                continue;
+            }
+            if (r->start > cur || (r->prot & need_prot) != need_prot) {
+                return false;
+            }
+            cur = (r->end < (uint32_t)end) ? r->end : (uint32_t)end;
+        }
+        return cur >= (uint32_t)end;
     }
     return true;
 }
@@ -277,7 +282,7 @@ static int futex_get_timeout(const ppc32_ctx_t *ctx, uint32_t va,
     uint32_t sec;
     uint32_t nsec;
 
-    if (!thread_range_ok(ctx, va, 8U)) {
+    if (!thread_range_ok(ctx, va, 8U, 1U)) {
         return -EFAULT;
     }
     sec = thread_ld32be(ctx, va);
@@ -309,11 +314,11 @@ long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
         cmd != PPC32_FUTEX_REQUEUE && cmd != PPC32_FUTEX_CMP_REQUEUE) {
         return -ENOSYS;
     }
-    if (!thread_range_ok(ctx, uaddr, 4U)) {
+    if (!thread_range_ok(ctx, uaddr, 4U, 1U)) {
         return -EFAULT;
     }
     if ((cmd == PPC32_FUTEX_REQUEUE || cmd == PPC32_FUTEX_CMP_REQUEUE) &&
-        !thread_range_ok(ctx, uaddr2, 4U)) {
+        !thread_range_ok(ctx, uaddr2, 4U, 1U)) {
         return -EFAULT;
     }
     if (cmd == PPC32_FUTEX_WAIT && timeout_va != 0U) {
@@ -339,10 +344,11 @@ long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
         return futex_host(up, host_op, (int32_t)val, NULL, NULL, 0);
     }
     if (cmd == PPC32_FUTEX_REQUEUE) {
-        return futex_host(up, host_op, (int32_t)val, NULL, up2,
-            (int32_t)val3);
+        return futex_host(up, host_op, (int32_t)val,
+            (const struct timespec *)(uintptr_t)timeout_va, up2, 0);
     }
-    return futex_host(up, host_op, (int32_t)val, NULL, up2,
+    return futex_host(up, host_op, (int32_t)val,
+        (const struct timespec *)(uintptr_t)timeout_va, up2,
         (int32_t)ppc32_be32(val3));
 }
 
@@ -499,7 +505,7 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
         }
     }
     if ((flags & PPC32_CLONE_PARENT_SETTID) != 0U &&
-        !thread_range_ok(parent, parent_tid_va, 4U)) {
+        !thread_range_ok(parent, parent_tid_va, 4U, 2U)) {
         return -EFAULT;
     }
     /* A NULL set/clear pointer means "no record" (the host kernel
@@ -507,11 +513,11 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
      * spawn passes child_tid 0 with CHILD_SETTID|CHILD_CLEARTID — so
      * only validate nonzero pointers instead of failing the clone). */
     if ((flags & PPC32_CLONE_CHILD_SETTID) != 0U && child_tid_va != 0U &&
-        !thread_range_ok(parent, child_tid_va, 4U)) {
+        !thread_range_ok(parent, child_tid_va, 4U, 2U)) {
         return -EFAULT;
     }
     if ((flags & PPC32_CLONE_CHILD_CLEARTID) != 0U && child_tid_va != 0U &&
-        !thread_range_ok(parent, child_tid_va, 4U)) {
+        !thread_range_ok(parent, child_tid_va, 4U, 1U)) {
         return -EFAULT;
     }
     child = (ppc32_ctx_t *)calloc(1, sizeof(ppc32_ctx_t));
@@ -582,7 +588,7 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
             slot->ctx = NULL;
             thread_unlock();
             free(child);
-            return -EAGAIN;
+            return -(long)rc;
         }
         /* Stored before the child can exit, so join is race-free. */
         thread_lock();
@@ -634,7 +640,7 @@ void ppc32_thread_exit(ppc32_ctx_t *child)
     }
     clear_va = child->clear_child_tid;
     child->clear_child_tid = 0U;
-    if (clear_va != 0U && thread_range_ok(child, clear_va, 4U)) {
+    if (clear_va != 0U && thread_range_ok(child, clear_va, 4U, 2U)) {
         int32_t *up = (int32_t *)ppc32_guest_ptr(child, clear_va);
         long woken;
 
@@ -657,18 +663,12 @@ void ppc32_thread_exit(ppc32_ctx_t *child)
     free(child);
 }
 
-/* ---- self-test (acceptance: prints L4B-OK, exit 0) ----
- * Built only with -DPPC32RT_THREADS_TEST, so the normal binary (which
- * compiles every os source next to main.c) never sees a second main(). Runs
- * host-natively or under the aarch64 container; exercises TLS,
- * reservation invalidation, set_tid_address, clone validation and a
- * real CLONE_VM thread round-trip, plus futex WAIT/WAKE. */
+/* ---- self-test (acceptance: prints L4B-OK, exit 0) ---- */
 
 #ifdef PPC32RT_THREADS_TEST
-
 #include <stdio.h>
 
-#define TEST_WIN_SIZE (16U * 1024U * 1024U)
+#define TEST_WIN_SIZE (32U * 1024U * 1024U)
 #define TEST_UADDR 0x01000000U
 #define TEST_TIMEOUT_VA 0x01000100U
 #define TEST_PARENT_TID_VA 0x01000200U
@@ -834,13 +834,13 @@ int main(void)
     thread_st32be(&parent, TEST_TIMEOUT_VA + 4U, 50000000U);
     rc = ppc32_futex(&parent, TEST_UADDR, PPC32_FUTEX_WAIT, 5U,
         TEST_TIMEOUT_VA, 0U, 0U);
-    if (rc != -ETIMEDOUT) {
-        return test_fail("futex-wait-timeout", rc, -ETIMEDOUT);
+    if (rc != -110L) {
+        return test_fail("futex-wait-timeout", rc, -110L);
     }
     rc = ppc32_futex(&parent, TEST_UADDR, PPC32_FUTEX_WAIT, 6U, 0U, 0U,
         0U);
-    if (rc != -EAGAIN) {
-        return test_fail("futex-wait-mismatch", rc, -EAGAIN);
+    if (rc != -11L) {
+        return test_fail("futex-wait-mismatch", rc, -11L);
     }
     rc = ppc32_futex(&parent, TEST_UADDR,
         PPC32_FUTEX_WAKE | PPC32_FUTEX_PRIVATE_FLAG, 1U, 0U, 0U, 0U);

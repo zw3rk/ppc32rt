@@ -46,6 +46,15 @@ uint32_t ppc32_open_flags_host2ppc(uint32_t flags);
 /* Moved here from syscalls.c (RC-H): fcntl dispatch including the
  * 64-bit lock commands 12/13/14 (struct flock64). */
 long sys_fcntl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t cmd, uint32_t arg);
+long sys_close(uint32_t fd);
+long sys_unlink(ppc32_ctx_t *ctx, uint32_t path_va);
+long sys_lseek(uint32_t fd, uint32_t offset, uint32_t whence);
+long sys_llseek(ppc32_ctx_t *ctx, uint32_t fd, uint32_t hi, uint32_t lo,
+    uint32_t res_va, uint32_t whence);
+long sys_stat_path(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
+    uint32_t use64, int nofollow);
+long sys_fstat(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t use64);
+long sys_ioctl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t req, uint32_t arg_va);
 
 /* RC5 dynamic-loading layer (syscalls_dyn.c): access/statx/getcwd/
  * rlimit/dents64/ids. Returns 1 with `*out_ret` set when owned. */

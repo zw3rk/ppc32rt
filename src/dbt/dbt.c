@@ -14,11 +14,9 @@
  * return as recorded by the exit stub (those stubs store nip before
  * returning; see dbt.h).
  *
- * Until lane L2c lands its per-op emitter, a TEMPORARY all-fallback
- * emitter is installed: every instruction refuses emission, so each
- * block is a single exit_undef plus interp_step — exactly interpreter
- * semantics, hence --difftest-clean by construction. ppc32_dbt_set_emitter
- * swaps in the real emitter without touching this file.
+ * Default emitter is dbt_fallback_emit (every instruction refuses native
+ * emission and exits via PPC32_EXIT_UNDEF to interp_step) until main.c or a
+ * test harness installs ppc32_emit_insn via ppc32_dbt_set_emitter.
  */
 
 #include <string.h>
@@ -41,8 +39,9 @@ _Static_assert(offsetof(ppc32_ctx_t, exit_reason) == 0x288U,
 _Static_assert(offsetof(ppc32_ctx_t, exit_dest) == 0x294U,
     "trampoline stores dest @0x294");
 
-/* TEMPORARY all-fallback emitter (delete when L2c lands): refuse every
- * instruction so translation always ends in an interp_step fallback. */
+/* Default all-fallback emitter used until ppc32_dbt_set_emitter installs
+ * ppc32_emit_insn: refuse every instruction so translation falls back to
+ * interp_step. */
 static int dbt_fallback_emit(a64_buf_t *b, const ppc32_insn_t *insn,
     uint32_t pc)
 {
@@ -96,7 +95,6 @@ static bool dbt_store_shape(const ppc32_insn_t *insn, uint32_t *len_out,
     case PPC32_OP_STWX:
     case PPC32_OP_STWUX:
     case PPC32_OP_STWBRX:
-    case PPC32_OP_STWCX:
         len = 4U;
         break;
     case PPC32_OP_STMW:
@@ -666,20 +664,29 @@ int dbt_run(ppc32_ctx_t *ctx)
             ppc32_insn_t stepped;
             uint32_t len = 0U;
             uint32_t back = 0U;
+            uint32_t stwcx_ea = 0U;
+            bool is_stwcx = false;
             bool flush = false;
 
             if (ctx->vm_ready) {
                 memcpy(&raw, ppc32_guest_ptr(ctx, upc), sizeof(raw));
                 memset(&stepped, 0, sizeof(stepped));
-                if (ppc_decode(ppc32_be32(raw), &stepped) == 0 &&
-                    dbt_store_shape(&stepped, &len, &back)) {
-                    flush = true;
+                if (ppc_decode(ppc32_be32(raw), &stepped) == 0) {
+                    if (stepped.op == PPC32_OP_STWCX) {
+                        stwcx_ea = ((stepped.ra == 0U ? 0U :
+                            ctx->gpr[stepped.ra]) + ctx->gpr[stepped.rb]) & ~3U;
+                        is_stwcx = true;
+                    } else if (dbt_store_shape(&stepped, &len, &back)) {
+                        flush = true;
+                    }
                 }
             }
             ctx->nip = upc;
             ctx->exit_reason = PPC32_EXIT_NONE;
             interp_step(ctx);
-            if (flush) {
+            if (is_stwcx) {
+                ppc32_smc_store(ctx, stwcx_ea, 4U, NULL);
+            } else if (flush) {
                 ppc32_cache_invalidate_all(ctx);
             }
             break;

@@ -142,6 +142,10 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         in->op == PPC32_OP_SUBFE || in->op == PPC32_OP_SUBFME ||
         in->op == PPC32_OP_SUBFZE || in->op == PPC32_OP_NEG;
 
+    if (in->oe != 0U && (in->op == PPC32_OP_ADDME || in->op == PPC32_OP_ADDZE ||
+        in->op == PPC32_OP_ADDE || in->op == PPC32_OP_SUBFE)) {
+        return PPC32_EMIT_FALLBACK;
+    }
     if (in->op != PPC32_OP_NEG) {
         ei_ld(b, EI_A, in->ra);
         ei_ld(b, EI_B, in->rb);
@@ -165,9 +169,6 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         break;
     case PPC32_OP_NEG:
         a64_emit_sub_reg_w(b, false, EI_R, A64_ZR, EI_A, A64_SHIFT_LSL, 0U);
-        ei_cmp_imm(b, EI_A, 0U);
-        ei_cset(b, EI_B, A64_COND_EQ); /* CA = (a == 0) */
-        ei_xer_ca_reg(b, EI_B);
         break;
     case PPC32_OP_ADDE:
         /* R = A+B+CA_old; C = carry(A+B) | carry((A+B)+CA_old). The
@@ -236,9 +237,9 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         ei_xer_ca_reg(b, EI_B);
         break;
     }
-    if (in->oe != 0U) {
+    if (in->oe != 0U && in->op != PPC32_OP_NEG) {
         if (is_sub && in->op != PPC32_OP_SUBFC && in->op != PPC32_OP_SUBFE &&
-            in->op != PPC32_OP_SUBF && in->op != PPC32_OP_NEG) {
+            in->op != PPC32_OP_SUBF) {
             /* SUBFME/SUBFZE: ov = (r>>31) != (~a>>31). */
             a64_emit_shift_imm_w(b, EI_T, EI_A, A64_SHIFT_LSR, 31U, false,
                 NULL);
@@ -538,13 +539,15 @@ static int ei_bcxr(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     return PPC32_EMIT_END;
 }
 
-/* tw/twi: one cmp, then one inverted-cond skip per TO bit over the inline
- * trap exit. Falls through (NEXT) when no trap fires. */
+/* tw/twi: one cmp, then one positive-cond branch per enabled TO bit to
+ * the trap exit (OR semantics); falls through (NEXT) when no trap fires. */
 static int ei_trap(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc)
 {
-    uint32_t to = in->rt;
-    size_t cont[5];
-    unsigned ncont = 0U;
+    uint32_t to = in->rt & 31U;
+    size_t hit[5];
+    unsigned nhit = 0U;
+    size_t skip;
+    size_t trap_idx;
     uint32_t i;
 
     if (to == 0U) {
@@ -558,24 +561,27 @@ static int ei_trap(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc)
     }
     ei_cmp_reg(b, EI_A, EI_B);
     if ((to & 16U) != 0U) {
-        cont[ncont++] = a64_emit_b_cond_placeholder(b, A64_COND_PL);
+        hit[nhit++] = a64_emit_b_cond_placeholder(b, A64_COND_LT);
     }
     if ((to & 8U) != 0U) {
-        cont[ncont++] = a64_emit_b_cond_placeholder(b, A64_COND_LE);
+        hit[nhit++] = a64_emit_b_cond_placeholder(b, A64_COND_GT);
     }
     if ((to & 4U) != 0U) {
-        cont[ncont++] = a64_emit_b_cond_placeholder(b, A64_COND_NE);
+        hit[nhit++] = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
     }
     if ((to & 2U) != 0U) {
-        cont[ncont++] = a64_emit_b_cond_placeholder(b, A64_COND_CS);
+        hit[nhit++] = a64_emit_b_cond_placeholder(b, A64_COND_CC);
     }
     if ((to & 1U) != 0U) {
-        cont[ncont++] = a64_emit_b_cond_placeholder(b, A64_COND_LS);
+        hit[nhit++] = a64_emit_b_cond_placeholder(b, A64_COND_HI);
+    }
+    skip = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+    trap_idx = b->count;
+    for (i = 0U; i < nhit; i++) {
+        a64_patch_b_cond(b, hit[i], trap_idx);
     }
     a64_emit_exit_trap(b, pc);
-    for (i = 0U; i < ncont; i++) {
-        a64_patch_b_cond(b, cont[i], b->count);
-    }
+    a64_patch_b_cond(b, skip, b->count);
     return PPC32_EMIT_NEXT;
 }
 
@@ -592,102 +598,6 @@ static int ei_sc(a64_buf_t *b, uint32_t pc)
     a64_emit_movz_w(b, A64_TMP1, PPC32_EXIT_SYSCALL, 0U);
     a64_emit_ret(b);
     return PPC32_EMIT_END;
-}
-
-/* lwarx via LDAXR (+REV): EA must be word-aligned else fallback. */
-static int ei_lwarx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
-    ppc32_emit_ctx_t *e)
-{
-    size_t patch_mis;
-    size_t patch_skip;
-    size_t fb_idx;
-
-    ei_ea_x(b, in->ra, in->rb);
-    ei_guard_low(b, pc);
-    a64_emit_mov_imm32(b, EI_A, 3U);
-    a64_emit_and_reg_w(b, true, A64_ZR, A64_ADDR, EI_A, A64_SHIFT_LSL, 0U);
-    patch_mis = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
-    a64_emit_ldxr_w(b, EI_B, A64_TMP2);
-    a64_emit_rev_w(b, EI_B, EI_B);
-    ei_st(b, EI_B, in->rt);
-    a64_emit_mov_imm32(b, EI_A, 0xFFFFFFFCU);
-    a64_emit_and_reg_w(b, false, EI_A, A64_ADDR, EI_A, A64_SHIFT_LSL, 0U);
-    ei_ctx_st(b, EI_A, (uint32_t)offsetof(ppc32_ctx_t, res_addr));
-    ei_ctx_st(b, EI_B, (uint32_t)offsetof(ppc32_ctx_t, res_val));
-    a64_emit_mov_imm32(b, EI_A, 1U);
-    a64_emit_strb_imm_w(b, EI_A, A64_XCTX,
-        (uint32_t)offsetof(ppc32_ctx_t, res_valid));
-    patch_skip = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    fb_idx = b->count;
-    ppc32_emit_fallback(e, pc);
-    a64_patch_b_cond(b, patch_mis, fb_idx);
-    a64_patch_b_cond(b, patch_skip, b->count);
-    b->gpr_cache_valid = 0;
-    return PPC32_EMIT_NEXT;
-}
-
-/* stwcx. via STLXR: CR0 = [EQ=ok, SO]; reservation cleared either way. */
-static int ei_stwcx(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
-    ppc32_emit_ctx_t *e)
-{
-    size_t patch_mis;
-    size_t patch_skip;
-    size_t patch_noval;
-    size_t patch_nomatch;
-    size_t patch_done;
-    size_t fb_idx;
-    size_t fail_idx;
-
-    ei_ea_x(b, in->ra, in->rb);
-    ei_guard_low(b, pc);
-    a64_emit_mov_imm32(b, EI_A, 3U);
-    a64_emit_and_reg_w(b, true, A64_ZR, A64_ADDR, EI_A, A64_SHIFT_LSL, 0U);
-    patch_mis = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    a64_emit_ldrb_imm_w(b, EI_A, A64_XCTX,
-        (uint32_t)offsetof(ppc32_ctx_t, res_valid));
-    patch_noval = a64_emit_cbz_w_placeholder(b, false, EI_A);
-    ei_ctx_ld(b, EI_B, (uint32_t)offsetof(ppc32_ctx_t, res_addr));
-    a64_emit_mov_imm32(b, EI_T, 0xFFFFFFFCU);
-    a64_emit_and_reg_w(b, false, EI_T, A64_ADDR, EI_T, A64_SHIFT_LSL, 0U);
-    ei_cmp_reg(b, EI_T, EI_B);
-    patch_nomatch = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    /* Match: exclusive store, then ok = (status == 0). */
-    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
-    ei_ld(b, EI_T, in->rs);
-    a64_emit_rev_w(b, EI_T, EI_T);
-    a64_emit_stxr_w(b, EI_T2, EI_T, A64_TMP2);
-    ei_cmp_imm(b, EI_T2, 0U);
-    ei_cset(b, EI_T, A64_COND_EQ);
-    patch_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    /* Mismatch paths: ok = 0. */
-    fail_idx = b->count;
-    a64_emit_movz_w(b, EI_T, 0U, 0U);
-    a64_patch_cbz_w(b, patch_noval, fail_idx);
-    a64_patch_b_cond(b, patch_nomatch, fail_idx);
-    /* Shared tail: clear reservation, bump epoch, set CR0. */
-    a64_emit_strb_imm_w(b, A64_ZR, A64_XCTX,
-        (uint32_t)offsetof(ppc32_ctx_t, res_valid));
-    ei_epoch_bump(b);
-    a64_emit_shift_imm_w(b, EI_T, EI_T, A64_SHIFT_LSL, 29U, false, NULL);
-    ei_ctx_ld(b, EI_X, (uint32_t)offsetof(ppc32_ctx_t, xer));
-    a64_emit_shift_imm_w(b, EI_B, EI_X, A64_SHIFT_LSR, 3U, false, NULL);
-    a64_emit_mov_imm32(b, EI_T2, 0x10000000U);
-    a64_emit_and_reg_w(b, false, EI_B, EI_B, EI_T2, A64_SHIFT_LSL, 0U);
-    a64_emit_orr_reg_w(b, EI_T, EI_T, EI_B, A64_SHIFT_LSL, 0U);
-    ei_ctx_ld(b, EI_B, (uint32_t)offsetof(ppc32_ctx_t, cr));
-    a64_emit_mov_imm32(b, EI_T2, 0xF0000000U);
-    a64_emit_bic_reg_w(b, false, EI_B, EI_B, EI_T2, A64_SHIFT_LSL, 0U);
-    a64_emit_orr_reg_w(b, EI_B, EI_B, EI_T, A64_SHIFT_LSL, 0U);
-    ei_ctx_st(b, EI_B, (uint32_t)offsetof(ppc32_ctx_t, cr));
-    patch_skip = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    fb_idx = b->count;
-    ppc32_emit_fallback(e, pc);
-    a64_patch_b_cond(b, patch_mis, fb_idx);
-    a64_patch_b_cond(b, patch_done, fail_idx + 1U); /* over movz to tail */
-    a64_patch_b_cond(b, patch_skip, b->count);
-    b->gpr_cache_valid = 0;
-    return PPC32_EMIT_NEXT;
 }
 
 static int ei_dcbz(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc)
@@ -845,17 +755,21 @@ int ppc32_emit_int(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn, uint32_t pc)
     case PPC32_OP_STHBRX:
         return ei_mem(b, insn, true, pc);
     case PPC32_OP_LWARX:
-        return ei_lwarx(b, insn, pc, e);
     case PPC32_OP_STWCX:
-        return ei_stwcx(b, insn, pc, e);
+        /* Route through interpreter fallback so Soft-TLB permission checks,
+         * COW promotion, and g_ll_table / g_ll_generation LL/SC tracking
+         * apply uniformly on both Regime A1 and Regime A2 (P32-4). */
+        return PPC32_EMIT_FALLBACK;
     case PPC32_OP_TWI:
     case PPC32_OP_TW:
         return ei_trap(b, insn, pc);
     case PPC32_OP_SC:
         return ei_sc(b, pc);
     case PPC32_OP_SYNC:
+        a64_emit_dmb_ish(b);
+        return PPC32_EMIT_NEXT;
     case PPC32_OP_DCBT:
-        return PPC32_EMIT_NEXT; /* cache-hint / barrier nop */
+        return PPC32_EMIT_NEXT; /* cache-hint nop */
     case PPC32_OP_DCBZ:
         return ei_dcbz(b, insn, pc);
     default:

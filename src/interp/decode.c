@@ -340,12 +340,16 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_TW;
         return 0;
     case 8u:
+    case 8u | 512u:
+        out->xo = 8u;
         out->op = (uint32_t)PPC32_OP_SUBFC;
         return 0;
     case 9u:
         out->op = (uint32_t)PPC32_OP_MULHDU;
         return 0;
     case 10u:
+    case 10u | 512u:
+        out->xo = 10u;
         out->op = (uint32_t)PPC32_OP_ADDC;
         return 0;
     case 11u:
@@ -373,6 +377,8 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_CMPL;
         return 0;
     case 40u:
+    case 40u | 512u:
+        out->xo = 40u;
         out->op = (uint32_t)PPC32_OP_SUBF;
         return 0;
     case 55u:
@@ -388,6 +394,8 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_LBZX;
         return 0;
     case 104u:
+    case 104u | 512u:
+        out->xo = 104u;
         out->op = (uint32_t)PPC32_OP_NEG;
         return 0;
     case 119u:
@@ -397,9 +405,13 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_NOR;
         return 0;
     case 136u:
+    case 136u | 512u:
+        out->xo = 136u;
         out->op = (uint32_t)PPC32_OP_SUBFE;
         return 0;
     case 138u:
+    case 138u | 512u:
+        out->xo = 138u;
         out->op = (uint32_t)PPC32_OP_ADDE;
         return 0;
     case 144u: /* mtcrf: FXM mask (bits 12-19) rides in ui */
@@ -416,21 +428,31 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_STWUX;
         return 0;
     case 200u:
+    case 200u | 512u:
+        out->xo = 200u;
         out->op = (uint32_t)PPC32_OP_SUBFZE;
         return 0;
     case 202u:
+    case 202u | 512u:
+        out->xo = 202u;
         out->op = (uint32_t)PPC32_OP_ADDZE;
         return 0;
     case 215u:
         out->op = (uint32_t)PPC32_OP_STBX;
         return 0;
     case 232u:
+    case 232u | 512u:
+        out->xo = 232u;
         out->op = (uint32_t)PPC32_OP_SUBFME;
         return 0;
     case 234u:
+    case 234u | 512u:
+        out->xo = 234u;
         out->op = (uint32_t)PPC32_OP_ADDME;
         return 0;
     case 235u:
+    case 235u | 512u:
+        out->xo = 235u;
         out->op = (uint32_t)PPC32_OP_MULLW;
         return 0;
     case 246u: /* dcbtst (ANALYTICAL XO): cache-hint nop */
@@ -442,6 +464,8 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_STBUX;
         return 0;
     case 266u:
+    case 266u | 512u:
+        out->xo = 266u;
         out->op = (uint32_t)PPC32_OP_ADD;
         return 0;
     case 279u:
@@ -479,6 +503,8 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_OR;
         return 0;
     case 459u:
+    case 459u | 512u:
+        out->xo = 459u;
         out->op = (uint32_t)PPC32_OP_DIVWU;
         return 0;
     case 467u: /* mtspr: 10-bit SPR number rides in ui */
@@ -489,6 +515,8 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_NAND;
         return 0;
     case 491u:
+    case 491u | 512u:
+        out->xo = 491u;
         out->op = (uint32_t)PPC32_OP_DIVW;
         return 0;
     case 512u:

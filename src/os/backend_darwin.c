@@ -195,58 +195,6 @@ int rt_host_create_shared_mem(const char *name, size_t size,
 #endif
 }
 
-int rt_host_protect(void *host_addr, size_t len, int linux_prot)
-{
-#if defined(__APPLE__)
-    if (mprotect(host_addr, len, linux_prot) != 0) {
-        return -errno;
-    }
-    return 0;
-#else
-    (void)host_addr; (void)len; (void)linux_prot;
-    return -ENOSYS;
-#endif
-}
-
-int rt_host_unmap(void *host_addr, size_t len)
-{
-#if defined(__APPLE__)
-    if (munmap(host_addr, len) != 0) {
-        return -errno;
-    }
-    return 0;
-#else
-    (void)host_addr; (void)len;
-    return -ENOSYS;
-#endif
-}
-
-int rt_host_msync(void *host_addr, size_t len, int linux_flags)
-{
-#if defined(__APPLE__)
-    if (msync(host_addr, len, linux_flags) != 0) {
-        return -errno;
-    }
-    return 0;
-#else
-    (void)host_addr; (void)len; (void)linux_flags;
-    return -ENOSYS;
-#endif
-}
-
-int rt_host_madvise(void *host_addr, size_t len, int linux_advice)
-{
-#if defined(__APPLE__)
-    if (madvise(host_addr, len, linux_advice) != 0) {
-        return -errno;
-    }
-    return 0;
-#else
-    (void)host_addr; (void)len; (void)linux_advice;
-    return -ENOSYS;
-#endif
-}
-
 void *rt_host_jit_alloc(size_t size)
 {
 #if defined(__APPLE__)
@@ -383,26 +331,14 @@ void rt_host_worker_sync_destroy(rt_worker_sync_t *ws)
     ws->wake_pipe_wr = -1;
 }
 
-void rt_host_worker_notify_signal(rt_worker_sync_t *ws)
-{
-    char one = 1;
-
-    if (ws == NULL) {
-        return;
-    }
-    atomic_fetch_add_explicit(&ws->sig_seq, 1U, memory_order_seq_cst);
-    if (ws->wake_pipe_wr >= 0) {
-        (void)write(ws->wake_pipe_wr, &one, 1U);
-    }
-}
-
 int rt_host_preempt_worker(uint64_t host_tid)
 {
 #if defined(__APPLE__)
     pthread_t th = (pthread_t)(uintptr_t)host_tid;
+    int rc = pthread_kill(th, SIGUSR2);
 
-    if (pthread_kill(th, SIGUSR2) != 0) {
-        return -errno;
+    if (rc != 0) {
+        return -rc;
     }
     return 0;
 #else
@@ -482,19 +418,6 @@ int64_t rt_host_openat(int dirfd, const char *path, int linux_flags,
     return (int64_t)fd;
 }
 
-int64_t rt_host_close(int fd)
-{
-#if defined(__APPLE__)
-    if (close(fd) != 0) {
-        return (int64_t)-errno;
-    }
-    return 0;
-#else
-    (void)fd;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
 /* Shared kevent-gated non-blocking transfer for read (is_write = 0)
  * and write (is_write != 0). */
 static int64_t darwin_transfer(int fd, void *buf, size_t count,
@@ -548,65 +471,6 @@ int64_t rt_host_write(int fd, const void *buf, size_t count,
 #endif
 }
 
-int64_t rt_host_pread64(int fd, void *buf, size_t count, int64_t offset)
-{
-#if defined(__APPLE__)
-    ssize_t r = pread(fd, buf, count, (off_t)offset);
-
-    if (r < 0) {
-        return (int64_t)-errno;
-    }
-    return (int64_t)r;
-#else
-    (void)fd; (void)buf; (void)count; (void)offset;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
-int64_t rt_host_pwrite64(int fd, const void *buf, size_t count,
-    int64_t offset)
-{
-#if defined(__APPLE__)
-    ssize_t r = pwrite(fd, buf, count, (off_t)offset);
-
-    if (r < 0) {
-        return (int64_t)-errno;
-    }
-    return (int64_t)r;
-#else
-    (void)fd; (void)buf; (void)count; (void)offset;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
-int64_t rt_host_lseek(int fd, int64_t offset, int linux_whence)
-{
-#if defined(__APPLE__)
-    off_t r = lseek(fd, (off_t)offset, linux_whence);
-
-    if (r == (off_t)-1) {
-        return (int64_t)-errno;
-    }
-    return (int64_t)r;
-#else
-    (void)fd; (void)offset; (void)linux_whence;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
-int64_t rt_host_ftruncate(int fd, int64_t length)
-{
-#if defined(__APPLE__)
-    if (ftruncate(fd, (off_t)length) != 0) {
-        return (int64_t)-errno;
-    }
-    return 0;
-#else
-    (void)fd; (void)length;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
 int64_t rt_host_fsync(int fd, int datasync_only)
 {
 #if defined(__APPLE__)
@@ -632,45 +496,6 @@ int64_t rt_host_getdents64(int fd, void *linux_dirent64_buf,
      * dirent64; translation lands with the convert.c lane. */
     (void)fd; (void)linux_dirent64_buf; (void)buf_size;
     return (int64_t)-ENOSYS;
-}
-
-int64_t rt_host_fcntl(int fd, int linux_cmd, uint64_t arg)
-{
-#if defined(__APPLE__)
-    int r = fcntl(fd, linux_cmd, (long)arg);
-
-    if (r < 0) {
-        return (int64_t)-errno;
-    }
-    return (int64_t)r;
-#else
-    (void)fd; (void)linux_cmd; (void)arg;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
-int64_t rt_host_dup(int oldfd)
-{
-#if defined(__APPLE__)
-    int r = dup(oldfd);
-
-    if (r < 0) {
-        return (int64_t)-errno;
-    }
-    return (int64_t)r;
-#else
-    (void)oldfd;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
-int64_t rt_host_pipe2(int fds[2], int linux_flags)
-{
-    (void)linux_flags;
-    if (pipe(fds) != 0) {
-        return (int64_t)-errno;
-    }
-    return 0;
 }
 
 int64_t rt_host_futex_wait(_Atomic uint32_t *pinned_host_uaddr,
@@ -747,16 +572,6 @@ int64_t rt_host_futex_wake(_Atomic uint32_t *pinned_host_uaddr,
 #endif
 }
 
-int64_t rt_host_clock_gettime(int linux_clk_id, struct timespec *tp)
-{
-    clockid_t id = (linux_clk_id == 1) ? CLOCK_MONOTONIC : CLOCK_REALTIME;
-
-    if (clock_gettime(id, tp) != 0) {
-        return (int64_t)-errno;
-    }
-    return 0;
-}
-
 int64_t rt_host_clock_nanosleep(int linux_clk_id, int linux_flags,
     const struct timespec *req, struct timespec *rem,
     rt_worker_sync_t *ws, uint32_t expected_seq)
@@ -768,128 +583,8 @@ int64_t rt_host_clock_nanosleep(int linux_clk_id, int linux_flags,
     return 0;
 }
 
-typedef struct {
-    void *(*fn)(void *);
-    void *arg;
-} spawn_slot_t;
-
-static void *spawn_tramp(void *arg)
-{
-    spawn_slot_t *slot = (spawn_slot_t *)arg;
-    void *(*fn)(void *) = slot->fn;
-    void *fnarg = slot->arg;
-
-    free(slot);
-    return fn(fnarg);
-}
-
-int rt_host_spawn_worker(void *(*fn)(void *), void *arg,
-    uint64_t *out_host_tid)
-{
-    pthread_t th;
-    spawn_slot_t *slot;
-
-    if (fn == NULL) {
-        return -EINVAL;
-    }
-    slot = (spawn_slot_t *)malloc(sizeof *slot);
-    if (slot == NULL) {
-        return -ENOMEM;
-    }
-    slot->fn = fn;
-    slot->arg = arg;
-    if (pthread_create(&th, NULL, spawn_tramp, slot) != 0) {
-        int e = errno;
-
-        free(slot);
-        return -e;
-    }
-    (void)pthread_detach(th);
-    if (out_host_tid != NULL) {
-        *out_host_tid = (uint64_t)(uintptr_t)th;
-    }
-    return 0;
-}
-
-int64_t rt_host_fork(void)
-{
-#if defined(__APPLE__)
-    pid_t r = fork();
-
-    if (r < 0) {
-        return (int64_t)-errno;
-    }
-    return (int64_t)r;
-#else
-    return (int64_t)-ENOSYS;
-#endif
-}
-
-int64_t rt_host_wait4(int64_t pid, int *linux_status_out,
-    int linux_options, rt_worker_sync_t *ws, uint32_t expected_seq)
-{
-#if defined(__APPLE__)
-    pid_t r;
-
-    (void)ws; (void)expected_seq;
-    r = waitpid((pid_t)pid, linux_status_out, linux_options);
-    if (r < 0) {
-        return (int64_t)-errno;
-    }
-    return (int64_t)r;
-#else
-    (void)pid; (void)linux_status_out; (void)linux_options; (void)ws; (void)expected_seq;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
-int64_t rt_host_kill(int64_t pid, int linux_sig)
-{
-#if defined(__APPLE__)
-    if (kill((pid_t)pid, linux_sig) != 0) {
-        return (int64_t)-errno;
-    }
-    return 0;
-#else
-    (void)pid; (void)linux_sig;
-    return (int64_t)-ENOSYS;
-#endif
-}
-
 int64_t rt_host_tgkill(int64_t tgid, int64_t tid, int linux_sig)
 {
     (void)tgid; (void)tid; (void)linux_sig;
     return (int64_t)-ENOSYS;
-}
-
-void rt_host_exit_thread(int status)
-{
-    _Exit(status);
-}
-
-void rt_host_exit_group(int status)
-{
-    exit(status);
-}
-
-int rt_host_install_signal_handlers(rt_host_sync_fault_fn on_sync_fault,
-    rt_host_async_sig_fn on_async_sig, rt_host_preempt_fn on_preempt)
-{
-#if defined(__APPLE__)
-    struct sigaction sa;
-
-    (void)on_sync_fault; (void)on_async_sig; (void)on_preempt;
-    (void)memset(&sa, 0, sizeof sa);
-    sa.sa_handler = SIG_IGN;
-    (void)sigemptyset(&sa.sa_mask);
-    /* Reserve SIGUSR2 as the DBT preemption signal (C3); the quiescence
-     * handler itself lands with the threads/signals lane. */
-    if (sigaction(SIGUSR2, &sa, NULL) != 0) {
-        return -errno;
-    }
-    return 0;
-#else
-    (void)on_sync_fault; (void)on_async_sig; (void)on_preempt;
-    return -ENOSYS;
-#endif
 }

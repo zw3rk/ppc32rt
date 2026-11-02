@@ -216,39 +216,8 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
     return (long)total;
 }
 
-/* File opens live in syscalls_file.c (PPC/host O_* translation). */
-
-static long sys_close(uint32_t fd)
-{
-    if (close((int)fd) != 0) {
-        return -(long)errno;
-    }
-    return 0;
-}
-
-/* RC2: glibc remove() lowers to classic unlink(10) (qemu-strace proven). */
-static long sys_unlink(ppc32_ctx_t *ctx, uint32_t path_va)
-{
-    char path[PPC32_PATH_MAX];
-
-    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
-        return -EFAULT;
-    }
-    if (unlink(path) != 0) {
-        return -(long)errno;
-    }
-    return 0;
-}
-
-static long sys_lseek(uint32_t fd, uint32_t offset, uint32_t whence)
-{
-    off_t r = lseek((int)fd, (off_t)(int32_t)offset, (int)whence);
-
-    if (r == (off_t)-1) {
-        return -(long)errno;
-    }
-    return (long)r;
-}
+/* File opens, close, unlink, lseek, llseek, stat, and ioctl live in
+ * syscalls_file.c. */
 
 /* Provider-A truncate hook: the host call resizes first; only then
  * does the mem layer discard/regrow translations (section 4.5). The
@@ -259,24 +228,6 @@ static long sys_ftruncate(uint32_t fd, uint32_t length)
         return -(long)errno;
     }
     (void)vm_file_on_truncate_fd((int)fd, (uint64_t)length);
-    return 0;
-}
-
-/* Bonus (file I/O): ppc llseek(140) carries the 64-bit offset as a
- * high/low word pair and stores the result through a BE u64 pointer. */
-static long sys_llseek(ppc32_ctx_t *ctx, uint32_t fd, uint32_t hi,
-    uint32_t lo, uint32_t res_va, uint32_t whence)
-{
-    int64_t off = ((int64_t)(int32_t)hi << 32) | (int64_t)(uint64_t)lo;
-    off_t r = lseek((int)fd, (off_t)off, (int)whence);
-
-    if (r == (off_t)-1) {
-        return -(long)errno;
-    }
-    if (!ppc32_range_ok(res_va, 8U)) {
-        return -EFAULT;
-    }
-    ppc32_st64be(ctx, res_va, (uint64_t)(int64_t)r);
     return 0;
 }
 
@@ -347,37 +298,6 @@ static long sys_uname(ppc32_ctx_t *ctx, uint32_t buf_va)
         }
     }
     return 0;
-}
-
-static long sys_stat_path(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
-    uint32_t use64, int nofollow)
-{
-    char path[PPC32_PATH_MAX];
-    struct stat hs;
-
-    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
-        return -EFAULT;
-    }
-    if ((nofollow ? lstat(path, &hs) : stat(path, &hs)) != 0) {
-        return -(long)errno;
-    }
-    if (use64 != 0U) {
-        return (long)ppc32_put_stat64(ctx, buf_va, &hs);
-    }
-    return (long)ppc32_put_stat(ctx, buf_va, &hs);
-}
-
-static long sys_fstat(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t use64)
-{
-    struct stat hs;
-
-    if (fstat((int)fd, &hs) != 0) {
-        return -(long)errno;
-    }
-    if (use64 != 0U) {
-        return (long)ppc32_put_stat64(ctx, buf_va, &hs);
-    }
-    return (long)ppc32_put_stat(ctx, buf_va, &hs);
 }
 
 static long sys_clock_gettime(ppc32_ctx_t *ctx, uint32_t clk, uint32_t ts_va,
@@ -529,87 +449,6 @@ static int sync_kid_reap(ppc32_ctx_t *ctx, uint32_t pid_va,
     return 0;
 }
 
-/* ioctl allowlist: only pure-status queries plus termios and winsize
- * cross the boundary; everything else takes -ENOSYS rather than leaking
- * host ioctls to the guest. The allowlisted request numbers are
- * asm-generic on Linux, so the guest values compare directly against
- * the host macros. */
-static long sys_ioctl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t req, uint32_t arg_va)
-{
-#ifdef __linux__
-    switch (req) {
-    case 0x5401U: /* TCGETS */
-    {
-        struct termios hs;
-
-        if (ioctl((int)fd, TCGETS, &hs) != 0) {
-            return -(long)errno;
-        }
-        return (long)ppc32_termios_to_guest(ctx, arg_va, &hs);
-    }
-    case 0x5402U: /* TCSETS */
-    case 0x5403U: /* TCSETSW */
-    case 0x5404U: /* TCSETSF */
-    {
-        struct termios hs;
-        int kind = (req == 0x5402U) ? TCSANOW :
-            (req == 0x5403U) ? TCSADRAIN : TCSAFLUSH;
-
-        if (ppc32_termios_from_guest(ctx, arg_va, &hs) != 0) {
-            return -EFAULT;
-        }
-        if (tcsetattr((int)fd, kind, &hs) != 0) {
-            return -(long)errno;
-        }
-        return 0;
-    }
-    case 0x5413U: /* TIOCGWINSZ */
-    {
-        struct winsize hs;
-
-        if (ioctl((int)fd, TIOCGWINSZ, &hs) != 0) {
-            return -(long)errno;
-        }
-        return (long)ppc32_winsize_to_guest(ctx, arg_va, &hs);
-    }
-    case 0x5414U: /* TIOCSWINSZ */
-    {
-        struct winsize hs;
-
-        if (ppc32_winsize_from_guest(ctx, arg_va, &hs) != 0) {
-            return -EFAULT;
-        }
-        if (ioctl((int)fd, TIOCSWINSZ, &hs) != 0) {
-            return -(long)errno;
-        }
-        return 0;
-    }
-    case 0x541BU: /* FIONREAD */
-    {
-        int n = 0;
-
-        if (ioctl((int)fd, FIONREAD, &n) != 0) {
-            return -(long)errno;
-        }
-        if (!ppc32_range_ok(arg_va, 4U)) {
-            return -EFAULT;
-        }
-        ppc32_st32be(ctx, arg_va, (uint32_t)n);
-        return 0;
-    }
-    default:
-        break;
-    }
-    return -ENOSYS;
-#else
-    (void)ctx;
-    (void)fd;
-    (void)req;
-    (void)arg_va;
-    return -ENOSYS;
-#endif
-}
-
 int ppc32_syscall_is_exit(uint32_t nr)
 {
     return (nr == PPC32_NR_EXIT || nr == PPC32_NR_EXIT_GROUP) ? 1 : 0;
@@ -628,6 +467,9 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
 
     if (ctx == NULL) {
         return;
+    }
+    if (ctx->vm_ready) {
+        ppc32_vm_sync_ctx(ctx);
     }
     nr = ctx->gpr[0];
     a0 = ctx->gpr[3];
@@ -707,10 +549,11 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     case PPC32_NR_READ:
         ret = sys_read_at(ctx, a0, a1, a2, false, 0);
         break;
-    case PPC32_NR_PREAD64:
-        ret = sys_read_at(ctx, a0, a1, a2, true,
-            ((int64_t)(int32_t)a3 << 32) | (int64_t)a4);
+    case PPC32_NR_PREAD64: {
+        uint64_t uoff = ((uint64_t)a3 << 32U) | (uint64_t)a4;
+        ret = sys_read_at(ctx, a0, a1, a2, true, (off_t)(int64_t)uoff);
         break;
+    }
     case PPC32_NR_WRITE:
         ret = sys_write(ctx, a0, a1, a2);
         break;

@@ -38,7 +38,8 @@
 /* Execute exactly one guest instruction at ctx->nip (SPEC section 2.2).
  * Advances nip by 4 (no delay slots on PPC) or to a taken branch target.
  * Terminal instructions set ctx->exit_reason (SYSCALL/UNDEF/FAULT/TRAP);
- * sc also advances nip past itself and clears the lwarx reservation.
+ * sc leaves nip at the sc word (the syscall layer advances past it) and
+ * clears the lwarx reservation.
  * Unknown words set PPC32_EXIT_UNDEF and leave nip at the faulting word. */
 void interp_step(ppc32_ctx_t *ctx);
 
@@ -628,6 +629,106 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         ctx->gpr[insn->rt] = loaded;
     }
     ctx->nip += 4U;
+}
+
+static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
+    const ppc32_insn_t *insn, uint32_t raw)
+{
+    switch (insn->op) {
+    case PPC32_OP_CR: {
+        uint32_t ba = (raw >> 16U) & 31U;
+        uint32_t bb = (raw >> 11U) & 31U;
+        uint32_t bd = (raw >> 21U) & 31U;
+        uint32_t abit = cr_bit(ctx, ba);
+        uint32_t bbit = cr_bit(ctx, bb);
+        uint32_t out = 0U;
+
+        switch (insn->xo) {
+        case 257u: out = abit & bbit; break;
+        case 129u: out = abit & (bbit ^ 1U); break;
+        case 449u: out = abit | bbit; break;
+        case 417u: out = abit | (bbit ^ 1U); break;
+        case 193u: out = abit ^ bbit; break;
+        case 225u: out = (abit & bbit) ^ 1U; break;
+        case 33u:  out = (abit | bbit) ^ 1U; break;
+        default:   out = (abit ^ bbit) ^ 1U; break;
+        }
+        if (out != 0U) {
+            ctx->cr |= 0x80000000U >> bd;
+        } else {
+            ctx->cr &= ~(0x80000000U >> bd);
+        }
+        ctx->nip += 4U;
+        break;
+    }
+    case PPC32_OP_MCRF: {
+        uint32_t crd = (raw >> 23U) & 7U;
+        uint32_t crs = (raw >> 18U) & 7U;
+        uint32_t v = (ctx->cr >> ((7U - crs) * 4U)) & 0xFU;
+
+        ctx->cr = (ctx->cr & ~(0xFU << ((7U - crd) * 4U))) |
+            (v << ((7U - crd) * 4U));
+        ctx->nip += 4U;
+        break;
+    }
+    case PPC32_OP_MCRXR: {
+        uint32_t crd = (raw >> 23U) & 7U;
+        uint32_t v = (ctx->xer >> 28U) & 0xFU;
+
+        ctx->cr = (ctx->cr & ~(0xFU << ((7U - crd) * 4U))) |
+            (v << ((7U - crd) * 4U));
+        ctx->xer &= 0x0FFFFFFFU;
+        ctx->nip += 4U;
+        break;
+    }
+    case PPC32_OP_MFCR:
+        ctx->gpr[insn->rt] = ctx->cr;
+        ctx->nip += 4U;
+        break;
+    case PPC32_OP_MTCRF: {
+        uint32_t crm = (raw >> 12U) & 0xFFU;
+        uint32_t i;
+
+        for (i = 0U; i < 8U; i++) {
+            if (((crm >> (7U - i)) & 1U) != 0U) {
+                uint32_t shift = (7U - i) * 4U;
+                ctx->cr = (ctx->cr & ~(0xFU << shift)) |
+                    ((ctx->gpr[insn->rs] >> shift) & 0xFU) << shift;
+            }
+        }
+        ctx->nip += 4U;
+        break;
+    }
+    default: {
+        uint32_t spr = (((raw >> 11U) & 31U) << 5U) | ((raw >> 16U) & 31U);
+
+        if (insn->op == PPC32_OP_MFSPR) {
+            switch (spr) {
+            case PPC32_SPR_XER: ctx->gpr[insn->rt] = ctx->xer; break;
+            case PPC32_SPR_LR:  ctx->gpr[insn->rt] = ctx->lr; break;
+            case PPC32_SPR_CTR: ctx->gpr[insn->rt] = ctx->ctr; break;
+            case 268U:
+            case 269U:          ctx->gpr[insn->rt] = 0U; break;
+            case PPC32_SPR_PVR:
+                ctx->gpr[insn->rt] = (ctx->profile == PPC32_PROFILE_SPE) ?
+                    PPC32_PVR_E500V2 : PPC32_PVR_750;
+                break;
+            default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
+            }
+        } else {
+            switch (spr) {
+            case PPC32_SPR_XER: ctx->xer = ctx->gpr[insn->rs]; break;
+            case PPC32_SPR_LR:  ctx->lr = ctx->gpr[insn->rs]; break;
+            case PPC32_SPR_CTR: ctx->ctr = ctx->gpr[insn->rs]; break;
+            default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
+            }
+        }
+        if (ctx->exit_reason == PPC32_EXIT_NONE) {
+            ctx->nip += 4U;
+        }
+        break;
+    }
+    }
 }
 
 #endif /* PPC32RT_INTERP_INTERP_H */

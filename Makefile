@@ -90,8 +90,13 @@ $(OBJ_DIR)/%.o: src/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: ## Run the test suite (none yet; fixtures arrive in Phase 1)
-	@echo "phase 0: no tests yet"
+test: check-abi-invariants build-darwin ## Run host ABI and P32 defect regression suites
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_defects.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_defects && \
+	./$(BUILD_DIR)/check_p32_defects
 
 # macOS hides MAP_ANON (no MAP_ANONYMOUS) once _POSIX_C_SOURCE is
 # defined, which would break the host syntax check below; the Linux/musl
@@ -118,15 +123,15 @@ check: check-line-limits check-abi-invariants ## Host-cc syntax check of every s
 	done
 	@echo "syntax check OK ($$(echo $(SRCS) | wc -w | tr -d ' ') files)"
 
-check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
-	@over=$$(for f in $$(find src -name '*.c' -o -name '*.h' -o -name '*.S'); do \
+check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
+	@over=$$(for f in $$(find src include tests -name '*.c' -o -name '*.h' -o -name '*.S'); do \
 		n=$$(wc -l < "$$f"); \
 		if [ "$$n" -gt 900 ]; then echo "$$f: $$n lines"; fi; \
 	done); \
 	if [ -n "$$over" ]; then \
 		echo "files over the 900-line limit:"; echo "$$over"; exit 1; \
 	fi; \
-	echo "line limits OK (all src .c/.h/.S <= 900 lines)"
+	echo "line limits OK (all src/include/tests .c/.h/.S <= 900 lines)"
 
 HOST_CC ?= cc
 

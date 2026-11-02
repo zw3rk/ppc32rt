@@ -79,6 +79,8 @@ typedef struct ppc32_region {
     uint32_t end;
     uint32_t prot;
     uint32_t flags;
+    int      fd;
+    uint64_t offset;
     char     name[64];
 } ppc32_region_t;
 
@@ -233,6 +235,10 @@ typedef struct ppc32_ctx {
      * file page). Set by interp fault() and the host-fault guard; read by
      * deliver_sync. Zero (no fault recorded) delivers as SIGSEGV. */
     uint32_t fault_signo;
+
+    /* Per-thread LL/SC epoch snapshots (P32-10: no shared-slot race). */
+    uint64_t res_snap;
+    uint64_t res_gensnap;
 
 } ppc32_ctx_t;
 

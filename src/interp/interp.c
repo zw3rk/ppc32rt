@@ -22,14 +22,38 @@
 #include "vm/vm32.h"
 
 /* lwarx/stwcx. lines (Wave U3 §4.4): SEQ_CST epoch + owner/addr/val snapshot (vm/vm32.h). */
-typedef struct { uint64_t epoch; uint64_t snap; uint64_t gensnap; const ppc32_ctx_t *owner; uint32_t addr; uint32_t val; } ppc32_ll_line_t;
+typedef struct {
+    uint64_t epoch;
+    const ppc32_ctx_t *owner;
+    uint32_t addr;
+    uint32_t val;
+} ppc32_ll_line_t;
+
 static ppc32_ll_line_t g_ll_table[1024];
+static _Atomic uint32_t g_ll_lock = 0U;
 
 /* Shared mapping generation (RC-U3-r2 #1): guest-mm teardowns bump it
  * via vm32_ll_note_remap, so a pre-teardown reservation can never
  * succeed after it (line epochs alone cannot see a remap). */
 static uint64_t g_ll_generation;
 void vm32_ll_note_remap(void) { __atomic_fetch_add(&g_ll_generation, 1ULL, __ATOMIC_SEQ_CST); }
+
+void vm32_ll_record(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
+{
+    uint32_t al = gva_aligned & ~3U;
+    uint32_t h = (al >> 6U) & 1023U;
+
+    ppc32_spin_lock(&g_ll_lock);
+    ctx->res_addr = al;
+    ctx->res_val = val;
+    ctx->res_valid = 1;
+    ctx->res_snap = __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST);
+    ctx->res_gensnap = __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST);
+    g_ll_table[h].owner = ctx;
+    g_ll_table[h].addr = al;
+    g_ll_table[h].val = val;
+    ppc32_spin_unlock(&g_ll_lock);
+}
 
 /* STWCX. as one SEQ_CST compare-exchange (vm/vm32.h): shared mapping
  * generation + reservation_valid/addr gate the store; consumed either way. */
@@ -40,16 +64,23 @@ bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
     uint32_t *hva = (uint32_t *)ppc32_guest_ptr(ctx, al);
     uint32_t exp = ppc32_be32(ctx->res_val);
     uint32_t des = ppc32_be32(val);
-    bool ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx &&
-        g_ll_table[h].addr == al && g_ll_table[h].val == ctx->res_val &&
-        __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST) == g_ll_table[h].snap &&
-        __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST) == g_ll_table[h].gensnap &&
-        __atomic_compare_exchange_n(hva, &exp, des, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    bool ok;
 
-    if (ok) { __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST); }
+    ppc32_spin_lock(&g_ll_lock);
+    ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx &&
+        g_ll_table[h].addr == al && g_ll_table[h].val == ctx->res_val &&
+        __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST) == ctx->res_snap &&
+        __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST) == ctx->res_gensnap &&
+        __atomic_compare_exchange_n(hva, &exp, des, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (ok) {
+        __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST);
+    }
     ctx->res_valid = 0;
-    g_ll_table[h].owner = NULL;
+    if (g_ll_table[h].owner == ctx) {
+        g_ll_table[h].owner = NULL;
+    }
     ctx->reservation_epoch++;
+    ppc32_spin_unlock(&g_ll_lock);
     return ok;
 }
 
@@ -247,7 +278,6 @@ void interp_step(ppc32_ctx_t *ctx)
         a = ctx->gpr[insn.ra];
         r = (uint32_t)(0U - a);
         ctx->gpr[insn.rt] = r;
-        xer_set_ca(ctx, a == 0U);
         if (insn.oe != 0U) {
             xer_set_ov(ctx, a == 0x80000000U);
         }
@@ -473,136 +503,16 @@ void interp_step(ppc32_ctx_t *ctx)
         ctx->nip += 4U;
         break;
     }
-    /* ---- CR logical ops (decoder: single PPC32_OP_CR, XO picks) - */
-    case PPC32_OP_CR: {
-        uint32_t ba = (raw >> 16U) & 31U;
-        uint32_t bb = (raw >> 11U) & 31U;
-        uint32_t bd = (raw >> 21U) & 31U;
-        uint32_t abit = cr_bit(ctx, ba);
-        uint32_t bbit = cr_bit(ctx, bb);
-        uint32_t out = 0U;
-
-        switch (insn.xo) {
-        case 257u: /* crand */
-            out = abit & bbit;
-            break;
-        case 129u: /* crandc */
-            out = abit & (bbit ^ 1U);
-            break;
-        case 449u: /* cror */
-            out = abit | bbit;
-            break;
-        case 417u: /* crorc */
-            out = abit | (bbit ^ 1U);
-            break;
-        case 193u: /* crxor */
-            out = abit ^ bbit;
-            break;
-        case 225u: /* crnand */
-            out = (abit & bbit) ^ 1U;
-            break;
-        case 33u: /* crnor */
-            out = (abit | bbit) ^ 1U;
-            break;
-        case 289u: /* creqv */
-        default:
-            out = (abit ^ bbit) ^ 1U;
-            break;
-        }
-        if (out != 0U) {
-            ctx->cr |= 0x80000000U >> bd;
-        } else {
-            ctx->cr &= ~(0x80000000U >> bd);
-        }
-        ctx->nip += 4U;
-        break;
-    }
-    case PPC32_OP_MCRF: {
-        uint32_t crd = (raw >> 23U) & 7U;
-        uint32_t crs = (raw >> 18U) & 7U;
-        uint32_t v = (ctx->cr >> ((7U - crs) * 4U)) & 0xFU;
-
-        ctx->cr = (ctx->cr & ~(0xFU << ((7U - crd) * 4U))) |
-            (v << ((7U - crd) * 4U));
-        ctx->nip += 4U;
-        break;
-    }
-    case PPC32_OP_MCRXR: {
-        uint32_t crd = (raw >> 23U) & 7U;
-        uint32_t v = (ctx->xer >> 28U) & 0xFU;
-
-        ctx->cr = (ctx->cr & ~(0xFU << ((7U - crd) * 4U))) |
-            (v << ((7U - crd) * 4U));
-        ctx->xer &= 0x0FFFFFFFU;
-        ctx->nip += 4U;
-        break;
-    }
+    /* ---- CR / SPR ops ------------------------------------------ */
+    case PPC32_OP_CR:
+    case PPC32_OP_MCRF:
+    case PPC32_OP_MCRXR:
     case PPC32_OP_MFCR:
-        ctx->gpr[insn.rt] = ctx->cr;
-        ctx->nip += 4U;
-        break;
-    case PPC32_OP_MTCRF: {
-        uint32_t crm = (raw >> 12U) & 0xFFU;
-        uint32_t i;
-
-        for (i = 0U; i < 8U; i++) {
-            if (((crm >> (7U - i)) & 1U) != 0U) {
-                uint32_t shift = (7U - i) * 4U;
-                ctx->cr = (ctx->cr & ~(0xFU << shift)) |
-                    ((ctx->gpr[insn.rs] >> shift) & 0xFU) << shift;
-            }
-        }
-        ctx->nip += 4U;
-        break;
-    }
+    case PPC32_OP_MTCRF:
     case PPC32_OP_MFSPR:
-    case PPC32_OP_MTSPR: {
-        uint32_t spr = (((raw >> 11U) & 31U) << 5U) | ((raw >> 16U) & 31U);
-
-        if (insn.op == PPC32_OP_MFSPR) {
-            switch (spr) {
-            case PPC32_SPR_XER:
-                ctx->gpr[insn.rt] = ctx->xer;
-                break;
-            case PPC32_SPR_LR:
-                ctx->gpr[insn.rt] = ctx->lr;
-                break;
-            case PPC32_SPR_CTR:
-                ctx->gpr[insn.rt] = ctx->ctr;
-                break;
-            case 268U:
-            case 269U:
-                ctx->gpr[insn.rt] = 0U;
-                break;
-            case PPC32_SPR_PVR: /* mfpvr: glibc IFUNC dispatch reads it */
-                ctx->gpr[insn.rt] = (ctx->profile == PPC32_PROFILE_SPE) ?
-                    PPC32_PVR_E500V2 : PPC32_PVR_750;
-                break;
-            default:
-                ctx->exit_reason = PPC32_EXIT_UNDEF;
-                break;
-            }
-        } else {
-            switch (spr) {
-            case PPC32_SPR_XER:
-                ctx->xer = ctx->gpr[insn.rs];
-                break;
-            case PPC32_SPR_LR:
-                ctx->lr = ctx->gpr[insn.rs];
-                break;
-            case PPC32_SPR_CTR:
-                ctx->ctr = ctx->gpr[insn.rs];
-                break;
-            default:
-                ctx->exit_reason = PPC32_EXIT_UNDEF;
-                break;
-            }
-        }
-        if (ctx->exit_reason == PPC32_EXIT_NONE) {
-            ctx->nip += 4U;
-        }
+    case PPC32_OP_MTSPR:
+        interp_exec_cr_spr(ctx, &insn, raw);
         break;
-    }
     /* ---- branches (no delay slots) ------------------------------ */
     case PPC32_OP_B: {
         uint32_t aa = (raw >> 1U) & 1U;
@@ -795,24 +705,30 @@ void interp_step(ppc32_ctx_t *ctx)
     /* ---- reservation ops (E06): SEQ_CST LL/SC over g_ll_table ---- */
     case PPC32_OP_LWARX: {
         uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) + ctx->gpr[insn.rb];
-        uint32_t al = ea & ~3U, h = (al >> 6U) & 1023U;
+        uint32_t al = ea & ~3U;
         uint32_t *hva;
+        uint32_t val;
+
         if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
-        hva = (uint32_t *)ppc32_guest_ptr(ctx, al);
-        ctx->gpr[insn.rt] = ppc32_be32(__atomic_load_n(hva, __ATOMIC_SEQ_CST));
-        ctx->res_addr = al; ctx->res_val = ctx->gpr[insn.rt]; ctx->res_valid = 1;
-        g_ll_table[h].owner = ctx; g_ll_table[h].addr = al; g_ll_table[h].val = ctx->res_val;
-        g_ll_table[h].snap = __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST);
-        g_ll_table[h].gensnap = __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST);
-        ctx->nip += 4U; break;
+        hva = (uint32_t *)ppc32_access_checked(ctx, al, 4U, false);
+        if (hva == NULL) { break; }
+        val = ppc32_be32(__atomic_load_n(hva, __ATOMIC_SEQ_CST));
+        ctx->gpr[insn.rt] = val;
+        vm32_ll_record(ctx, al, val);
+        ctx->nip += 4U;
+        break;
     }
     case PPC32_OP_STWCX: {
         uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) + ctx->gpr[insn.rb];
         uint32_t al = ea & ~3U;
         bool ok;
+
         if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+        if (ppc32_access_checked(ctx, al, 4U, true) == NULL) { break; }
         ok = vm32_sc_attempt(ctx, al, ctx->gpr[insn.rs]);
-        set_crf(ctx, 0U, false, false, ok); ctx->nip += 4U; break;
+        set_crf(ctx, 0U, false, false, ok);
+        ctx->nip += 4U;
+        break;
     }
     /* ---- traps -------------------------------------------------- */
     case PPC32_OP_TWI:
@@ -837,12 +753,15 @@ void interp_step(ppc32_ctx_t *ctx)
     /* ---- syscall ------------------------------------------------ */
     case PPC32_OP_SC:
         /* Leave nip AT the sc (E01 contract); advancing here too would skip
-         * the instruction after every syscall (RC1). */
+          * the instruction after every syscall (RC1). */
         ctx->exit_reason = PPC32_EXIT_SYSCALL;
         res_invalidate(ctx);
         break;
-    /* ---- memory-order / cache no-ops ---------------------------- */
+    /* ---- memory-order / cache ops ------------------------------- */
     case PPC32_OP_SYNC:
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        ctx->nip += 4U;
+        break;
     case PPC32_OP_DCBT:
         ctx->nip += 4U;
         break;

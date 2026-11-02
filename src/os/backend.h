@@ -150,28 +150,4 @@ int64_t rt_host_tgkill(int64_t tgid, int64_t tid, int linux_sig);
 void rt_host_exit_thread(int status);
 void rt_host_exit_group(int status);
 
-typedef struct {
-    int linux_si_signo;
-    int linux_si_code;
-    uintptr_t fault_addr;
-    uintptr_t host_pc;
-    int is_write;
-    void *host_ucontext;
-} rt_host_sync_fault_t;
-
-typedef struct {
-    int linux_si_signo;
-    int linux_si_code;
-    int32_t sender_pid;
-    uint32_t sender_uid;
-    int32_t exit_status_or_sig;
-} rt_host_async_siginfo_t;
-
-typedef void (*rt_host_sync_fault_fn)(const rt_host_sync_fault_t *fault);
-typedef void (*rt_host_async_sig_fn)(const rt_host_async_siginfo_t *sig);
-typedef void (*rt_host_preempt_fn)(void *host_ucontext);
-
-int rt_host_install_signal_handlers(rt_host_sync_fault_fn on_sync_fault,
-    rt_host_async_sig_fn on_async_sig, rt_host_preempt_fn on_preempt);
-
 #endif /* PPC32RT_OS_BACKEND_H */

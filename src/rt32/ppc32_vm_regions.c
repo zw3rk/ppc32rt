@@ -72,8 +72,9 @@ void vm_remove_region_at(size_t idx)
     g_vm_region_count--;
 }
 
-int vm_insert_region_raw(uint32_t start, uint32_t end,
-                                uint32_t prot, uint32_t flags, const char *name)
+int vm_insert_region_raw_ex(uint32_t start, uint32_t end,
+                            uint32_t prot, uint32_t flags, int fd,
+                            uint64_t offset, const char *name)
 {
     if (start >= end || g_vm_region_count >= PPC32_MAX_REGIONS) {
         return -1;
@@ -88,16 +89,24 @@ int vm_insert_region_raw(uint32_t start, uint32_t end,
     }
     g_vm_region_count++;
     ppc32_region_t *r = &g_vm_regions[pos];
-    r->start = start;
-    r->end   = end;
-    r->prot  = prot;
-    r->flags = flags;
+    r->start  = start;
+    r->end    = end;
+    r->prot   = prot;
+    r->flags  = flags;
+    r->fd     = fd;
+    r->offset = (fd >= 0) ? offset : 0ULL;
     if (name) {
         snprintf(r->name, sizeof(r->name), "%s", name);
     } else {
         r->name[0] = '\0';
     }
     return 0;
+}
+
+int vm_insert_region_raw(uint32_t start, uint32_t end,
+                         uint32_t prot, uint32_t flags, const char *name)
+{
+    return vm_insert_region_raw_ex(start, end, prot, flags, -1, 0ULL, name);
 }
 
 void vm_coalesce_regions_locked(void)
@@ -109,8 +118,11 @@ void vm_coalesce_regions_locked(void)
     for (size_t src = 1U; src < g_vm_region_count; src++) {
         ppc32_region_t *prev = &g_vm_regions[dst];
         const ppc32_region_t *curr = &g_vm_regions[src];
+        bool off_ok = (prev->fd < 0) ||
+            (prev->offset + (uint64_t)(prev->end - prev->start) == curr->offset);
         if (prev->end == curr->start && prev->prot == curr->prot &&
-            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0) {
+            prev->flags == curr->flags && prev->fd == curr->fd &&
+            off_ok && strcmp(prev->name, curr->name) == 0) {
             prev->end = curr->end;
         } else {
             dst++;
@@ -145,8 +157,11 @@ void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
                 }
             }
             ppc32_region_t orig = *r;
-            if (vm_insert_region_raw(unmap_end, orig.end,
-                                     orig.prot, orig.flags, orig.name) == 0) {
+            uint64_t right_off = (orig.fd >= 0) ?
+                (orig.offset + (uint64_t)(unmap_end - orig.start)) : 0ULL;
+            if (vm_insert_region_raw_ex(unmap_end, orig.end,
+                                        orig.prot, orig.flags, orig.fd,
+                                        right_off, orig.name) == 0) {
                 g_vm_regions[i].end = unmap_start;
                 i += 2U;
             } else {
@@ -157,14 +172,18 @@ void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
         if (r->start < unmap_start) {
             r->end = unmap_start;
         } else {
+            if (r->fd >= 0) {
+                r->offset += (uint64_t)(unmap_end - r->start);
+            }
             r->start = unmap_end;
         }
         i++;
     }
 }
 
-int vm_record_region_locked(uint32_t start, uint32_t end,
-                                   uint32_t prot, uint32_t flags, const char *name)
+int vm_record_region_ex_locked(uint32_t start, uint32_t end,
+                               uint32_t prot, uint32_t flags, int fd,
+                               uint64_t offset, const char *name)
 {
     if (start >= end) {
         return -1;
@@ -177,13 +196,19 @@ int vm_record_region_locked(uint32_t start, uint32_t end,
     }
     uint32_t clean_flags = flags & ~(PPC32_MAP_FIXED | PPC32_MAP_FIXED_NOREPLACE);
     vm_unmap_regions_locked(start, end);
-    int rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
+    int rc = vm_insert_region_raw_ex(start, end, prot, clean_flags, fd, offset, name_copy);
     if (rc < 0) {
         vm_coalesce_regions_locked();
-        rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
+        rc = vm_insert_region_raw_ex(start, end, prot, clean_flags, fd, offset, name_copy);
     }
     vm_coalesce_regions_locked();
     return rc;
+}
+
+int vm_record_region_locked(uint32_t start, uint32_t end,
+                            uint32_t prot, uint32_t flags, const char *name)
+{
+    return vm_record_region_ex_locked(start, end, prot, flags, -1, 0ULL, name);
 }
 
 void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot)
@@ -203,16 +228,25 @@ void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t pro
         ppc32_region_t orig = *r;
         if (orig.start < mp_start && orig.end > mp_end) {
             if (g_vm_region_count + 2U <= PPC32_MAX_REGIONS) {
+                uint64_t mid_off = (orig.fd >= 0) ?
+                    (orig.offset + (uint64_t)(mp_start - orig.start)) : 0ULL;
+                uint64_t right_off = (orig.fd >= 0) ?
+                    (orig.offset + (uint64_t)(mp_end - orig.start)) : 0ULL;
                 r->end = mp_start;
-                (void)vm_insert_region_raw(mp_start, mp_end, prot, orig.flags, orig.name);
-                (void)vm_insert_region_raw(mp_end, orig.end, orig.prot, orig.flags, orig.name);
+                (void)vm_insert_region_raw_ex(mp_start, mp_end, prot, orig.flags,
+                                              orig.fd, mid_off, orig.name);
+                (void)vm_insert_region_raw_ex(mp_end, orig.end, orig.prot, orig.flags,
+                                              orig.fd, right_off, orig.name);
                 i += 3U;
             } else {
                 r->prot = prot;
                 i++;
             }
         } else if (orig.start < mp_start) {
-            if (vm_insert_region_raw(mp_start, orig.end, prot, orig.flags, orig.name) == 0) {
+            uint64_t right_off = (orig.fd >= 0) ?
+                (orig.offset + (uint64_t)(mp_start - orig.start)) : 0ULL;
+            if (vm_insert_region_raw_ex(mp_start, orig.end, prot, orig.flags,
+                                        orig.fd, right_off, orig.name) == 0) {
                 g_vm_regions[i].end = mp_start;
                 i += 2U;
             } else {
@@ -221,11 +255,16 @@ void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t pro
             }
         } else {
             r->start = mp_end;
-            if (vm_insert_region_raw(orig.start, mp_end, prot, orig.flags, orig.name) == 0) {
+            if (orig.fd >= 0) {
+                r->offset = orig.offset + (uint64_t)(mp_end - orig.start);
+            }
+            if (vm_insert_region_raw_ex(orig.start, mp_end, prot, orig.flags,
+                                        orig.fd, orig.offset, orig.name) == 0) {
                 i += 2U;
             } else {
-                r->start = orig.start;
-                r->prot  = prot;
+                r->start  = orig.start;
+                r->offset = orig.offset;
+                r->prot   = prot;
                 i++;
             }
         }
@@ -243,9 +282,10 @@ bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
     return false;
 }
 
-bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
-                                         uint32_t *out_prot, uint32_t *out_flags,
-                                         char *out_name, size_t name_sz)
+bool vm_check_mapped_range_ex_locked(uint32_t start, uint32_t end,
+                                     uint32_t *out_prot, uint32_t *out_flags,
+                                     int *out_fd, uint64_t *out_offset,
+                                     char *out_name, size_t name_sz)
 {
     if (start >= end) {
         return false;
@@ -254,6 +294,8 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
     bool     first = true;
     uint32_t first_prot  = 0U;
     uint32_t first_flags = 0U;
+    int      first_fd    = -1;
+    uint64_t base_off    = 0ULL;
     for (size_t i = 0U; i < g_vm_region_count; i++) {
         const ppc32_region_t *r = &g_vm_regions[i];
         if (r->end <= cur) {
@@ -265,19 +307,33 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
         if (first) {
             first_prot  = r->prot;
             first_flags = r->flags & 0x23U;
+            first_fd    = r->fd;
+            base_off    = (r->fd >= 0) ?
+                (r->offset + (uint64_t)(start - r->start)) : 0ULL;
             if (out_prot) {
                 *out_prot = r->prot;
             }
             if (out_flags) {
                 *out_flags = r->flags;
             }
+            if (out_fd) {
+                *out_fd = r->fd;
+            }
+            if (out_offset) {
+                *out_offset = base_off;
+            }
             if (out_name && name_sz > 0U) {
                 snprintf(out_name, name_sz, "%s", r->name);
             }
             first = false;
-        } else if ((out_prot != NULL && r->prot != first_prot) ||
-                   (out_flags != NULL && (r->flags & 0x23U) != first_flags)) {
-            return false;
+        } else {
+            bool fd_mismatch = (out_fd != NULL) && (r->fd != first_fd ||
+                (first_fd >= 0 && r->offset != base_off + (uint64_t)(r->start - start)));
+            if ((out_prot != NULL && r->prot != first_prot) ||
+                (out_flags != NULL && (r->flags & 0x23U) != first_flags) ||
+                fd_mismatch) {
+                return false;
+            }
         }
         if (r->end >= end) {
             return true;
@@ -285,6 +341,14 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
         cur = r->end;
     }
     return false;
+}
+
+bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
+                                  uint32_t *out_prot, uint32_t *out_flags,
+                                  char *out_name, size_t name_sz)
+{
+    return vm_check_mapped_range_ex_locked(start, end, out_prot, out_flags,
+                                           NULL, NULL, out_name, name_sz);
 }
 
 int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)

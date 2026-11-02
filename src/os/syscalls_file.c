@@ -31,6 +31,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <termios.h>
+#endif
 
 #include "os/convert.h"
 #include "os/procfs.h"
@@ -243,4 +247,160 @@ long sys_fcntl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t cmd, uint32_t arg)
         break;
     }
     return -ENOSYS;
+}
+
+long sys_close(uint32_t fd)
+{
+    if (close((int)fd) != 0) {
+        return -(long)errno;
+    }
+    return 0;
+}
+
+long sys_unlink(ppc32_ctx_t *ctx, uint32_t path_va)
+{
+    char path[PPC32_PATH_MAX];
+
+    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
+        return -EFAULT;
+    }
+    if (unlink(path) != 0) {
+        return -(long)errno;
+    }
+    return 0;
+}
+
+long sys_lseek(uint32_t fd, uint32_t offset, uint32_t whence)
+{
+    off_t r = lseek((int)fd, (off_t)(int32_t)offset, (int)whence);
+
+    if (r == (off_t)-1) {
+        return -(long)errno;
+    }
+    return (long)r;
+}
+
+/* Bonus (file I/O): ppc llseek(140) carries the 64-bit offset as a
+ * high/low word pair and stores the result through a BE u64 pointer. */
+long sys_llseek(ppc32_ctx_t *ctx, uint32_t fd, uint32_t hi,
+    uint32_t lo, uint32_t res_va, uint32_t whence)
+{
+    uint64_t uoff = ((uint64_t)hi << 32U) | (uint64_t)lo;
+    off_t r = lseek((int)fd, (off_t)(int64_t)uoff, (int)whence);
+
+    if (r == (off_t)-1) {
+        return -(long)errno;
+    }
+    if (!ppc32_range_ok(res_va, 8U)) {
+        return -EFAULT;
+    }
+    ppc32_st64be(ctx, res_va, (uint64_t)(int64_t)r);
+    return 0;
+}
+
+long sys_stat_path(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
+    uint32_t use64, int nofollow)
+{
+    char path[PPC32_PATH_MAX];
+    struct stat hs;
+
+    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
+        return -EFAULT;
+    }
+    if ((nofollow ? lstat(path, &hs) : stat(path, &hs)) != 0) {
+        return -(long)errno;
+    }
+    if (use64 != 0U) {
+        return (long)ppc32_put_stat64(ctx, buf_va, &hs);
+    }
+    return (long)ppc32_put_stat(ctx, buf_va, &hs);
+}
+
+long sys_fstat(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t use64)
+{
+    struct stat hs;
+
+    if (fstat((int)fd, &hs) != 0) {
+        return -(long)errno;
+    }
+    if (use64 != 0U) {
+        return (long)ppc32_put_stat64(ctx, buf_va, &hs);
+    }
+    return (long)ppc32_put_stat(ctx, buf_va, &hs);
+}
+
+long sys_ioctl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t req, uint32_t arg_va)
+{
+#ifdef __linux__
+    switch (req) {
+    case 0x5401U: /* TCGETS */
+    {
+        struct termios hs;
+
+        if (ioctl((int)fd, TCGETS, &hs) != 0) {
+            return -(long)errno;
+        }
+        return (long)ppc32_termios_to_guest(ctx, arg_va, &hs);
+    }
+    case 0x5402U: /* TCSETS */
+    case 0x5403U: /* TCSETSW */
+    case 0x5404U: /* TCSETSF */
+    {
+        struct termios hs;
+        int kind = (req == 0x5402U) ? TCSANOW :
+            (req == 0x5403U) ? TCSADRAIN : TCSAFLUSH;
+
+        if (ppc32_termios_from_guest(ctx, arg_va, &hs) != 0) {
+            return -EFAULT;
+        }
+        if (tcsetattr((int)fd, kind, &hs) != 0) {
+            return -(long)errno;
+        }
+        return 0;
+    }
+    case 0x5413U: /* TIOCGWINSZ */
+    {
+        struct winsize hs;
+
+        if (ioctl((int)fd, TIOCGWINSZ, &hs) != 0) {
+            return -(long)errno;
+        }
+        return (long)ppc32_winsize_to_guest(ctx, arg_va, &hs);
+    }
+    case 0x5414U: /* TIOCSWINSZ */
+    {
+        struct winsize hs;
+
+        if (ppc32_winsize_from_guest(ctx, arg_va, &hs) != 0) {
+            return -EFAULT;
+        }
+        if (ioctl((int)fd, TIOCSWINSZ, &hs) != 0) {
+            return -(long)errno;
+        }
+        return 0;
+    }
+    case 0x541BU: /* FIONREAD */
+    {
+        int n = 0;
+
+        if (ioctl((int)fd, FIONREAD, &n) != 0) {
+            return -(long)errno;
+        }
+        if (!ppc32_range_ok(arg_va, 4U)) {
+            return -EFAULT;
+        }
+        ppc32_st32be(ctx, arg_va, (uint32_t)n);
+        return 0;
+    }
+    default:
+        break;
+    }
+    return -ENOSYS;
+#else
+    (void)ctx;
+    (void)fd;
+    (void)req;
+    (void)arg_va;
+    return -ENOSYS;
+#endif
 }

@@ -38,7 +38,6 @@ enum {
     ULOCK_COMPARE_AND_WAIT = 1,
     ULOCK_WAKE_ALL = 0x00000100
 };
-#endif
 
 static long ul_errno(void)
 {
@@ -56,6 +55,7 @@ static long ul_errno(void)
     }
     return -UL_LINUX_EINVAL;
 }
+#endif
 
 /* Emulated futex op (same arg shape as threads.c futex_host): uaddr is
  * the pinned host word, op carries PRIVATE/CLOCK bits plus the low cmd
@@ -66,9 +66,9 @@ static long ul_errno(void)
 long ppc32_futex_emul(int32_t *uaddr, uint32_t op, int32_t val,
     const struct timespec *timeout, int32_t *uaddr2, int32_t val3)
 {
+#if defined(__APPLE__)
     uint32_t cmd = op & 15U;
 
-#if defined(__APPLE__)
     if (cmd == PPC32_FUTEX_WAIT) {
         uint64_t timeout_ns = 0ULL;
 
