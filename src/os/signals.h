@@ -16,6 +16,10 @@
  * stays within the async-signal-safe subset even if invoked from a host
  * signal context. Guest FPR state is copied as opaque u64 bit patterns;
  * the host FP environment (FPCR/FPSCR, rounding mode) is never touched.
+ *
+ * Locking: the process-shared disposition table has its own spinlock,
+ * outermost in the global order (selection may not touch guest memory
+ * while held; syscall handlers snapshot inputs before writing outputs).
  */
 
 #ifndef PPC32RT_OS_SIGNALS_H
@@ -120,6 +124,17 @@ typedef struct ppc32_sigact {
 
 /* Reset every disposition to SIG_DFL (test setup). */
 void ppc32_sig_reset(void);
+
+/* execve reset: caught dispositions return to SIG_DFL, ignored stay
+ * ignored; the calling thread's mask and pending set are preserved. */
+void ppc32_sig_reset_exec(void);
+
+/* Fork coordination for the ppc32_proc_fork protocol (prepare holds the
+ * disposition lock across the snapshot; parent releases; the child
+ * drops the inherited locked value). */
+void ppc32_sig_fork_prepare(void);
+void ppc32_sig_fork_parent(void);
+void ppc32_sig_fork_child(void);
 
 /* Direct table access (used by the L4c fixture and future clone/exec). */
 int ppc32_sigaction_get(int sig, ppc32_sigact_t *out);

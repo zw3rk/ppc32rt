@@ -61,6 +61,23 @@ static void tlb_unlock(void)
     atomic_store_explicit(&g_tlb_lock, 0U, memory_order_release);
 }
 
+/* Fork coordination (P32-R3-4): hold the lock across the snapshot in
+ * the parent; the child drops the inherited locked value. */
+void vm32_tlb_fork_prepare(void)
+{
+    tlb_lock();
+}
+
+void vm32_tlb_fork_parent(void)
+{
+    tlb_unlock();
+}
+
+void vm32_tlb_fork_child(void)
+{
+    atomic_store_explicit(&g_tlb_lock, 0U, memory_order_release);
+}
+
 static uint64_t page_tag(uint32_t gva)
 {
     return (uint64_t)(gva & ~VM32_GUEST_PAGE_MASK);

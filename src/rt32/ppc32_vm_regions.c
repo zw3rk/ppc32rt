@@ -23,6 +23,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "vm/vm32.h"
+
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
@@ -57,6 +59,15 @@ void ppc32_vm_unlock_if_held_by_self(void)
         g_vm_lock_held = 0;
         ppc32_spin_unlock(&g_vm_lock);
     }
+}
+
+/* Fork coordination (P32-R3-4): the parent holds the VM lock across
+ * the snapshot (ppc32_vm_lock); the child drops the inherited locked
+ * value and clears the copied thread-local held flag. */
+void ppc32_vm_fork_child(void)
+{
+    g_vm_lock_held = 0;
+    atomic_store_explicit(&g_vm_lock, 0U, memory_order_release);
 }
 
 uint64_t page_align_up(uint64_t v)
@@ -712,5 +723,141 @@ void ppc32_vm_sync_ctx(ppc32_ctx_t *ctx)
     vm_sync_from_ctx(ctx);
     vm_sync_to_ctx(ctx);
     vm_lock_release();
+}
+
+/* Reserve host PROT_NONE over [start, start+len) for the legacy (non-A2)
+ * unmap path. Moved from ppc32_vm.c (Phase 0 file-size discipline). */
+int vm_reserve_prot_none(ppc32_ctx_t *ctx, uint32_t start, uint32_t len)
+{
+    void *res = mmap(ppc32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+    if (res == MAP_FAILED) {
+        return -errno;
+    }
+    return 0;
+}
+
+/* True teardown (munmap/mremap-source removal): the range stops being
+ * file-backed, so its inode records go too. Moved from ppc32_vm.c
+ * (Phase 0 file-size discipline). */
+
+/* A staged MAP_SHARED group stays alive while any live region references
+ * its (dev, ino, offset) key; regions keep the caller's file fd/offset,
+ * so identity is compared through fstat. */
+static bool staged_group_referenced_locked(uint64_t dev, uint64_t ino,
+    uint64_t off)
+{
+    size_t i;
+
+    for (i = 0U; i < g_vm_region_count; i++) {
+        struct stat st;
+
+        if (g_vm_regions[i].fd < 0 || g_vm_regions[i].offset != off) {
+            continue;
+        }
+        if (fstat(g_vm_regions[i].fd, &st) != 0) {
+            continue;
+        }
+        if ((uint64_t)st.st_dev == dev && (uint64_t)st.st_ino == ino) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Drop staged groups no live region references (P32-R3-3): the drop
+ * itself writes back and closes both fds. Runs after every region-list
+ * mutation on the unmap path. */
+static void vm_file_shared_gc_locked(void)
+{
+    size_t n = vm_file_shared_group_count();
+    size_t i;
+
+    for (i = 0U; i < n; i++) {
+        uint64_t dev;
+        uint64_t ino;
+        uint64_t off;
+
+        if (!vm_file_shared_group_key(i, &dev, &ino, &off)) {
+            continue;
+        }
+        if (!staged_group_referenced_locked(dev, ino, off)) {
+            vm_file_shared_drop_group(dev, ino, off);
+        }
+    }
+}
+
+/* Best-effort write-back of staged groups intersecting a torn-down or
+ * replaced range, resolved through the still-live regions. */
+static void vm_file_shared_writeback_overlap_locked(uint32_t start,
+    uint32_t end)
+{
+    size_t i;
+
+    if (end <= start) {
+        return;
+    }
+    for (i = 0U; i < g_vm_region_count; i++) {
+        uint32_t lo;
+        uint32_t hi;
+
+        if (g_vm_regions[i].fd < 0 ||
+            (g_vm_regions[i].flags & 0x01U) == 0U) {
+            continue;
+        }
+        if (g_vm_regions[i].end <= start || g_vm_regions[i].start >= end) {
+            continue;
+        }
+        lo = (g_vm_regions[i].start > start) ? g_vm_regions[i].start : start;
+        hi = (g_vm_regions[i].end < end) ? g_vm_regions[i].end : end;
+        vm_file_shared_writeback_file_range(g_vm_regions[i].fd,
+            g_vm_regions[i].offset + (uint64_t)(lo - g_vm_regions[i].start),
+            g_vm_regions[i].offset + (uint64_t)(hi - g_vm_regions[i].start));
+    }
+}
+
+int vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (!ctx || (addr & (PPC32_PAGE_SIZE - 1U)) != 0U || len == 0U) {
+        return -EINVAL;
+    }
+    uint64_t aligned_len = page_align_up((uint64_t)len);
+    if (addr < PPC32_LOW_GUARD_SIZE ||
+        (uint64_t)addr + aligned_len > (uint64_t)PPC32_TASK_SIZE_TOP) {
+        return -EINVAL;
+    }
+
+    uint32_t start = ppc32_page_down(addr);
+    uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
+    if (!vm_can_modify_range_locked(start, end, false)) {
+        return -ENOMEM;
+    }
+
+    /* Same VM>inode order as the mmap path. */
+    vm_file_untrack_range(start, end);
+    vm_file_shared_writeback_overlap_locked(start, end);
+
+    if (vm32_is_a2()) {
+        int urc = vm32_unmap_union(start, (uint32_t)aligned_len);
+        if (urc != 0) {
+            return urc;
+        }
+    } else {
+        int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
+        if (rc != 0) {
+            return rc;
+        }
+        vm32_record_unmap(start, end);
+    }
+
+    vm_unmap_regions_locked(start, end);
+    vm_file_shared_gc_locked();
+    vm32_tlb_invalidate_range(start, end);
+    vm32_ll_note_remap();
+    if (g_vm_mmap_cursor == end && start >= PPC32_MMAP_BASE_32) {
+        g_vm_mmap_cursor = start;
+    }
+    return 0;
 }
 

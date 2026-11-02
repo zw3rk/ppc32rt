@@ -93,6 +93,16 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
  * successful join the guest TID is no longer valid. */
 long ppc32_thread_join(uint32_t guest_tid);
 
+/* Fork coordination for the ppc32_proc_fork protocol (P32-R3-4): the
+ * parent holds the thread-table lock across the snapshot so no clone
+ * or exit is half-recorded; the parent releases afterwards. The child
+ * drops the inherited locked value and rebuilds the table around the
+ * sole surviving thread (ctx, already refreshed by proc_child_refresh,
+ * takes slot 0; every other slot is dead). */
+void ppc32_thread_fork_prepare(void);
+void ppc32_thread_fork_parent(void);
+void ppc32_thread_fork_child(ppc32_ctx_t *ctx);
+
 /* Child-side teardown: clears the CLONE_CHILD_CLEARTID word (BE zero
  * store) and wakes one waiter, releases the table slot, and frees the
  * child context. Runs at the end of the host-thread wrapper and after

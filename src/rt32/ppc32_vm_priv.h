@@ -38,6 +38,9 @@ extern size_t           g_vm_region_count;
 void     vm_lock_acquire(void);
 void     vm_lock_release(void);
 uint64_t page_align_up(uint64_t v);
+int      vm_reserve_prot_none(ppc32_ctx_t *ctx, uint32_t start,
+                              uint32_t len);
+int      vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len);
 
 void vm_sync_from_ctx(ppc32_ctx_t *ctx);
 void vm_sync_brk_to_ctx(ppc32_ctx_t *ctx);

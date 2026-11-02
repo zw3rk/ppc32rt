@@ -152,6 +152,38 @@ long ppc32_thread_init_main(ppc32_ctx_t *ctx)
     return 0;
 }
 
+/* Fork coordination (P32-R3-4): hold the table lock across the
+ * snapshot in the parent; the child drops the inherited locked value
+ * and rebuilds the table around the sole surviving thread. */
+void ppc32_thread_fork_prepare(void)
+{
+    thread_lock();
+}
+
+void ppc32_thread_fork_parent(void)
+{
+    thread_unlock();
+}
+
+void ppc32_thread_fork_child(ppc32_ctx_t *ctx)
+{
+    uint32_t i;
+
+    atomic_store_explicit(&g_thread_lock, 0U, memory_order_release);
+    for (i = 0U; i < PPC32_MAX_THREADS; i++) {
+        g_thread_table[i].used = false;
+        g_thread_table[i].ctx = NULL;
+        memset(&g_thread_table[i].host, 0, sizeof(pthread_t));
+        g_thread_table[i].guest_tid = 0U;
+    }
+    if (ctx != NULL) {
+        g_thread_table[0].used = true;
+        g_thread_table[0].ctx = ctx;
+        g_thread_table[0].host = pthread_self();
+        g_thread_table[0].guest_tid = ctx->guest_tid;
+    }
+}
+
 uint32_t ppc32_thread_count(void)
 {
     uint32_t n = 0U;

@@ -27,35 +27,57 @@
 #include "os/signals.h"
 
 #include <errno.h>
+#include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "os/sigframe_ppc32.h"
+#include "os/signals_priv.h"
 #include "os/syscall_nr.h"
 #include "rt32/ppc32.h"
 
-/* siginfo/ucontext geometry inside struct rt_sigframe (frozen header). */
-#define SIGINFO_SIZE 128U
-#define SIGINFO_OFF 0x80U
-#define UCONTEXT_OFF 0x80U
-#define ABIGAP_OFF 0x520U
-
-/* siginfo word offsets (Linux struct siginfo: signo, errno, code, addr). */
-#define SI_SIGNO_OFF 0U
-#define SI_ERRNO_OFF 4U
-#define SI_CODE_OFF 8U
-#define SI_ADDR_OFF 12U
-
-/* DSISR class bits for mc dsisr on a DSI fault (informational: only the
- * store/load class is modeled, matching the is_store delivery argument). */
-#define DSISR_STORE_CLASS 0x02000000U
-#define DSISR_LOAD_CLASS 0x40000000U
-
 /* Process-shared disposition table (kernel sighand equivalent; per-thread
- * state — the blocked mask — already lives in ppc32_ctx_t for L4b). */
+ * state — the blocked mask — already lives in ppc32_ctx_t for L4b).
+ * Guarded by g_sig_disp_lock: getters copy the whole entry and setters
+ * replace it, so concurrent delivery never mixes a handler from one
+ * update with flags/mask from another. Lock order is outermost: holders
+ * may enter the VM (guest copy helpers) but no VM holder takes this. */
 static ppc32_sigact_t sig_actions[PPC32_NSIG + 1U];
 static int sig_installed[PPC32_NSIG + 1U];
+static _Atomic uint32_t g_sig_disp_lock = 0U;
+
+static void sig_disp_lock_acquire(void)
+{
+    while (atomic_exchange_explicit(&g_sig_disp_lock, 1U,
+        memory_order_acquire) != 0U) {
+        sched_yield();
+    }
+}
+
+static void sig_disp_lock_release(void)
+{
+    atomic_store_explicit(&g_sig_disp_lock, 0U, memory_order_release);
+}
+
+/* Fork coordination (ppc32_proc_fork protocol): the parent holds the
+ * lock across fork so no update is half-written at the snapshot; the
+ * child drops the inherited locked value (its owner is gone). */
+void ppc32_sig_fork_prepare(void)
+{
+    sig_disp_lock_acquire();
+}
+
+void ppc32_sig_fork_parent(void)
+{
+    sig_disp_lock_release();
+}
+
+void ppc32_sig_fork_child(void)
+{
+    atomic_store_explicit(&g_sig_disp_lock, 0U, memory_order_release);
+}
 
 /* ---- Frozen-layout compile checks (SPEC 2.3) ---- */
 _Static_assert(PPC32_SIGACTION_SIZE == 20U, "guest sigaction must be 20 B");
@@ -70,115 +92,8 @@ _Static_assert(offsetof(ppc32_ucontext_t, uc_mcontext) == 0xC0U, "mc@0xc0");
 _Static_assert(UCONTEXT_OFF == 0x80U, "ucontext@0x80");
 _Static_assert(ABIGAP_OFF == 0x520U, "abigap@0x520");
 
-/* ---- Local guest-memory helpers (BE scalars over the locked safe-copy
- * path; each access validates under the VM lock so a concurrent
- * unmap/mprotect cannot slip between check and copy. convert.h is
- * deliberately not included: its ppc32_stat_t collides with the frozen
- * sigframe header, so the BE helpers needed here are restated on top of
- * ppc32_vm_copyin_safe/ppc32_vm_copyout_safe. */
-
-static int sig_range_ok(uint32_t va, size_t len)
-{
-    uint64_t end;
-
-    if (len == 0U) {
-        return 1;
-    }
-    if (va < PPC32_LOW_GUARD_SIZE) {
-        return 0;
-    }
-    end = (uint64_t)va + (uint64_t)len;
-    if (end > (uint64_t)PPC32_TASK_SIZE_TOP) {
-        return 0;
-    }
-    return 1;
-}
-
-static int sig_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
-    uint32_t need_prot)
-{
-    if (!sig_range_ok(va, len)) {
-        return 0;
-    }
-    return ppc32_vm_range_prot_ok(ctx, va, len, need_prot) ? 1 : 0;
-}
-
-/* Fail the caller with -EFAULT when a safe guest access fails. */
-#define SIG_MUST(expr) do { if ((expr) != 0) { return -EFAULT; } } while (0)
-
-static int sig_ld32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t *out)
-{
-    uint32_t raw = 0U;
-    int rc;
-
-    if (out == NULL) {
-        return -EFAULT;
-    }
-    rc = ppc32_vm_copyin_safe(ctx, va, &raw, sizeof raw);
-    if (rc != 0) {
-        return rc;
-    }
-    *out = ppc32_be32(raw);
-    return 0;
-}
-
-static int sig_ld64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t *out)
-{
-    uint64_t raw = 0ULL;
-    int rc;
-
-    if (out == NULL) {
-        return -EFAULT;
-    }
-    rc = ppc32_vm_copyin_safe(ctx, va, &raw, sizeof raw);
-    if (rc != 0) {
-        return rc;
-    }
-    *out = ppc32_be64(raw);
-    return 0;
-}
-
-static int sig_st32(const ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
-{
-    uint32_t t = ppc32_be32(v);
-
-    return ppc32_vm_copyout_safe(ctx, va, &t, sizeof t);
-}
-
-static int sig_st64(const ppc32_ctx_t *ctx, uint32_t va, uint64_t v)
-{
-    uint64_t t = ppc32_be64(v);
-
-    return ppc32_vm_copyout_safe(ctx, va, &t, sizeof t);
-}
-
-static int sig_zero(const ppc32_ctx_t *ctx, uint32_t va, size_t len)
-{
-    static const char zeros[64] = { 0 };
-    uint32_t cur = va;
-    size_t left = len;
-
-    while (left > 0U) {
-        size_t n = (left > sizeof zeros) ? sizeof zeros : left;
-        int rc = ppc32_vm_copyout_safe(ctx, cur, zeros, n);
-
-        if (rc != 0) {
-            return rc;
-        }
-        cur += (uint32_t)n;
-        left -= n;
-    }
-    return 0;
-}
-
-/* Mask word with bit (sig-1) set; 0 when sig is outside 1..64. */
-static uint64_t sig_bit(int sig)
-{
-    if (sig < 1 || sig > (int)PPC32_NSIG) {
-        return 0ULL;
-    }
-    return 1ULL << (uint64_t)(sig - 1);
-}
+/* BE scalar helpers, sigframe geometry, and SIG_MUST live in
+ * signals_priv.h (shared with signals_dispatch.c). */
 
 /* SIGKILL/SIGSTOP can never be caught, blocked, or ignored. */
 int ppc32_sig_is_catchable(int sig)
@@ -190,6 +105,7 @@ void ppc32_sig_reset(void)
 {
     uint32_t i;
 
+    sig_disp_lock_acquire();
     for (i = 0U; i <= PPC32_NSIG; i++) {
         sig_actions[i].handler = PPC32_SIG_DFL;
         sig_actions[i].flags = 0U;
@@ -198,6 +114,7 @@ void ppc32_sig_reset(void)
         sig_actions[i].mask[1] = 0U;
         sig_installed[i] = 0;
     }
+    sig_disp_lock_release();
 }
 
 int ppc32_sigaction_get(int sig, ppc32_sigact_t *out)
@@ -205,11 +122,9 @@ int ppc32_sigaction_get(int sig, ppc32_sigact_t *out)
     if (sig < 1 || sig > (int)PPC32_NSIG || out == NULL) {
         return -EINVAL;
     }
-    out->handler = sig_actions[(uint32_t)sig].handler;
-    out->flags = sig_actions[(uint32_t)sig].flags;
-    out->restorer = sig_actions[(uint32_t)sig].restorer;
-    out->mask[0] = sig_actions[(uint32_t)sig].mask[0];
-    out->mask[1] = sig_actions[(uint32_t)sig].mask[1];
+    sig_disp_lock_acquire();
+    *out = sig_actions[(uint32_t)sig];
+    sig_disp_lock_release();
     return 0;
 }
 
@@ -221,42 +136,33 @@ int ppc32_sigaction_set_raw(int sig, const ppc32_sigact_t *act)
     if (!ppc32_sig_is_catchable(sig) && act->handler != PPC32_SIG_DFL) {
         return -EINVAL;
     }
-    sig_actions[(uint32_t)sig].handler = act->handler;
-    sig_actions[(uint32_t)sig].flags = act->flags;
-    sig_actions[(uint32_t)sig].restorer = act->restorer;
-    sig_actions[(uint32_t)sig].mask[0] = act->mask[0];
-    sig_actions[(uint32_t)sig].mask[1] = act->mask[1];
+    sig_disp_lock_acquire();
+    sig_actions[(uint32_t)sig] = *act;
     sig_installed[(uint32_t)sig] = 1;
+    sig_disp_lock_release();
     return 0;
 }
 
-/* Current altstack flags for ucontext: SS_ONSTACK when sp is inside it. */
-static uint32_t sig_current_stack_flags(const ppc32_ctx_t *ctx)
+/* execve disposition reset (Linux semantics): caught dispositions return
+ * to SIG_DFL, ignored ones stay ignored. The calling thread's blocked
+ * mask and pending set are per-thread state owned by the caller and are
+ * preserved, not cleared here. */
+void ppc32_sig_reset_exec(void)
 {
-    uint32_t sp = ctx->gpr[PPC32_REG_SP];
+    uint32_t i;
 
-    if (ctx->altstack_size == 0U ||
-        (ctx->altstack_flags & PPC32_SS_DISABLE) != 0U) {
-        return PPC32_SS_DISABLE;
+    sig_disp_lock_acquire();
+    for (i = 1U; i <= PPC32_NSIG; i++) {
+        if (sig_actions[i].handler != PPC32_SIG_IGN) {
+            sig_actions[i].handler = PPC32_SIG_DFL;
+            sig_actions[i].flags = 0U;
+            sig_actions[i].restorer = 0U;
+            sig_actions[i].mask[0] = 0U;
+            sig_actions[i].mask[1] = 0U;
+            sig_installed[i] = 0;
+        }
     }
-    if (sp >= ctx->altstack_sp &&
-        sp < ctx->altstack_sp + ctx->altstack_size) {
-        return PPC32_SS_ONSTACK;
-    }
-    return 0U;
-}
-
-/* Pick the frame base: altstack top with SA_ONSTACK, else current sp. */
-static uint32_t sig_frame_base(const ppc32_ctx_t *ctx, uint32_t flags)
-{
-    uint32_t sp = ctx->gpr[PPC32_REG_SP];
-
-    if ((flags & PPC32_SA_ONSTACK) != 0U && ctx->altstack_size != 0U &&
-        (ctx->altstack_flags & PPC32_SS_DISABLE) == 0U &&
-        sig_current_stack_flags(ctx) != PPC32_SS_ONSTACK) {
-        return ctx->altstack_sp + ctx->altstack_size;
-    }
-    return sp;
+    sig_disp_lock_release();
 }
 
 int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
@@ -404,13 +310,8 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
     ctx->sig_last_frame_va = frame;
     ctx->sig_last_frame_rt = 1U;
 
-    if ((act->flags & PPC32_SA_RESETHAND) != 0U) {
-        sig_actions[(uint32_t)sig].handler = PPC32_SIG_DFL;
-        sig_actions[(uint32_t)sig].flags = 0U;
-        sig_actions[(uint32_t)sig].restorer = 0U;
-        sig_actions[(uint32_t)sig].mask[0] = 0U;
-        sig_actions[(uint32_t)sig].mask[1] = 0U;
-    }
+    /* SA_RESETHAND consumption lives in ppc32_sig_deliver_sync (atomic
+     * with disposition selection, before this frame work starts). */
 
     *out_frame_va = frame;
     return 0;
@@ -563,9 +464,21 @@ long ppc32_sig_deliver_sync(ppc32_ctx_t *ctx, int sig, int code,
     if (sig < 1 || sig > (int)PPC32_NSIG) {
         return -EINVAL;
     }
-    if (ppc32_sigaction_get(sig, &act) != 0) {
-        return -EINVAL;
+    /* Snapshot and consume one-shot state atomically: selection plus the
+     * SA_RESETHAND clear happen under the disposition lock, before any
+     * frame construction or guest-memory access, so a concurrent
+     * sigaction update cannot interleave a mixed disposition. */
+    sig_disp_lock_acquire();
+    act = sig_actions[(uint32_t)sig];
+    if (act.handler != PPC32_SIG_DFL && act.handler != PPC32_SIG_IGN &&
+        (act.flags & PPC32_SA_RESETHAND) != 0U) {
+        sig_actions[(uint32_t)sig].handler = PPC32_SIG_DFL;
+        sig_actions[(uint32_t)sig].flags = 0U;
+        sig_actions[(uint32_t)sig].restorer = 0U;
+        sig_actions[(uint32_t)sig].mask[0] = 0U;
+        sig_actions[(uint32_t)sig].mask[1] = 0U;
     }
+    sig_disp_lock_release();
     if (act.handler == PPC32_SIG_IGN) {
         return 1;
     }
@@ -590,8 +503,13 @@ long ppc32_sig_deliver_sync(ppc32_ctx_t *ctx, int sig, int code,
 static long sys_rt_sigaction(ppc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
     uint32_t old_va, uint32_t setsize)
 {
+    /* Guest struct sigaction: handler, flags, restorer, mask[2]. The
+     * request is snapshotted before the old value is written: act_va
+     * and old_va may alias or overlap, and the output write must not
+     * destroy the input. */
     ppc32_sigact_t neu;
     ppc32_sigact_t old;
+    int have_new = 0;
 
     if (sig < 1U || sig > PPC32_NSIG) {
         return -EINVAL;
@@ -599,23 +517,25 @@ static long sys_rt_sigaction(ppc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
     if (setsize != PPC32_SIGSET_SIZE) {
         return -EINVAL;
     }
-    if (ppc32_sigaction_get((int)sig, &old) != 0) {
-        return -EINVAL;
-    }
-    if (old_va != 0U) {
-        /* Guest struct sigaction: handler, flags, restorer, mask[2]. */
-        SIG_MUST(sig_st32(ctx, old_va, old.handler));
-        SIG_MUST(sig_st32(ctx, old_va + 4U, old.flags));
-        SIG_MUST(sig_st32(ctx, old_va + 8U, old.restorer));
-        SIG_MUST(sig_st32(ctx, old_va + 12U, old.mask[0]));
-        SIG_MUST(sig_st32(ctx, old_va + 16U, old.mask[1]));
-    }
     if (act_va != 0U) {
         SIG_MUST(sig_ld32(ctx, act_va, &neu.handler));
         SIG_MUST(sig_ld32(ctx, act_va + 4U, &neu.flags));
         SIG_MUST(sig_ld32(ctx, act_va + 8U, &neu.restorer));
         SIG_MUST(sig_ld32(ctx, act_va + 12U, &neu.mask[0]));
         SIG_MUST(sig_ld32(ctx, act_va + 16U, &neu.mask[1]));
+        have_new = 1;
+    }
+    if (ppc32_sigaction_get((int)sig, &old) != 0) {
+        return -EINVAL;
+    }
+    if (old_va != 0U) {
+        SIG_MUST(sig_st32(ctx, old_va, old.handler));
+        SIG_MUST(sig_st32(ctx, old_va + 4U, old.flags));
+        SIG_MUST(sig_st32(ctx, old_va + 8U, old.restorer));
+        SIG_MUST(sig_st32(ctx, old_va + 12U, old.mask[0]));
+        SIG_MUST(sig_st32(ctx, old_va + 16U, old.mask[1]));
+    }
+    if (have_new != 0) {
         if (ppc32_sigaction_set_raw((int)sig, &neu) != 0) {
             return -EINVAL;
         }
@@ -626,40 +546,55 @@ static long sys_rt_sigaction(ppc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
 static long sys_rt_sigprocmask(ppc32_ctx_t *ctx, uint32_t how,
     uint32_t set_va, uint32_t old_va, uint32_t setsize)
 {
+    /* The requested set is snapshotted before the old mask is written:
+     * set_va and old_va may alias or overlap. how is validated up
+     * front (kernel order): a bad how fails before any output write. */
     uint64_t new_mask;
-    uint64_t set;
+    uint64_t set = 0ULL;
+    uint64_t old_mask;
+    int have_new = 0;
 
     if (setsize != PPC32_SIGSET_SIZE) {
         return -EINVAL;
-    }
-    if (old_va != 0U) {
-        SIG_MUST(sig_st32(ctx, old_va,
-            (uint32_t)(ctx->sig_mask & 0xFFFFFFFFULL)));
-        SIG_MUST(sig_st32(ctx, old_va + 4U,
-            (uint32_t)((ctx->sig_mask >> 32) & 0xFFFFFFFFULL)));
     }
     if (set_va != 0U) {
         uint32_t set_lo = 0U;
         uint32_t set_hi = 0U;
 
+        switch (how) {
+        case PPC32_SIG_BLOCK:
+        case PPC32_SIG_UNBLOCK:
+        case PPC32_SIG_SETMASK:
+            break;
+        default:
+            return -EINVAL;
+        }
         SIG_MUST(sig_ld32(ctx, set_va, &set_lo));
         SIG_MUST(sig_ld32(ctx, set_va + 4U, &set_hi));
         set = (uint64_t)set_lo | ((uint64_t)set_hi << 32);
         /* SIGKILL/SIGSTOP are never blocked. */
         set &= ~(sig_bit((int)PPC32_SIGKILL) |
             sig_bit((int)PPC32_SIGSTOP));
+        have_new = 1;
+    }
+    old_mask = ctx->sig_mask;
+    if (old_va != 0U) {
+        SIG_MUST(sig_st32(ctx, old_va,
+            (uint32_t)(old_mask & 0xFFFFFFFFULL)));
+        SIG_MUST(sig_st32(ctx, old_va + 4U,
+            (uint32_t)((old_mask >> 32) & 0xFFFFFFFFULL)));
+    }
+    if (have_new != 0) {
         switch (how) {
         case PPC32_SIG_BLOCK:
-            new_mask = ctx->sig_mask | set;
+            new_mask = old_mask | set;
             break;
         case PPC32_SIG_UNBLOCK:
-            new_mask = ctx->sig_mask & ~set;
-            break;
-        case PPC32_SIG_SETMASK:
-            new_mask = set;
+            new_mask = old_mask & ~set;
             break;
         default:
-            return -EINVAL;
+            new_mask = set;
+            break;
         }
         ctx->sig_mask = new_mask;
     }
@@ -696,23 +631,29 @@ static long sys_rt_sigreturn(ppc32_ctx_t *ctx)
 static long sys_sigaltstack(ppc32_ctx_t *ctx, uint32_t uss_va,
     uint32_t uoss_va)
 {
-    uint32_t sp;
-    uint32_t flags;
-    uint32_t size;
+    /* Snapshot the request before writing the old stack: uss_va and
+     * uoss_va may alias or overlap. */
+    uint32_t sp = 0U;
+    uint32_t flags = 0U;
+    uint32_t size = 0U;
     uint32_t cur_flags;
+    int have_new = 0;
 
+    if (uss_va != 0U) {
+        SIG_MUST(sig_ld32(ctx, uss_va, &sp));
+        SIG_MUST(sig_ld32(ctx, uss_va + 4U, &flags));
+        SIG_MUST(sig_ld32(ctx, uss_va + 8U, &size));
+        have_new = 1;
+    }
     if (uoss_va != 0U) {
         cur_flags = sig_current_stack_flags(ctx);
         SIG_MUST(sig_st32(ctx, uoss_va, ctx->altstack_sp));
         SIG_MUST(sig_st32(ctx, uoss_va + 4U, (uint32_t)(int32_t)cur_flags));
         SIG_MUST(sig_st32(ctx, uoss_va + 8U, ctx->altstack_size));
     }
-    if (uss_va == 0U) {
+    if (have_new == 0) {
         return 0;
     }
-    SIG_MUST(sig_ld32(ctx, uss_va, &sp));
-    SIG_MUST(sig_ld32(ctx, uss_va + 4U, &flags));
-    SIG_MUST(sig_ld32(ctx, uss_va + 8U, &size));
     if ((flags & ~(PPC32_SS_DISABLE | PPC32_SS_ONSTACK)) != 0U) {
         return -EINVAL;
     }

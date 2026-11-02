@@ -53,6 +53,25 @@ void vm32_ll_unlock_if_held_by_self(void)
     }
 }
 
+/* Fork coordination (P32-R3-4): hold the reservation lock across the
+ * snapshot in the parent; the child drops the inherited locked value
+ * and clears the copied thread-local held flag. */
+void vm32_ll_fork_prepare(void)
+{
+    ll_lock_acquire();
+}
+
+void vm32_ll_fork_parent(void)
+{
+    ll_lock_release();
+}
+
+void vm32_ll_fork_child(void)
+{
+    g_ll_lock_held = 0;
+    atomic_store_explicit(&g_ll_lock, 0U, memory_order_release);
+}
+
 /* Shared mapping generation (RC-U3-r2 #1): guest-mm teardowns bump it
  * via vm32_ll_note_remap, so a pre-teardown reservation can never
  * succeed after it (line epochs alone cannot see a remap). */
@@ -359,8 +378,13 @@ void interp_step(ppc32_ctx_t *ctx)
         break;
     case PPC32_OP_DIVW:
     case PPC32_OP_DIVWU: {
+        /* Snapshot both operands first: RT may alias RA/RB, so the
+         * destination write below must not feed the divisor test. */
         int32_t sa = (int32_t)ctx->gpr[insn.ra];
         int32_t sb = (int32_t)ctx->gpr[insn.rb];
+        uint32_t da = ctx->gpr[insn.ra];
+        uint32_t db = ctx->gpr[insn.rb];
+        bool div_ov;
 
         if (insn.op == PPC32_OP_DIVW) {
             if (sb == 0) {
@@ -371,17 +395,17 @@ void interp_step(ppc32_ctx_t *ctx)
                 r = (uint32_t)(sa / sb);
             }
         } else {
-            if (ctx->gpr[insn.rb] == 0U) {
+            if (db == 0U) {
                 r = 0U;
             } else {
-                r = ctx->gpr[insn.ra] / ctx->gpr[insn.rb];
+                r = da / db;
             }
         }
+        div_ov = (db == 0U) ||
+            (insn.op == PPC32_OP_DIVW &&
+             sa == (int32_t)0x80000000U && sb == -1);
         ctx->gpr[insn.rt] = r;
         if (insn.oe != 0U) {
-            bool div_ov = (ctx->gpr[insn.rb] == 0U) ||
-                (insn.op == PPC32_OP_DIVW &&
-                 sa == (int32_t)0x80000000U && sb == -1);
             xer_set_ov(ctx, div_ov);
         }
         if (insn.rc != 0U) {

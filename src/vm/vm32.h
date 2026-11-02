@@ -117,6 +117,13 @@ void vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
 void vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva);
 void vm32_tlb_invalidate_all(void);
 
+/* Fork coordination (P32-R3-4): the parent holds the TLB lock across
+ * the snapshot so no fill/invalidate is half-written; the child drops
+ * the inherited locked value (its owner is gone). */
+void vm32_tlb_fork_prepare(void);
+void vm32_tlb_fork_parent(void);
+void vm32_tlb_fork_child(void);
+
 /* ---- Regime A2 host-page permission unions (RC-U3 finding 3) ----
  *
  * One host page (H > 4096) packs several 4 KiB guest sub-pages, so a
@@ -193,9 +200,27 @@ bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val);
  * ~0 on reserved pages so stores always trap here. */
 void vm32_reservation_bump(uint32_t gva_aligned);
 void vm32_ll_unlock_if_held_by_self(void);
+
+/* Fork coordination (P32-R3-4): the parent holds the LL/SC reservation
+ * lock across the snapshot; the child drops the inherited locked value
+ * and clears the copied thread-local held flag (the syscall path never
+ * holds it, so the forking thread's copy is always clear). */
+void vm32_ll_fork_prepare(void);
+void vm32_ll_fork_parent(void);
+void vm32_ll_fork_child(void);
+
+/* Shared LL/SC generation lives with the reservation table
+ * (src/interp/interp.c); mapping teardowns bump it so a pre-teardown
+ * lwarx can never succeed after its page was unmapped (RC-U3-r2 #1). */
+void vm32_ll_note_remap(void);
 void ppc32_vm_lock(void);
 void ppc32_vm_unlock(void);
 void ppc32_vm_unlock_if_held_by_self(void);
+
+/* Fork coordination (P32-R3-4): the parent holds the VM lock across the
+ * snapshot; the child drops the inherited locked value (its owner is
+ * gone) and clears the copied thread-local held flag. */
+void ppc32_vm_fork_child(void);
 
 /* ---- Relative DBT memory-site records (section 4.3.3) ---- */
 
@@ -236,6 +261,42 @@ int vm_file_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len);
 void vm_file_note_private(int host_fd, uint32_t gva_base, uint32_t pages,
     uint64_t map_offset);
+
+/* Drop inode records overlapping [start_gva, end_gva): the range is
+ * being unmapped or replaced, so hooks must no longer treat it as
+ * file-backed. Fully covered records are reclaimed; edge overlaps
+ * shrink the record; an interior hole splits it when a free slot
+ * exists, otherwise the record is conservatively dropped. */
+void vm_file_untrack_range(uint32_t start_gva, uint32_t end_gva);
+
+/* Mark guest pages wholly beyond EOF as SIGBUS trap pages: staged
+ * MAP_SHARED mappings have no host page fault to supply it. Only whole
+ * pages past the rounded-up EOF move; the partial tail page keeps its
+ * zero-filled bytes. Private mappings keep zero-filled reads (correct
+ * Linux behavior), so callers gate on MAP_SHARED. */
+void vm_file_trap_beyond_eof(int host_fd, uint32_t gva_base,
+    uint64_t map_offset, size_t len);
+
+/* Fork coordination (P32-R3-4): the parent holds the inode lock across
+ * the snapshot so no registration is half-written; the child drops the
+ * inherited locked value (its owner is gone). */
+void vm_file_fork_prepare(void);
+void vm_file_fork_parent(void);
+void vm_file_fork_child(void);
+
+/* A2 sub-page MAP_SHARED staging (P32-R3-3, src/vm/vm_file.c). Every
+ * entry point runs under the VM lock; stage fds stay shared across fork
+ * via MAP_SHARED, and the region-side GC drops unreferenced groups. */
+int vm_file_shared_acquire(int src_fd, uint64_t file_offset, size_t len,
+    int *out_stage_fd);
+void vm_file_shared_writeback_file_range(int fd, uint64_t lo, uint64_t hi);
+size_t vm_file_shared_group_count(void);
+bool vm_file_shared_group_key(size_t idx, uint64_t *dev_out,
+    uint64_t *ino_out, uint64_t *off_out);
+void vm_file_shared_drop_group(uint64_t dev, uint64_t ino, uint64_t off);
+int vm_file_shared_map_at(void *host_target, size_t map_len, int use_fd,
+    uint64_t host_off, uint32_t target_va, uint32_t map_end, uint8_t prot,
+    uint8_t state);
 void vm_file_promote_cow(uint32_t gva_page);
 int vm_file_on_truncate(uint64_t new_size);
 int vm_file_hook_write(int host_fd, uint64_t end_offset);

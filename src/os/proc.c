@@ -43,9 +43,13 @@
 #include <unistd.h>
 
 #include "os/convert.h"
+#include "os/signals.h"
 #include "os/syscall_nr.h"
+#include "os/threads.h"
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
+#include "rt32/ppc32_vm_priv.h"
+#include "vm/vm32.h"
 
 /* execve vector bounds: Linux caps MAX_ARG_STRINGS at 2^31 pages, but a
  * translator-side copy keeps a small fixed table (no VLA); beyond it
@@ -99,6 +103,48 @@ long ppc32_proc_getpid(void)
     return (long)getpid();
 }
 
+/* Coordinated fork protocol (P32-R3-4): the parent holds every
+ * process-global runtime lock across the snapshot so no update is
+ * half-written when the address space clones, releases them after a
+ * parent return, and the child drops every inherited locked value
+ * (each owner is gone) and rebuilds the thread table around the sole
+ * surviving thread. Global acquisition order (outermost first, matching
+ * all observed runtime nesting: dispositions enter the VM through the
+ * locked copy helpers; file and TLB updates run under the VM lock):
+ * signal dispositions, thread table, VM, TLB, inode, LL/SC. The fork
+ * syscall path holds none of these on entry, so the prepare cannot
+ * self-deadlock; a concurrent holder only delays the snapshot. */
+static void proc_fork_prepare(void)
+{
+    ppc32_sig_fork_prepare();
+    ppc32_thread_fork_prepare();
+    ppc32_vm_lock();
+    vm32_tlb_fork_prepare();
+    vm_file_fork_prepare();
+    vm32_ll_fork_prepare();
+}
+
+static void proc_fork_parent(void)
+{
+    vm32_ll_fork_parent();
+    vm_file_fork_parent();
+    vm32_tlb_fork_parent();
+    ppc32_vm_unlock();
+    ppc32_thread_fork_parent();
+    ppc32_sig_fork_parent();
+}
+
+static void proc_fork_child(ppc32_ctx_t *ctx)
+{
+    vm32_ll_fork_child();
+    vm_file_fork_child();
+    vm32_tlb_fork_child();
+    ppc32_vm_fork_child();
+    proc_child_refresh(ctx);
+    ppc32_thread_fork_child(ctx);
+    ppc32_sig_fork_child();
+}
+
 long ppc32_proc_fork(ppc32_ctx_t *ctx)
 {
     pid_t pid;
@@ -107,14 +153,19 @@ long ppc32_proc_fork(ppc32_ctx_t *ctx)
         return -EFAULT;
     }
     proc_invalidate_reservation(ctx);
+    proc_fork_prepare();
     pid = fork();
     if (pid < 0) {
-        return -(long)errno;
+        int e = errno;
+
+        proc_fork_parent();
+        return -(long)e;
     }
     if (pid == 0) {
-        proc_child_refresh(ctx);
+        proc_fork_child(ctx);
         return 0;
     }
+    proc_fork_parent();
     return (long)pid;
 }
 
@@ -407,9 +458,12 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         proc_free_vec(env, envc);
         return -ENOEXEC;
     }
-    /* Fresh process image: the register file, pending signals, signal
-     * stack, thread identity, and heap/stack mirrors reset to the
-     * load state (Linux exec semantics); then the new stack + auxv. */
+    /* Fresh process image: the register file, signal stack, thread
+     * identity, and heap/stack mirrors reset to the load state; then
+     * the new stack + auxv. Linux exec semantics for signals: caught
+     * dispositions return to SIG_DFL (ignored ones stay ignored), while
+     * the calling thread's blocked mask and pending set survive the
+     * image replacement, so neither is cleared here. */
     memset(ctx->gpr, 0, sizeof ctx->gpr);
     memset(ctx->gpr_hi, 0, sizeof ctx->gpr_hi);
     memset(ctx->fpr, 0, sizeof ctx->fpr);
@@ -425,8 +479,7 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     ctx->res_val = 0U;
     ctx->res_valid = 0U;
     ctx->reservation_epoch++;
-    ctx->sig_mask = 0ULL;
-    ctx->pending_signals = 0ULL;
+    ppc32_sig_reset_exec();
     ctx->sig_last_frame_va = 0U;
     ctx->sig_last_frame_rt = 0U;
     ctx->altstack_sp = 0U;

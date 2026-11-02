@@ -659,6 +659,85 @@ static void test_p32_5_6_11_vm_and_syscalls(void)
     }
 }
 
+/* P32-R3-3: guest-4K (but host-sub-page) MAP_SHARED file mappings keep
+ * coherent sharing: two aliases of the same file range and parent/child
+ * across fork() observe each other's stores. */
+static void test_p32_r3_3_subpage_shared(void)
+{
+    ppc32_ctx_t ctx;
+    char tmp_path[] = "/tmp/ppc32rt-r33-test.XXXXXX";
+    int fd;
+    uint32_t alias_a;
+    uint32_t alias_b;
+    uint32_t seed_be = 0x78563412U;
+
+    fd = mkstemp(tmp_path);
+    CHECK(fd >= 0, "mkstemp r3-3");
+    if (fd < 0) {
+        return;
+    }
+    (void)unlink(tmp_path);
+    CHECK(ftruncate(fd, 65536) == 0, "ftruncate r3-3");
+    /* Seed file bytes at the shared offset before mapping. */
+    CHECK(pwrite(fd, &seed_be, sizeof seed_be, 0x1000) == 4,
+        "pwrite seed r3-3");
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK(ppc32_vm_init(&ctx, UINT64_MAX) == 0, "ppc32_vm_init r3-3");
+
+    alias_a = ppc32_vm_mmap2(&ctx, 0x300000U, 0x4000U, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_FIXED, fd, 1U);
+    CHECK(alias_a == 0x300000U, "sub-page MAP_SHARED mmap2 alias A");
+    if (alias_a != 0x300000U) {
+        (void)close(fd);
+        return;
+    }
+    CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base, alias_a) ==
+        0x12345678U, "staged mapping shows seeded file bytes");
+    alias_b = ppc32_vm_mmap2(&ctx, 0x304000U, 0x4000U, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_FIXED, fd, 1U);
+    CHECK(alias_b == 0x304000U, "sub-page MAP_SHARED mmap2 alias B");
+    if (alias_b != 0x304000U) {
+        (void)close(fd);
+        return;
+    }
+
+    write_be32((uint8_t *)(uintptr_t)ctx.guest_base, alias_a, 0xa1b2c3d4U);
+    CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base, alias_b) ==
+        0xa1b2c3d4U, "alias B observes store through alias A");
+    write_be32((uint8_t *)(uintptr_t)ctx.guest_base, alias_b + 4U,
+        0x5a5a5a5aU);
+    CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base,
+        alias_a + 4U) == 0x5a5a5a5aU,
+        "alias A observes store through alias B");
+
+    {
+        pid_t pid = fork();
+
+        CHECK(pid >= 0, "fork for sub-page MAP_SHARED test");
+        if (pid == 0) {
+            write_be32((uint8_t *)(uintptr_t)ctx.guest_base, alias_a + 8U,
+                0xdeadbeefU);
+            _Exit(0);
+        } else if (pid > 0) {
+            int status = 0;
+
+            (void)waitpid(pid, &status, 0);
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "fork child exited cleanly r3-3");
+            CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base,
+                alias_b + 8U) == 0xdeadbeefU,
+                "parent observes child store in sub-page MAP_SHARED");
+        }
+    }
+
+    CHECK(ppc32_vm_munmap(&ctx, alias_a, 0x4000U) == 0, "munmap alias A");
+    CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base, alias_b) ==
+        0xa1b2c3d4U, "surviving alias keeps shared bytes after peer munmap");
+    CHECK(ppc32_vm_munmap(&ctx, alias_b, 0x4000U) == 0, "munmap alias B");
+    (void)close(fd);
+}
+
 int main(void)
 {
     uint8_t *base = (uint8_t *)mmap(NULL, 0x200000U, PROT_READ | PROT_WRITE,
@@ -675,6 +754,7 @@ int main(void)
     (void)munmap(base, 0x200000U);
 
     test_p32_5_6_11_vm_and_syscalls();
+    test_p32_r3_3_subpage_shared();
 
     if (g_fails != 0) {
         fprintf(stderr, "check_p32_defects: %d FAILURES\n", g_fails);

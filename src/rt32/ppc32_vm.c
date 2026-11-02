@@ -41,16 +41,6 @@ uint32_t               g_vm_mmap_cursor = PPC32_MMAP_BASE_32;
 ppc32_region_t         g_vm_regions[PPC32_MAX_REGIONS];
 size_t                 g_vm_region_count = 0U;
 
-static int vm_reserve_prot_none(ppc32_ctx_t *ctx, uint32_t start, uint32_t len)
-{
-    void *res = mmap(ppc32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (res == MAP_FAILED) {
-        return -errno;
-    }
-    return 0;
-}
-
 /* Translation-cache invalidation on guest mm ops (D11 SMC): real since
  * Phase H H1; the interpreter has no code cache (the call is cheap). */
 #ifdef PPC32RT_NO_DBT
@@ -93,11 +83,6 @@ static int try_reserve_window(uint64_t base)
     }
     return 0;
 }
-
-/* Shared LL/SC generation lives with the reservation table
- * (src/interp/interp.c); mapping teardowns bump it so a pre-teardown
- * lwarx can never succeed after its page was unmapped (RC-U3-r2 #1). */
-void vm32_ll_note_remap(void);
 
 /* Publish the two-regime state when the legacy probe owns the window:
  * regime from the live host page size, A2 TLB armed empty. */
@@ -435,12 +420,24 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         state = (uint8_t)VM32_PAGE_COW_CLEAN;
     }
 
+    bool va_host_aligned = (((uint64_t)target_va & (hpsz - 1ULL)) == 0ULL);
+    bool off_host_aligned = (((uint64_t)host_off & (hpsz - 1ULL)) == 0ULL);
+    bool in_window =
+        ((uint64_t)target_va + host_map_len <= (uint64_t)PPC32_TASK_SIZE_TOP);
     bool shared_direct = is_shared && use_fd >= 0 &&
-                         ((uint64_t)target_va & (hpsz - 1ULL)) == 0ULL &&
-                         ((uint64_t)host_off & (hpsz - 1ULL)) == 0ULL &&
-                         (uint64_t)target_va + host_map_len <= (uint64_t)PPC32_TASK_SIZE_TOP;
-    uint32_t rec_end = map_end;
-    if (shared_direct && host_map_len > aligned_len) {
+                         va_host_aligned && off_host_aligned && in_window;
+    /* A2 sub-page shared file staging (P32-R3-3): guest-4K-aligned file
+     * offsets below host granularity cannot map MAP_SHARED from the file,
+     * so they share a memfd-backed staging object with the same alias and
+     * fork visibility as a direct mapping instead of failing. */
+    bool shared_staged = !shared_direct && vm32_is_a2() && is_shared &&
+                         use_fd >= 0 &&
+                         (host_flags & MAP_ANONYMOUS) == 0 &&
+                         va_host_aligned && in_window;
+    /* Guest-visible extent stays map_end: host_map_len may round up to a
+     * host page, but the padding is backing only — publishing guest perms
+     * over it would grant accessible memory past the requested mapping. */
+    if ((shared_direct || shared_staged) && host_map_len > aligned_len) {
         uint32_t host_end = (uint32_t)((uint64_t)target_va + host_map_len);
         bool tail_busy = vm_range_overlaps_locked(map_end, host_end);
         if (tail_busy || !vm_can_modify_range_locked(target_va, host_end, true)) {
@@ -450,7 +447,6 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             }
             return (uint32_t)(-ENOMEM);
         }
-        rec_end = host_end;
     }
     if (shared_direct) {
         int mprot = vm32_is_a2() ? (PROT_READ | PROT_WRITE) : host_prot;
@@ -467,11 +463,34 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             }
             return (uint32_t)err;
         }
-        vm32_record_map(target_va, rec_end, (uint8_t)(prot & 0x7U), state);
+        vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
         if (vm32_is_a2()) {
-            (void)vm32_sync_host_range(target_va, rec_end);
+            (void)vm32_sync_host_range(target_va, map_end);
+        }
+    } else if (shared_staged) {
+        /* Coherent sub-page sharing through the staged object (sh_fd is
+         * always -1 here: staging is file-backed only). */
+        int serr = vm_file_shared_map_at(host_target, (size_t)host_map_len,
+            use_fd, (uint64_t)host_off, target_va, map_end,
+            (uint8_t)(prot & 0x7U), state);
+
+        if (serr != 0) {
+            return (uint32_t)serr;
         }
     } else if (vm32_is_a2()) {
+        /* Shared mappings that are neither host-eligible (direct) nor
+         * file-staged (anonymous MAP_SHARED below host granularity, or a
+         * host-rounded tail past the window) still have no coherent
+         * backing here: fail instead of reporting MAP_SHARED semantics
+         * that a private copy could not honor. */
+        if (is_shared) {
+            bool misaligned = !va_host_aligned || !off_host_aligned;
+
+            if (sh_fd >= 0) {
+                (void)close(sh_fd);
+            }
+            return (uint32_t)(misaligned ? -EINVAL : -ENOMEM);
+        }
         vm32_record_map(target_va, map_end,
             (uint8_t)(PROT_READ | PROT_WRITE), state);
         if (vm32_sync_host_range(target_va, map_end) != 0) {
@@ -481,7 +500,7 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             }
             return (uint32_t)(-ENOMEM);
         }
-        if (use_fd < 0 || sh_fd >= 0) {
+        if (use_fd < 0) {
             memset(host_target, 0, (size_t)aligned_len);
         } else {
             int prc = vm_file_populate_private(host_target, use_fd,
@@ -514,8 +533,8 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
     }
 
     uint64_t rec_off = (use_fd >= 0) ? (uint64_t)host_off : 0ULL;
-    uint32_t rec_len = (uint32_t)((uint64_t)rec_end - (uint64_t)target_va);
-    int rrc = vm_record_region_ex_locked(target_va, rec_end, prot & 0x7U, flags, use_fd, rec_off, "[mmap]");
+    uint32_t rec_len = (uint32_t)((uint64_t)map_end - (uint64_t)target_va);
+    int rrc = vm_record_region_ex_locked(target_va, map_end, prot & 0x7U, flags, use_fd, rec_off, "[mmap]");
     if (sh_fd >= 0) {
         (void)close(sh_fd);
     }
@@ -524,9 +543,22 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             (void)vm32_unmap_union(target_va, rec_len);
         } else {
             (void)vm_reserve_prot_none(ctx, target_va, rec_len);
-            vm32_record_unmap(target_va, rec_end);
+            vm32_record_unmap(target_va, map_end);
         }
         return (uint32_t)(-ENOMEM);
+    }
+    /* Region publication unmaps overlapping ranges first, which drops
+     * their inode records — including the fresh one populated above.
+     * Re-register file backing after the insert so the new mapping
+     * keeps its identity and EOF tracking. */
+    if (sh_fd < 0 && use_fd >= 0 && (host_flags & MAP_ANONYMOUS) == 0) {
+        vm_file_note_private(use_fd, target_va,
+            (uint32_t)(aligned_len / 4096ULL),
+            (uint64_t)host_off);
+        if (is_shared && vm32_is_a2()) {
+            vm_file_trap_beyond_eof(use_fd, target_va,
+                (uint64_t)host_off, (size_t)aligned_len);
+        }
     }
     if (update_cursor) {
         g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + host_map_len);
@@ -613,45 +645,6 @@ int ppc32_vm_mprotect(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t pr
         vm_invalidate_jit(ctx, addr, (uint32_t)((uint64_t)addr + page_align_up((uint64_t)len)));
     }
     return rc;
-}
-
-static int vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
-{
-    if (!ctx || (addr & (PPC32_PAGE_SIZE - 1U)) != 0U || len == 0U) {
-        return -EINVAL;
-    }
-    uint64_t aligned_len = page_align_up((uint64_t)len);
-    if (addr < PPC32_LOW_GUARD_SIZE ||
-        (uint64_t)addr + aligned_len > (uint64_t)PPC32_TASK_SIZE_TOP) {
-        return -EINVAL;
-    }
-
-    uint32_t start = ppc32_page_down(addr);
-    uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
-    if (!vm_can_modify_range_locked(start, end, false)) {
-        return -ENOMEM;
-    }
-
-    if (vm32_is_a2()) {
-        int urc = vm32_unmap_union(start, (uint32_t)aligned_len);
-        if (urc != 0) {
-            return urc;
-        }
-    } else {
-        int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
-        if (rc != 0) {
-            return rc;
-        }
-        vm32_record_unmap(start, end);
-    }
-
-    vm_unmap_regions_locked(start, end);
-    vm32_tlb_invalidate_range(start, end);
-    vm32_ll_note_remap();
-    if (g_vm_mmap_cursor == end && start >= PPC32_MMAP_BASE_32) {
-        g_vm_mmap_cursor = start;
-    }
-    return 0;
 }
 
 int ppc32_vm_munmap(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
@@ -815,10 +808,15 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     }
 
     bool is_fixed      = (flags & PPC32_MREMAP_FIXED) != 0U;
-    bool shared_backed = is_shared && has_fd &&
-                         (!vm32_is_a2() ||
-                          ((!is_fixed || ((uint64_t)new_addr & (hpsz - 1ULL)) == 0ULL) &&
-                           (orig_offset & (hpsz - 1ULL)) == 0ULL));
+    bool fixed_va_ok   = !is_fixed ||
+                         (((uint64_t)new_addr & (hpsz - 1ULL)) == 0ULL);
+    bool direct_ok     = ((orig_offset & (hpsz - 1ULL)) == 0ULL);
+    /* A2 file-backed sub-page sharing restages through the same shared
+     * object (P32-R3-3), so it moves like a directly backed mapping. */
+    bool staged_ok     = vm32_is_a2() &&
+                         (keep_flags & PPC32_MAP_ANONYMOUS) == 0U;
+    bool shared_backed = is_shared && has_fd && fixed_va_ok &&
+                         (!vm32_is_a2() || direct_ok || staged_ok);
     if ((is_shared && !shared_backed) ||
         !vm_can_modify_range_locked(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned), false)) {
         return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-ENOMEM));
