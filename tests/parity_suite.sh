@@ -181,6 +181,15 @@ fi
 # --- oracle vs committed goldens (docker qemu-ppc ground truth) ------
 
 log "== oracle vs goldens (docker) =="
+need_oracle="$need_build"
+[ -f "$B/ora-rc.txt" ] || need_oracle=1
+for _g in p1_isa p2_libc p3_fp p4_threads h1_smc p5_dyn h4_cxx p3_torture tcg_smoke; do
+    [ -f "$B/ora-$_g-750.txt" ] || need_oracle=1
+done
+for _g in p1_isa p3_fp p4_threads h1_smc; do
+    [ -f "$B/ora-$_g-e500v2.txt" ] || need_oracle=1
+done
+if [ "$need_oracle" = "1" ]; then
 if ! command -v docker >/dev/null 2>&1; then
     for _g in p1_isa p3_fp p4_threads h1_smc p2_libc p3_torture tcg_smoke \
         p5_dyn h4_cxx; do
@@ -217,6 +226,7 @@ done
         done
     fi
     if command -v docker >/dev/null 2>&1; then docker ps >/dev/null 2>&1; fi
+fi
 fi
 
 oracle_row() {
