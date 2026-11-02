@@ -22,7 +22,7 @@ endif
 # src/main.c calls setenv(3), which musl hides under strict -std=c11 unless a
 # POSIX feature-test macro is visible; expose exactly that (keeps -pedantic
 # and every prescribed warning intact).
-CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
+CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 LDFLAGS ?= -static-pie
 LDLIBS ?= -lm # RC3: interp fp.c fsqrt uses host sqrt(3)
 
@@ -74,7 +74,7 @@ build-darwin: ## Build native macOS arm64 ppc32rt-darwin binary
 		CC=cc \
 		OBJ_DIR=$(BUILD_DIR)/darwin-obj \
 		PPC32RT_BIN=$(BUILD_DIR)/ppc32rt-darwin \
-		CFLAGS="-std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32" \
+		CFLAGS="-std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32" \
 		LDFLAGS=""
 
 $(PPC32RT_BIN): $(OBJS)

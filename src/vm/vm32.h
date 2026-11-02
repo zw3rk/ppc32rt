@@ -192,6 +192,10 @@ bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val);
  * path (DBT slow path, interp, copyout, sigframe). Forces write_tag ==
  * ~0 on reserved pages so stores always trap here. */
 void vm32_reservation_bump(uint32_t gva_aligned);
+void vm32_ll_unlock_if_held_by_self(void);
+void ppc32_vm_lock(void);
+void ppc32_vm_unlock(void);
+void ppc32_vm_unlock_if_held_by_self(void);
 
 /* ---- Relative DBT memory-site records (section 4.3.3) ---- */
 

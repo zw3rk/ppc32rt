@@ -58,6 +58,15 @@ int      ppc32_vm_munmap(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len);
 uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                         uint32_t new_len, uint32_t flags, uint32_t new_addr);
 void     ppc32_vm_sync_ctx(ppc32_ctx_t *ctx);
+void     ppc32_vm_lock(void);
+void     ppc32_vm_unlock(void);
+void     ppc32_vm_unlock_if_held_by_self(void);
+bool     ppc32_vm_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va,
+                                size_t len, uint32_t need_prot);
+int      ppc32_vm_copyin_safe(const ppc32_ctx_t *ctx, uint32_t va,
+                              void *dst, size_t len);
+int      ppc32_vm_copyout_safe(const ppc32_ctx_t *ctx, uint32_t va,
+                               const void *src, size_t len);
 
 /* ELF32 loader & initial stack (ppc32_elf32.c, ppc32_stack32.c) */
 typedef struct ppc32_elf_info {

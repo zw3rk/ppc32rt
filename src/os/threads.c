@@ -15,6 +15,7 @@
 #endif
 
 #include "os/threads.h"
+#include "rt32/ppc32.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -40,54 +41,19 @@
 static bool thread_range_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
     uint32_t need_prot)
 {
-    uint64_t end;
-
-    if (ctx == NULL) {
-        return false;
-    }
-    if (len == 0U) {
-        return true;
-    }
-    if (len > PPC32_TASK_SIZE_TOP || va < PPC32_LOW_GUARD_SIZE) {
-        return false;
-    }
-    end = (uint64_t)va + (uint64_t)len;
-    if (end > (uint64_t)PPC32_TASK_SIZE_TOP || end < (uint64_t)va) {
-        return false;
-    }
-    if (ctx->vm_ready || ctx->region_count > 0U) {
-        uint32_t cur = va;
-        size_t i;
-
-        for (i = 0U; i < ctx->region_count && cur < (uint32_t)end; i++) {
-            const ppc32_region_t *r = &ctx->regions[i];
-
-            if (r->end <= cur) {
-                continue;
-            }
-            if (r->start > cur || (r->prot & need_prot) != need_prot) {
-                return false;
-            }
-            cur = (r->end < (uint32_t)end) ? r->end : (uint32_t)end;
-        }
-        return cur >= (uint32_t)end;
-    }
-    return true;
+    return ppc32_vm_range_prot_ok(ctx, va, len, need_prot);
 }
 
-static uint32_t thread_ld32be(const ppc32_ctx_t *ctx, uint32_t va)
-{
-    uint32_t raw = 0U;
-
-    memcpy(&raw, ppc32_guest_ptr(ctx, va), sizeof(raw));
-    return ppc32_be32(raw);
-}
-
-static void thread_st32be(const ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
+static int thread_st32be_safe(ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
     uint32_t raw = ppc32_be32(v);
 
-    memcpy(ppc32_guest_ptr(ctx, va), &raw, sizeof(raw));
+    return ppc32_vm_copyout_safe(ctx, va, &raw, sizeof(raw));
+}
+
+static void thread_st32be(ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
+{
+    (void)thread_st32be_safe(ctx, va, v);
 }
 
 /* ---- thread table (fixed, spinlock-guarded) ---- */
@@ -279,14 +245,15 @@ static long futex_host(int32_t *uaddr, int op, int32_t val,
 static int futex_get_timeout(const ppc32_ctx_t *ctx, uint32_t va,
     struct timespec *out)
 {
+    uint32_t raw[2];
     uint32_t sec;
     uint32_t nsec;
 
-    if (!thread_range_ok(ctx, va, 8U, 1U)) {
+    if (ppc32_vm_copyin_safe(ctx, va, raw, sizeof(raw)) != 0) {
         return -EFAULT;
     }
-    sec = thread_ld32be(ctx, va);
-    nsec = thread_ld32be(ctx, va + 4U);
+    sec = ppc32_be32(raw[0]);
+    nsec = ppc32_be32(raw[1]);
     if (nsec >= 1000000000U) {
         return -EINVAL;
     }
@@ -640,11 +607,10 @@ void ppc32_thread_exit(ppc32_ctx_t *child)
     }
     clear_va = child->clear_child_tid;
     child->clear_child_tid = 0U;
-    if (clear_va != 0U && thread_range_ok(child, clear_va, 4U, 2U)) {
+    if (clear_va != 0U && thread_st32be_safe(child, clear_va, 0U) == 0) {
         int32_t *up = (int32_t *)ppc32_guest_ptr(child, clear_va);
         long woken;
 
-        thread_st32be(child, clear_va, 0U);
         woken = futex_host(up, (int)PPC32_FUTEX_WAKE, 1, NULL, NULL, 0);
         (void)woken;
     }
@@ -667,6 +633,14 @@ void ppc32_thread_exit(ppc32_ctx_t *child)
 
 #ifdef PPC32RT_THREADS_TEST
 #include <stdio.h>
+
+static uint32_t thread_ld32be(const ppc32_ctx_t *ctx, uint32_t va)
+{
+    uint32_t raw = 0U;
+
+    (void)ppc32_vm_copyin_safe(ctx, va, &raw, sizeof(raw));
+    return ppc32_be32(raw);
+}
 
 #define TEST_WIN_SIZE (32U * 1024U * 1024U)
 #define TEST_UADDR 0x01000000U

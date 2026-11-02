@@ -33,6 +33,7 @@
 
 #include "os/sigframe_ppc32.h"
 #include "os/syscall_nr.h"
+#include "rt32/ppc32.h"
 
 /* siginfo/ucontext geometry inside struct rt_sigframe (frozen header). */
 #define SIGINFO_SIZE 128U
@@ -85,10 +86,19 @@ static int sig_range_ok(uint32_t va, size_t len)
         return 0;
     }
     end = (uint64_t)va + (uint64_t)len;
-    if (end > 0x100000000ULL) {
+    if (end > (uint64_t)PPC32_TASK_SIZE_TOP) {
         return 0;
     }
     return 1;
+}
+
+static int sig_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
+    uint32_t need_prot)
+{
+    if (!sig_range_ok(va, len)) {
+        return 0;
+    }
+    return ppc32_vm_range_prot_ok(ctx, va, len, need_prot) ? 1 : 0;
 }
 
 static uint32_t sig_ld32(const ppc32_ctx_t *ctx, uint32_t va)
@@ -243,11 +253,7 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
     base = sig_frame_base(ctx, act->flags);
     /* 16-byte aligned frame below the base (ppc32 SysV ABI alignment). */
     frame = (base - (uint32_t)sizeof(ppc32_rt_sigframe_t)) & ~15U;
-    if (!sig_range_ok(frame, sizeof(ppc32_rt_sigframe_t))) {
-        return -EFAULT;
-    }
-    if ((uint64_t)frame + sizeof(ppc32_rt_sigframe_t) >
-        (uint64_t)PPC32_TASK_SIZE_TOP) {
+    if (!sig_range_prot_ok(ctx, frame, sizeof(ppc32_rt_sigframe_t), 2U)) {
         return -EFAULT;
     }
     if ((uint64_t)frame + sizeof(ppc32_rt_sigframe_t) > (uint64_t)base) {
@@ -393,7 +399,7 @@ int ppc32_sig_restore_frame(ppc32_ctx_t *ctx, uint32_t frame_va)
     if (ctx == NULL) {
         return -EFAULT;
     }
-    if (!sig_range_ok(frame_va, sizeof(ppc32_rt_sigframe_t))) {
+    if (!sig_range_prot_ok(ctx, frame_va, sizeof(ppc32_rt_sigframe_t), 1U)) {
         return -EFAULT;
     }
 
@@ -552,7 +558,7 @@ static long sys_rt_sigaction(ppc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
     }
     if (old_va != 0U) {
         /* Guest struct sigaction: handler, flags, restorer, mask[2]. */
-        if (!sig_range_ok(old_va, PPC32_SIGACTION_SIZE)) {
+        if (!sig_range_prot_ok(ctx, old_va, PPC32_SIGACTION_SIZE, 2U)) {
             return -EFAULT;
         }
         sig_st32(ctx, old_va, old.handler);
@@ -562,7 +568,7 @@ static long sys_rt_sigaction(ppc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
         sig_st32(ctx, old_va + 16U, old.mask[1]);
     }
     if (act_va != 0U) {
-        if (!sig_range_ok(act_va, PPC32_SIGACTION_SIZE)) {
+        if (!sig_range_prot_ok(ctx, act_va, PPC32_SIGACTION_SIZE, 1U)) {
             return -EFAULT;
         }
         neu.handler = sig_ld32(ctx, act_va);
@@ -587,7 +593,7 @@ static long sys_rt_sigprocmask(ppc32_ctx_t *ctx, uint32_t how,
         return -EINVAL;
     }
     if (old_va != 0U) {
-        if (!sig_range_ok(old_va, PPC32_SIGSET_SIZE)) {
+        if (!sig_range_prot_ok(ctx, old_va, PPC32_SIGSET_SIZE, 2U)) {
             return -EFAULT;
         }
         sig_st32(ctx, old_va,
@@ -596,7 +602,7 @@ static long sys_rt_sigprocmask(ppc32_ctx_t *ctx, uint32_t how,
             (uint32_t)((ctx->sig_mask >> 32) & 0xFFFFFFFFULL));
     }
     if (set_va != 0U) {
-        if (!sig_range_ok(set_va, PPC32_SIGSET_SIZE)) {
+        if (!sig_range_prot_ok(ctx, set_va, PPC32_SIGSET_SIZE, 1U)) {
             return -EFAULT;
         }
         set = (uint64_t)sig_ld32(ctx, set_va) |
@@ -633,7 +639,7 @@ static long sys_rt_sigpending(ppc32_ctx_t *ctx, uint32_t set_va,
     if (set_va == 0U) {
         return -EFAULT;
     }
-    if (!sig_range_ok(set_va, PPC32_SIGSET_SIZE)) {
+    if (!sig_range_prot_ok(ctx, set_va, PPC32_SIGSET_SIZE, 2U)) {
         return -EFAULT;
     }
     /* Blocked-but-raised signals awaiting delivery. */
@@ -660,7 +666,7 @@ static long sys_sigaltstack(ppc32_ctx_t *ctx, uint32_t uss_va,
     uint32_t cur_flags;
 
     if (uoss_va != 0U) {
-        if (!sig_range_ok(uoss_va, PPC32_SIGSTACK_SIZE)) {
+        if (!sig_range_prot_ok(ctx, uoss_va, PPC32_SIGSTACK_SIZE, 2U)) {
             return -EFAULT;
         }
         cur_flags = sig_current_stack_flags(ctx);
@@ -671,7 +677,7 @@ static long sys_sigaltstack(ppc32_ctx_t *ctx, uint32_t uss_va,
     if (uss_va == 0U) {
         return 0;
     }
-    if (!sig_range_ok(uss_va, PPC32_SIGSTACK_SIZE)) {
+    if (!sig_range_prot_ok(ctx, uss_va, PPC32_SIGSTACK_SIZE, 1U)) {
         return -EFAULT;
     }
     sp = sig_ld32(ctx, uss_va);

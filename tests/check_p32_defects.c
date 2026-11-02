@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "dbt/dbt.h"
@@ -24,6 +26,9 @@
 #include "interp/decode.h"
 #include "interp/interp.h"
 #include "os/backend.h"
+#include "os/hostfault.h"
+#include "os/procfs.h"
+#include "os/signals.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls.h"
 #include "os/threads.h"
@@ -343,12 +348,131 @@ static void test_p32_4_and_10_atomics(uint8_t *base)
     CHECK(read_be32(base, data_rw_ea) == 0x11223344U, "Thread A store rejected");
 }
 
-/* P32-5, P32-6, P32-11, P32-12: VM mremap metadata, thread_range_ok, 64-bit offsets */
+static void r2_faulting_run(ppc32_ctx_t *ctx)
+{
+    uint32_t *unmapped = (uint32_t *)ppc32_guest_ptr(ctx, 0x00400000U);
+    ppc32_vm_lock();
+    vm32_ll_record(ctx, 0x00400000U, 0x12345678U);
+    *(volatile uint32_t *)unmapped = 1U;
+}
+
+static void test_p32_r2_5_6_alu_div_ov(uint8_t *base)
+{
+    ppc32_ctx_t ctx;
+    const uint32_t code_ea = 0x100000U;
+
+    /* P32-R2-5: subfo. r3, r4, r5 (r3 = r5 - r4).
+     * Case 1: r5 = 0, r4 = 1 -> r3 = -1 (0xffffffff), NO signed overflow!
+     * Case 2: r5 = 0x80000000, r4 = 1 -> r3 = 0x7fffffff, signed overflow! */
+    ctx_init_test(&ctx, base);
+    ctx.nip = code_ea;
+    ctx.gpr[4] = 1U;
+    ctx.gpr[5] = 0U;
+    /* subfo. r3, r4, r5: op=31, rt=3, ra=4, rb=5, oe=1, xo=40, rc=1 */
+    write_be32(base, code_ea + 0U,
+        (31U << 26) | (3U << 21) | (4U << 16) | (5U << 11) | (1U << 10) |
+        (40U << 1) | 1U);
+    interp_step(&ctx);
+    CHECK(ctx.gpr[3] == 0xffffffffU, "subfo. 0 - 1 == -1 (interp)");
+    CHECK((ctx.xer & XER_OV) == 0U, "subfo. 0 - 1 OV == 0 (interp)");
+
+    ctx_init_test(&ctx, base);
+    ctx.nip = code_ea;
+    ctx.gpr[4] = 1U;
+    ctx.gpr[5] = 0x80000000U;
+    interp_step(&ctx);
+    CHECK(ctx.gpr[3] == 0x7fffffffU, "subfo. INT_MIN - 1 == INT_MAX (interp)");
+    CHECK((ctx.xer & XER_OV) != 0U, "subfo. INT_MIN - 1 OV == 1 (interp)");
+
+    /* Verify DBT ei_sub_ov matches on both cases */
+    {
+        ppc32_insn_t insn;
+        a64_buf_t b;
+        ppc32_emit_ctx_t e;
+        uint32_t raw = read_be32(base, code_ea);
+        CHECK(ppc_decode(raw, &insn) == 0, "decode subfo.");
+        memset(&b, 0, sizeof(b));
+        g_emit_owner = &ctx;
+        ppc32_emit_begin(&e, g_emit_owner, &b);
+        CHECK(ppc32_emit_int(&e, &insn, code_ea) == PPC32_EMIT_NEXT,
+            "emit subfo. in DBT");
+    }
+
+    /* P32-R2-5: addeo. r3, r4, r5 with r4 = 0x7fffffff, r5 = 0x7fffffff, CA = 1
+     * True signed sum = 2147483647 + 2147483647 + 1 > INT32_MAX -> OV = 1 */
+    ctx_init_test(&ctx, base);
+    ctx.nip = code_ea;
+    ctx.gpr[4] = 0x7fffffffU;
+    ctx.gpr[5] = 0x7fffffffU;
+    ctx.xer = XER_CA;
+    /* addeo. r3, r4, r5: op=31, rt=3, ra=4, rb=5, oe=1, xo=138, rc=1 */
+    write_be32(base, code_ea,
+        (31U << 26) | (3U << 21) | (4U << 16) | (5U << 11) | (1U << 10) |
+        (138U << 1) | 1U);
+    interp_step(&ctx);
+    CHECK(ctx.gpr[3] == 0xffffffffU, "addeo. result 0xffffffff");
+    CHECK((ctx.xer & XER_OV) != 0U, "addeo. 0x7fffffff+0x7fffffff+1 sets OV");
+
+    /* P32-R2-5: subfzeo. r3, r4 with r4 = 0x7fffffff, CA = 0
+     * ~0x7fffffff + 0 = 0x80000000 (-2147483648), fits in int32_t -> OV = 0 */
+    ctx_init_test(&ctx, base);
+    ctx.nip = code_ea;
+    ctx.gpr[4] = 0x7fffffffU;
+    ctx.xer = 0U;
+    /* subfzeo. r3, r4: op=31, rt=3, ra=4, oe=1, xo=200, rc=1 */
+    write_be32(base, code_ea,
+        (31U << 26) | (3U << 21) | (4U << 16) | (1U << 10) | (200U << 1) | 1U);
+    interp_step(&ctx);
+    CHECK(ctx.gpr[3] == 0x80000000U, "subfzeo. result 0x80000000");
+    CHECK((ctx.xer & XER_OV) == 0U, "subfzeo. ~0x7fffffff + 0 clears OV");
+    {
+        ppc32_insn_t insn;
+        a64_buf_t b;
+        ppc32_emit_ctx_t e;
+        uint32_t raw = read_be32(base, code_ea);
+        CHECK(ppc_decode(raw, &insn) == 0, "decode subfzeo.");
+        memset(&b, 0, sizeof(b));
+        g_emit_owner = &ctx;
+        ppc32_emit_begin(&e, g_emit_owner, &b);
+        CHECK(ppc32_emit_int(&e, &insn, code_ea) == PPC32_EMIT_FALLBACK,
+            "subfzeo. routes to interpreter fallback in DBT");
+    }
+
+    /* P32-R2-6: divwo. and divwuo. by zero set XER.OV and XER.SO */
+    ctx_init_test(&ctx, base);
+    ctx.nip = code_ea;
+    ctx.gpr[4] = 42U;
+    ctx.gpr[5] = 0U;
+    /* divwo. r3, r4, r5: op=31, rt=3, ra=4, rb=5, oe=1, xo=491, rc=1 */
+    write_be32(base, code_ea,
+        (31U << 26) | (3U << 21) | (4U << 16) | (5U << 11) | (1U << 10) |
+        (491U << 1) | 1U);
+    interp_step(&ctx);
+    CHECK((ctx.xer & (XER_OV | XER_SO)) == (XER_OV | XER_SO),
+        "divwo. by zero sets XER.OV and XER.SO");
+    CHECK(((ctx.cr >> 28) & 1U) == 1U, "divwo. by zero sets CR0.SO");
+
+    ctx_init_test(&ctx, base);
+    ctx.nip = code_ea;
+    ctx.gpr[4] = 42U;
+    ctx.gpr[5] = 0U;
+    /* divwuo. r3, r4, r5: op=31, rt=3, ra=4, rb=5, oe=1, xo=459, rc=1 */
+    write_be32(base, code_ea,
+        (31U << 26) | (3U << 21) | (4U << 16) | (5U << 11) | (1U << 10) |
+        (459U << 1) | 1U);
+    interp_step(&ctx);
+    CHECK((ctx.xer & (XER_OV | XER_SO)) == (XER_OV | XER_SO),
+        "divwuo. by zero sets XER.OV and XER.SO");
+    CHECK(((ctx.cr >> 28) & 1U) == 1U, "divwuo. by zero sets CR0.SO");
+}
+
+/* P32-5, P32-6, P32-11, P32-12, and Round-2 VM/OS defects */
 static void test_p32_5_6_11_vm_and_syscalls(void)
 {
     ppc32_ctx_t ctx;
     char tmp_path[] = "/tmp/ppc32rt-p32-test.XXXXXX";
     int fd;
+    struct stat st_orig;
     uint32_t addr1, addr2;
     long sret;
 
@@ -359,24 +483,40 @@ static void test_p32_5_6_11_vm_and_syscalls(void)
     }
     (void)unlink(tmp_path);
     CHECK(ftruncate(fd, 65536) == 0, "ftruncate");
+    CHECK(fstat(fd, &st_orig) == 0, "fstat orig fd");
 
     memset(&ctx, 0, sizeof(ctx));
     CHECK(ppc32_vm_init(&ctx, UINT64_MAX) == 0, "ppc32_vm_init");
 
-    /* P32-5: file-backed MAP_SHARED mmap + mremap preserves fd, offset, flags */
+    /* P32-5 & P32-R2-1: file-backed MAP_SHARED mmap + close(fd) + mremap
+     * preserves private dup'd fd, offset, and flags even after caller closes fd */
     addr1 = ppc32_vm_mmap2(&ctx, 0x100000U, 0x4000U, PROT_READ | PROT_WRITE,
         MAP_SHARED | MAP_FIXED, fd, 1U /* pgoffset = 1 * 4096 = 0x1000 */);
     CHECK(addr1 == 0x100000U, "file-backed mmap2");
+    write_be32((uint8_t *)(uintptr_t)ctx.guest_base, addr1, 0xcafebabeU);
+
+    /* Close the caller's fd before mremap to verify P32-R2-1 private dup ownership */
+    int saved_fd = dup(fd);
+    (void)close(fd);
+    fd = -1;
+
     addr2 = ppc32_vm_mremap(&ctx, addr1, 0x4000U, 0x8000U,
         1U /* MREMAP_MAYMOVE */, 0U);
-    CHECK(addr2 < 0xfffff000U, "file-backed mremap");
+    CHECK(addr2 < 0xfffff000U, "file-backed mremap after caller close(fd)");
+    CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base, addr2) == 0xcafebabeU,
+        "file-backed mremap preserved file data after caller close(fd)");
     {
         bool found = false;
         uint32_t i;
         for (i = 0U; i < ctx.region_count; i++) {
             if (ctx.regions[i].start == addr2) {
+                struct stat st_reg;
                 found = true;
-                CHECK(ctx.regions[i].fd == fd, "mremap preserved region fd");
+                CHECK(ctx.regions[i].fd >= 0 &&
+                    fstat(ctx.regions[i].fd, &st_reg) == 0 &&
+                    st_reg.st_ino == st_orig.st_ino &&
+                    st_reg.st_dev == st_orig.st_dev,
+                    "mremap preserved private region fd with matching inode");
                 CHECK(ctx.regions[i].offset == 0x1000ULL,
                     "mremap preserved region offset");
                 CHECK((ctx.regions[i].flags & MAP_SHARED) != 0U,
@@ -386,6 +526,111 @@ static void test_p32_5_6_11_vm_and_syscalls(void)
         CHECK(found, "mremap target region present");
     }
 
+    /* P32-R2-2: CLONE_VM child ctx with stale region_count=0 sees live mappings */
+    {
+        ppc32_ctx_t child_ctx = ctx;
+        child_ctx.region_count = 0U;
+        CHECK(ppc32_vm_range_prot_ok(&child_ctx, addr2, 4U, 3U),
+            "CLONE_VM child sees parent's mremap region via authoritative g_vm_regions");
+        CHECK(!ppc32_vm_range_prot_ok(&child_ctx, 0x500000U, 4U, 1U),
+            "CLONE_VM child rejects unmapped VA");
+        int maps_fd = ppc32_procfs_open(&child_ctx, "/proc/self/maps");
+        CHECK(maps_fd >= 0, "ppc32_procfs_open(/proc/self/maps) on child_ctx");
+        if (maps_fd >= 0) {
+            char mbuf[512];
+            ssize_t n = read(maps_fd, mbuf, sizeof(mbuf) - 1U);
+            mbuf[(n > 0) ? n : 0] = '\0';
+            CHECK(n > 0 && mbuf[0] != '\0',
+                "/proc/self/maps synced authoritative regions on child_ctx");
+            (void)close(maps_fd);
+        }
+    }
+
+    /* P32-R2-4: MAP_SHARED | MAP_ANONYMOUS + mremap preserves shared memory across fork() */
+    {
+        uint32_t sh1 = ppc32_vm_mmap2(&ctx, 0U, 0x4000U, PROT_READ | PROT_WRITE,
+            MAP_SHARED | 0x20U, -1, 0U);
+        CHECK(sh1 < 0xfffff000U, "MAP_SHARED|MAP_ANONYMOUS mmap2");
+        write_be32((uint8_t *)(uintptr_t)ctx.guest_base, sh1, 0x11112222U);
+        uint32_t sh2 = ppc32_vm_mremap(&ctx, sh1, 0x4000U, 0x8000U, 1U, 0U);
+        CHECK(sh2 < 0xfffff000U, "MAP_SHARED|MAP_ANONYMOUS mremap");
+        CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base, sh2) == 0x11112222U,
+            "MAP_SHARED|MAP_ANONYMOUS mremap preserved initial word");
+        pid_t pid = fork();
+        CHECK(pid >= 0, "fork for MAP_SHARED|MAP_ANONYMOUS mremap test");
+        if (pid == 0) {
+            write_be32((uint8_t *)(uintptr_t)ctx.guest_base, sh2 + 0x4000U,
+                0xdeadbeefU);
+            _Exit(0);
+        } else if (pid > 0) {
+            int status = 0;
+            (void)waitpid(pid, &status, 0);
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "fork child exited cleanly");
+            CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base,
+                sh2 + 0x4000U) == 0xdeadbeefU,
+                "parent observes child write in mremapped MAP_SHARED|MAP_ANONYMOUS");
+        }
+        CHECK(ppc32_vm_munmap(&ctx, sh2, 0x8000U) == 0,
+            "munmap MAP_SHARED|MAP_ANONYMOUS");
+    }
+
+    /* P32-R2-7: mremap of PROT_NONE private mapping preserves data and PROT_NONE */
+    {
+        uint32_t p1 = ppc32_vm_mmap2(&ctx, 0U, 0x4000U, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | 0x20U, -1, 0U);
+        CHECK(p1 < 0xfffff000U, "private mmap2 for PROT_NONE mremap");
+        write_be32((uint8_t *)(uintptr_t)ctx.guest_base, p1, 0x55aa55aaU);
+        CHECK(ppc32_vm_mprotect(&ctx, p1, 0x4000U, PROT_NONE) == 0,
+            "mprotect to PROT_NONE");
+        uint32_t p2 = ppc32_vm_mremap(&ctx, p1, 0x4000U, 0x8000U, 1U, 0U);
+        CHECK(p2 < 0xfffff000U, "mremap of PROT_NONE region");
+        CHECK(!ppc32_vm_range_prot_ok(&ctx, p2, 4U, 1U),
+            "mremapped PROT_NONE region stays PROT_NONE");
+        CHECK(ppc32_vm_mprotect(&ctx, p2, 0x8000U, PROT_READ) == 0,
+            "mprotect mremapped region to PROT_READ");
+        CHECK(read_be32((const uint8_t *)(uintptr_t)ctx.guest_base, p2) == 0x55aa55aaU,
+            "mremapped PROT_NONE region preserved payload");
+        CHECK(ppc32_vm_munmap(&ctx, p2, 0x8000U) == 0, "munmap p2");
+    }
+
+    /* P32-R2-3: hostfault recovery releases held VM and LL locks */
+    {
+        ppc32_hostfault_install();
+        CHECK(ppc32_hostfault_run(&ctx, r2_faulting_run) == 1,
+            "ppc32_hostfault_run caught fault while holding VM lock");
+        /* If ppc32_vm_unlock_if_held_by_self worked, ppc32_vm_lock() will not deadlock */
+        ppc32_vm_lock();
+        ppc32_vm_unlock();
+    }
+
+    /* P32-R2-8: vm32_tlb_probe under tlb_lock returns coherent addend */
+    {
+        uintptr_t addend = 0U;
+        vm32_tlb_fill(0x00200000U, (uintptr_t)ctx.guest_base + 0x00200000ULL,
+            true, false);
+        CHECK(vm32_tlb_probe(0x00200000U, false, 4U, &addend) &&
+            addend == (uintptr_t)ctx.guest_base,
+            "vm32_tlb_probe read hit returns coherent addend");
+        vm32_tlb_invalidate_range(0x00200000U, 0x00201000U);
+        CHECK(!vm32_tlb_probe(0x00200000U, false, 4U, &addend),
+            "vm32_tlb_probe misses after invalidate_range");
+    }
+
+    /* X-R2-5: signal frame build/restore rejects unmapped guest stack */
+    {
+        ppc32_sigact_t act;
+        uint32_t out_frame = 0U;
+        memset(&act, 0, sizeof(act));
+        act.handler = 0x100000U;
+        ctx.gpr[PPC32_REG_SP] = 0x00600000U; /* unmapped */
+        CHECK(ppc32_sig_build_frame(&ctx, PPC32_SIGUSR1, &act, 0, 0U, 0U, 0U,
+            &out_frame) == -EFAULT,
+            "ppc32_sig_build_frame on unmapped stack returns -EFAULT");
+        CHECK(ppc32_sig_restore_frame(&ctx, 0x00600000U) == -EFAULT,
+            "ppc32_sig_restore_frame on unmapped stack returns -EFAULT");
+    }
+
     /* P32-6: thread_range_ok rejects unmapped / RO addresses when vm_ready */
     ppc32_vm_sync_ctx(&ctx);
     sret = ppc32_futex(&ctx, 0x500000U, PPC32_FUTEX_WAIT, 0U, 0U, 0U, 0U);
@@ -393,7 +638,7 @@ static void test_p32_5_6_11_vm_and_syscalls(void)
 
     /* P32-11: _llseek with offset_lo = 0x80000000 must not sign-extend */
     ctx.gpr[0] = PPC32_NR_LLSEEK;
-    ctx.gpr[3] = (uint32_t)fd;
+    ctx.gpr[3] = (uint32_t)saved_fd;
     ctx.gpr[4] = 0U;          /* offset_hi */
     ctx.gpr[5] = 0x80000000U; /* offset_lo */
     ctx.gpr[6] = addr2;       /* result_va */
@@ -409,7 +654,9 @@ static void test_p32_5_6_11_vm_and_syscalls(void)
     CHECK(rt_host_preempt_worker(0ULL) < 0,
         "rt_host_preempt_worker returns negative errno on invalid tid");
 
-    (void)close(fd);
+    if (saved_fd >= 0) {
+        (void)close(saved_fd);
+    }
 }
 
 int main(void)
@@ -424,6 +671,7 @@ int main(void)
     test_p32_2_dbt_trap_or_semantics(base);
     test_p32_3_and_7_sync_and_neg(base);
     test_p32_4_and_10_atomics(base);
+    test_p32_r2_5_6_alu_div_ov(base);
     (void)munmap(base, 0x200000U);
 
     test_p32_5_6_11_vm_and_syscalls();

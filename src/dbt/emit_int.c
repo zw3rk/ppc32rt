@@ -143,7 +143,8 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         in->op == PPC32_OP_SUBFZE || in->op == PPC32_OP_NEG;
 
     if (in->oe != 0U && (in->op == PPC32_OP_ADDME || in->op == PPC32_OP_ADDZE ||
-        in->op == PPC32_OP_ADDE || in->op == PPC32_OP_SUBFE)) {
+        in->op == PPC32_OP_ADDE || in->op == PPC32_OP_SUBFE ||
+        in->op == PPC32_OP_SUBFME || in->op == PPC32_OP_SUBFZE)) {
         return PPC32_EMIT_FALLBACK;
     }
     if (in->op != PPC32_OP_NEG) {
@@ -305,7 +306,8 @@ static int ei_mullw(a64_buf_t *b, const ppc32_insn_t *in)
 }
 
 /* SDIV/UDIV by zero yield 0 on AArch64 (no trap), matching interp;
- * INT_MIN/-1 saturates to INT_MIN, also matching. divwu+OE clears OV. */
+ * INT_MIN/-1 saturates to INT_MIN, also matching. OE=1 sets OV on B==0
+ * (and on INT_MIN/-1 for DIVW). */
 static int ei_divw(a64_buf_t *b, const ppc32_insn_t *in)
 {
     ei_ld(b, EI_A, in->ra);
@@ -326,9 +328,13 @@ static int ei_divw(a64_buf_t *b, const ppc32_insn_t *in)
             ei_cset(b, EI_T2, A64_COND_EQ);
             a64_emit_and_reg_w(b, false, EI_T, EI_T, EI_T2, A64_SHIFT_LSL,
                 0U);
+            ei_cmp_imm(b, EI_B, 0U);
+            ei_cset(b, EI_T2, A64_COND_EQ);
+            a64_emit_orr_reg_w(b, EI_T, EI_T, EI_T2, A64_SHIFT_LSL, 0U);
             ei_xer_ov_reg(b, EI_T);
         } else {
-            a64_emit_movz_w(b, EI_T, 0U, 0U);
+            ei_cmp_imm(b, EI_B, 0U);
+            ei_cset(b, EI_T, A64_COND_EQ);
             ei_xer_ov_reg(b, EI_T);
         }
     }

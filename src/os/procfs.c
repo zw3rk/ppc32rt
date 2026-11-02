@@ -352,6 +352,7 @@ int ppc32_procfs_open(ppc32_ctx_t *ctx, const char *path)
     }
     switch (kind) {
     case PPC32_PROCFS_MAPS:
+        ppc32_vm_sync_ctx(ctx);
         rc = build_maps(ctx, buf, cap, &len);
         break;
     case PPC32_PROCFS_CMDLINE:

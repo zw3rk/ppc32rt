@@ -104,18 +104,22 @@ bool vm32_tlb_probe(uint32_t gva, bool is_store, uint32_t width,
     /* Matches the emitted sequence: x4 = VPN | (gva & (N-1)) equals the
      * stored tag iff the VPN matches and the access is N-aligned. */
     masked = (uint64_t)page_tag(gva);
+    tlb_lock();
     if (is_store) {
         tag = __atomic_load_n(&g_tlb[idx].write_tag, __ATOMIC_SEQ_CST);
         if (masked != tag) {
+            tlb_unlock();
             return false;
         }
     } else {
         tag = __atomic_load_n(&g_tlb[idx].read_tag, __ATOMIC_SEQ_CST);
         if (masked != tag) {
+            tlb_unlock();
             return false;
         }
     }
-    *addend_out = g_tlb[idx].addend;
+    *addend_out = __atomic_load_n(&g_tlb[idx].addend, __ATOMIC_SEQ_CST);
+    tlb_unlock();
     return true;
 }
 
@@ -125,22 +129,19 @@ void vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
     uint32_t vpn = gva_page >> 12U;
     uint32_t idx = (gva_page >> 12U) & (VM32_TLB_SIZE - 1U);
     uint64_t tag = page_tag(gva_page);
+    uint64_t rtag;
+    uint64_t wtag;
 
     if (vpn >= VM32_PAGE_COUNT) {
         return;
     }
     tlb_lock();
-    g_tlb[idx].addend = host_page_base - (uintptr_t)tag;
-    if (readable) {
-        g_tlb[idx].read_tag = tag;
-    } else {
-        g_tlb[idx].read_tag = VM32_TLB_INVALID_TAG;
-    }
-    if (writable && page_writable_locked(vpn)) {
-        g_tlb[idx].write_tag = tag;
-    } else {
-        g_tlb[idx].write_tag = VM32_TLB_INVALID_TAG;
-    }
+    __atomic_store_n(&g_tlb[idx].addend, host_page_base - (uintptr_t)tag,
+        __ATOMIC_SEQ_CST);
+    rtag = readable ? tag : VM32_TLB_INVALID_TAG;
+    wtag = (writable && page_writable_locked(vpn)) ? tag : VM32_TLB_INVALID_TAG;
+    __atomic_store_n(&g_tlb[idx].read_tag, rtag, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_tlb[idx].write_tag, wtag, __ATOMIC_SEQ_CST);
     tlb_unlock();
 }
 
@@ -189,11 +190,14 @@ int vm32_tlb_miss(ppc32_ctx_t *ctx, uint32_t gva, bool is_store,
         uint32_t idx = vpn & (VM32_TLB_SIZE - 1U);
         uint64_t tag = page_tag(gva);
 
-        g_tlb[idx].addend = base + (uintptr_t)page - (uintptr_t)tag;
-        g_tlb[idx].read_tag =
-            ((g_page_prot[vpn] & 0x1U) != 0U) ? tag : VM32_TLB_INVALID_TAG;
-        g_tlb[idx].write_tag =
-            page_writable_locked(vpn) ? tag : VM32_TLB_INVALID_TAG;
+        __atomic_store_n(&g_tlb[idx].addend,
+            base + (uintptr_t)page - (uintptr_t)tag, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_tlb[idx].read_tag,
+            ((g_page_prot[vpn] & 0x1U) != 0U) ? tag : VM32_TLB_INVALID_TAG,
+            __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_tlb[idx].write_tag,
+            page_writable_locked(vpn) ? tag : VM32_TLB_INVALID_TAG,
+            __ATOMIC_SEQ_CST);
         *hva_out = (void *)(base + (uintptr_t)gva);
     }
     tlb_unlock();
@@ -220,15 +224,19 @@ void vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva)
         size_t i;
 
         for (i = 0U; i < VM32_TLB_SIZE; i++) {
-            g_tlb[i].read_tag = VM32_TLB_INVALID_TAG;
-            g_tlb[i].write_tag = VM32_TLB_INVALID_TAG;
+            __atomic_store_n(&g_tlb[i].read_tag, VM32_TLB_INVALID_TAG,
+                __ATOMIC_SEQ_CST);
+            __atomic_store_n(&g_tlb[i].write_tag, VM32_TLB_INVALID_TAG,
+                __ATOMIC_SEQ_CST);
         }
     } else {
         for (vpn = first; vpn < last; vpn++) {
             uint32_t idx = vpn & (VM32_TLB_SIZE - 1U);
 
-            g_tlb[idx].read_tag = VM32_TLB_INVALID_TAG;
-            g_tlb[idx].write_tag = VM32_TLB_INVALID_TAG;
+            __atomic_store_n(&g_tlb[idx].read_tag, VM32_TLB_INVALID_TAG,
+                __ATOMIC_SEQ_CST);
+            __atomic_store_n(&g_tlb[idx].write_tag, VM32_TLB_INVALID_TAG,
+                __ATOMIC_SEQ_CST);
         }
     }
     tlb_unlock();
@@ -240,10 +248,12 @@ void vm32_tlb_invalidate_all(void)
 
     tlb_lock();
     for (i = 0U; i < VM32_TLB_SIZE; i++) {
-        g_tlb[i].read_tag = VM32_TLB_INVALID_TAG;
-        g_tlb[i].write_tag = VM32_TLB_INVALID_TAG;
-        g_tlb[i].addend = 0U;
-        g_tlb[i].flags_reserved = 0U;
+        __atomic_store_n(&g_tlb[i].read_tag, VM32_TLB_INVALID_TAG,
+            __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_tlb[i].write_tag, VM32_TLB_INVALID_TAG,
+            __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_tlb[i].addend, 0U, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_tlb[i].flags_reserved, 0U, __ATOMIC_SEQ_CST);
     }
     (void)memset(g_page_prot, 0, sizeof g_page_prot);
     (void)memset(g_page_state, 0, sizeof g_page_state);
@@ -282,8 +292,10 @@ static void tlb_evict_slot_locked(uint32_t vpn)
 {
     uint32_t idx = vpn & (VM32_TLB_SIZE - 1U);
 
-    g_tlb[idx].read_tag = VM32_TLB_INVALID_TAG;
-    g_tlb[idx].write_tag = VM32_TLB_INVALID_TAG;
+    __atomic_store_n(&g_tlb[idx].read_tag, VM32_TLB_INVALID_TAG,
+        __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_tlb[idx].write_tag, VM32_TLB_INVALID_TAG,
+        __ATOMIC_SEQ_CST);
 }
 
 /* Refill one slot from the recorded arrays (canonical in-place HVA =
@@ -293,18 +305,13 @@ static void tlb_refill_slot_locked(uint32_t vpn, uintptr_t base)
 {
     uint32_t idx = vpn & (VM32_TLB_SIZE - 1U);
     uint64_t tag = (uint64_t)vpn << 12U;
+    uint64_t rtag = ((g_page_prot[vpn] & (uint8_t)PROT_READ) != 0U) ?
+        tag : VM32_TLB_INVALID_TAG;
+    uint64_t wtag = page_writable_locked(vpn) ? tag : VM32_TLB_INVALID_TAG;
 
-    g_tlb[idx].addend = base;
-    if ((g_page_prot[vpn] & (uint8_t)PROT_READ) != 0U) {
-        g_tlb[idx].read_tag = tag;
-    } else {
-        g_tlb[idx].read_tag = VM32_TLB_INVALID_TAG;
-    }
-    if (page_writable_locked(vpn)) {
-        g_tlb[idx].write_tag = tag;
-    } else {
-        g_tlb[idx].write_tag = VM32_TLB_INVALID_TAG;
-    }
+    __atomic_store_n(&g_tlb[idx].addend, base, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_tlb[idx].read_tag, rtag, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_tlb[idx].write_tag, wtag, __ATOMIC_SEQ_CST);
 }
 
 /* Clamp [start_gva, end_gva) to the window; false when empty. */
@@ -468,10 +475,12 @@ void vm32_note_cow_dirty(uint32_t gva_page)
 /* Union of mapped sub-pages' R/W bits over one host page starting at
  * guest page vpn_first (vpn_first holds H / 4096 sub-pages). Caller
  * holds tlb_lock. Never includes PROT_EXEC (W^X). */
-static int host_union_locked(uint32_t vpn_first, uint32_t sub_pages)
+static int host_union_locked(uint32_t vpn_first, uint32_t sub_pages,
+    bool *all_unmapped_out)
 {
     uint32_t k;
     int uni = 0;
+    bool all_unmapped = true;
 
     for (k = 0U; k < sub_pages; k++) {
         uint32_t vpn = vpn_first + k;
@@ -482,8 +491,12 @@ static int host_union_locked(uint32_t vpn_first, uint32_t sub_pages)
         if (g_page_state[vpn] == VM32_PAGE_UNMAPPED) {
             continue;
         }
+        all_unmapped = false;
         uni |= (int)(g_page_prot[vpn] &
             (uint8_t)((uint32_t)PROT_READ | (uint32_t)PROT_WRITE));
+    }
+    if (all_unmapped_out != NULL) {
+        *all_unmapped_out = all_unmapped;
     }
     return uni;
 }
@@ -516,13 +529,21 @@ int vm32_sync_host_range(uint32_t start_gva, uint32_t end_gva)
     for (hp = first_hp; hp < last_hp; hp++) {
         uint64_t vpn_first64 = hp * (uint64_t)subs_per_host;
         void *host_addr;
+        bool all_unmapped = false;
         int uni;
 
         if (vpn_first64 >= (uint64_t)VM32_PAGE_COUNT) {
             break;
         }
-        uni = host_union_locked((uint32_t)vpn_first64, subs_per_host);
+        uni = host_union_locked((uint32_t)vpn_first64, subs_per_host,
+            &all_unmapped);
         host_addr = (void *)(base + hp * (uint64_t)host_page);
+        if (all_unmapped &&
+            ((uintptr_t)host_addr & (host_page - 1U)) == 0U &&
+            mmap(host_addr, host_page, PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED) {
+            continue;
+        }
         if (mprotect(host_addr, host_page, uni) != 0) {
             int e = errno;
 

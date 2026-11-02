@@ -43,6 +43,10 @@ void vm_sync_from_ctx(ppc32_ctx_t *ctx);
 void vm_sync_brk_to_ctx(ppc32_ctx_t *ctx);
 void vm_copy_state_to_ctx(ppc32_ctx_t *dst);
 void vm_sync_to_ctx(ppc32_ctx_t *ctx);
+int  vm_dup_fd(int fd);
+bool vm_same_backing_fd(int fd_a, int fd_b);
+int  vm_create_shared_anon_fd(uint64_t size);
+bool vm_can_modify_range_locked(uint32_t start, uint32_t end, bool insert_mid);
 void vm_remove_region_at(size_t idx);
 int  vm_insert_region_raw(uint32_t start, uint32_t end, uint32_t prot,
                           uint32_t flags, const char *name);
@@ -56,7 +60,7 @@ int  vm_record_region_locked(uint32_t start, uint32_t end, uint32_t prot,
 int  vm_record_region_ex_locked(uint32_t start, uint32_t end, uint32_t prot,
                                 uint32_t flags, int fd, uint64_t offset,
                                 const char *name);
-void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot);
+int  vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot);
 bool vm_range_overlaps_locked(uint32_t start, uint32_t end);
 bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                                   uint32_t *out_prot, uint32_t *out_flags,
@@ -66,5 +70,7 @@ bool vm_check_mapped_range_ex_locked(uint32_t start, uint32_t end,
                                      int *out_fd, uint64_t *out_offset,
                                      char *out_name, size_t name_sz);
 int  vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va);
+int  vm_find_free_gap_aligned_locked(uint64_t aligned_len, uint64_t align,
+                                     uint32_t *out_va);
 
 #endif /* PPC32_VM_PRIV_H */

@@ -33,28 +33,13 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
-_Atomic uint32_t g_vm_lock = 0U;
-ppc32_ctx_t    *g_vm_root_ctx = NULL;
-uint32_t        g_vm_brk_base = 0U;
-uint32_t        g_vm_brk_curr = 0U;
-uint32_t        g_vm_mmap_cursor = PPC32_MMAP_BASE_32;
-ppc32_region_t  g_vm_regions[PPC32_MAX_REGIONS];
-size_t          g_vm_region_count = 0U;
-
-void vm_lock_acquire(void)
-{
-    ppc32_spin_lock(&g_vm_lock);
-}
-
-void vm_lock_release(void)
-{
-    ppc32_spin_unlock(&g_vm_lock);
-}
-
-uint64_t page_align_up(uint64_t v)
-{
-    return (v + 0xFFFULL) & ~0xFFFULL;
-}
+_Atomic uint32_t       g_vm_lock = 0U;
+ppc32_ctx_t           *g_vm_root_ctx = NULL;
+uint32_t               g_vm_brk_base = 0U;
+uint32_t               g_vm_brk_curr = 0U;
+uint32_t               g_vm_mmap_cursor = PPC32_MMAP_BASE_32;
+ppc32_region_t         g_vm_regions[PPC32_MAX_REGIONS];
+size_t                 g_vm_region_count = 0U;
 
 static int vm_reserve_prot_none(ppc32_ctx_t *ctx, uint32_t start, uint32_t len)
 {
@@ -214,21 +199,6 @@ int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
     return 0;
 }
 
-int ppc32_vm_record_region(ppc32_ctx_t *ctx, uint32_t start, uint32_t end,
-                         uint32_t prot, uint32_t flags, const char *name)
-{
-    if (!ctx || start >= end) {
-        return -1;
-    }
-    vm_lock_acquire();
-    vm_sync_from_ctx(ctx);
-    int rc = vm_record_region_locked(start, end, prot, flags, name);
-    vm_sync_to_ctx(ctx);
-    vm_lock_release();
-    return rc;
-}
-
-
 /* Exec teardown: drop every region except the vdso from the AUTHORITATIVE
  * global list (ctx->regions is a mirror; vm_sync_from_ctx never copies it
  * back, so a ctx-only clear is undone by the next vm_sync_to_ctx). */
@@ -240,6 +210,8 @@ void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
         if (strcmp(g_vm_regions[r].name, "[vdso]") == 0) {
             g_vm_regions[w] = g_vm_regions[r];
             w++;
+        } else if (g_vm_regions[r].fd >= 0) {
+            (void)close(g_vm_regions[r].fd);
         }
     }
     g_vm_region_count = w;
@@ -310,7 +282,8 @@ uint32_t ppc32_vm_brk(ppc32_ctx_t *ctx, uint32_t new_brk)
     uint32_t new_page = (uint32_t)new_page64;
 
     if (new_page > old_page) {
-        if (vm_range_overlaps_locked(old_page, new_page)) {
+        if (vm_range_overlaps_locked(old_page, new_page) ||
+            !vm_can_modify_range_locked(old_page, new_page, true)) {
             uint32_t curr = g_vm_brk_curr;
             vm_sync_brk_to_ctx(ctx);
             vm_lock_release();
@@ -346,22 +319,20 @@ uint32_t ppc32_vm_brk(ppc32_ctx_t *ctx, uint32_t new_brk)
         (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
     } else if (new_page < old_page) {
+        if (!vm_can_modify_range_locked(new_page, old_page, false)) {
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_brk_to_ctx(ctx);
+            vm_lock_release();
+            return curr;
+        }
         uint32_t len = old_page - new_page;
         if (vm32_is_a2()) {
-            /* Host-page-granular union unmap: fully-emptied host pages
-             * drop to PROT_NONE, shared ones keep the survivor union.
-             * The 4K-granular PROT_NONE reserve below would EINVAL on
-             * H > 4096 hosts, so the union path replaces it there.
-             * Best-effort like the reserve it replaces (regions below
-             * stay authoritative). */
             (void)vm32_unmap_union(new_page, len);
         } else {
-            /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
             (void)vm_reserve_prot_none(ctx, new_page, len);
             vm32_record_unmap(new_page, old_page);
         }
         vm_unmap_regions_locked(new_page, old_page);
-        /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
         vm32_tlb_invalidate_range(new_page, old_page);
         vm32_ll_note_remap();
     }
@@ -403,6 +374,13 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         host_flags |= MAP_ANONYMOUS;
     }
 
+    uint64_t hpsz        = (uint64_t)vm32_host_page_size();
+    bool     is_shared   = (flags & 0x01U) != 0U;
+    uint64_t gap_align   = (is_shared && hpsz > (uint64_t)PPC32_PAGE_SIZE) ?
+                           hpsz : (uint64_t)PPC32_PAGE_SIZE;
+    uint64_t host_map_len = (is_shared && hpsz > (uint64_t)PPC32_PAGE_SIZE) ?
+                            ((aligned_len + hpsz - 1ULL) & ~(hpsz - 1ULL)) : aligned_len;
+
     uint32_t target_va     = 0U;
     bool     update_cursor = false;
     if ((flags & (PPC32_MAP_FIXED | PPC32_MAP_FIXED_NOREPLACE)) != 0U) {
@@ -418,44 +396,82 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         }
         target_va = addr;
     } else {
-        uint32_t hint_va = ppc32_page_down(addr);
+        uint32_t hint_va = (uint32_t)((uint64_t)addr & ~(gap_align - 1ULL));
         if (addr != 0U &&
             hint_va >= PPC32_MMAP_BASE_32 &&
-            (uint64_t)hint_va + aligned_len <= (uint64_t)PPC32_MMAP_TOP_32 &&
-            !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + aligned_len))) {
+            (uint64_t)hint_va + host_map_len <= (uint64_t)PPC32_MMAP_TOP_32 &&
+            !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + host_map_len))) {
             target_va = hint_va;
-        } else if (vm_find_free_gap_locked(aligned_len, &target_va) != 0) {
+        } else if (vm_find_free_gap_aligned_locked(host_map_len, gap_align, &target_va) != 0) {
             return (uint32_t)(-ENOMEM);
         } else {
             update_cursor = true;
         }
     }
 
+    uint32_t map_end = (uint32_t)((uint64_t)target_va + aligned_len);
+    if (!vm_can_modify_range_locked(target_va, map_end, true)) {
+        return (uint32_t)(-ENOMEM);
+    }
+    if ((host_flags & MAP_ANONYMOUS) == 0 && fd < 0) {
+        return (uint32_t)(-EBADF);
+    }
+
+    int sh_fd = -1;
+    if (is_shared && (flags & PPC32_MAP_ANONYMOUS) != 0U && fd < 0) {
+        sh_fd = vm_create_shared_anon_fd(host_map_len);
+        if (sh_fd < 0) {
+            return (uint32_t)sh_fd;
+        }
+    }
+    int      use_fd      = (sh_fd >= 0) ? sh_fd : (((host_flags & MAP_ANONYMOUS) != 0) ? -1 : fd);
     int      host_prot   = ppc32_host_prot(ctx, prot);
     void    *host_target = ppc32_guest_ptr(ctx, target_va);
-    off_t    host_off    = (off_t)pgoffset * (off_t)PPC32_PAGE_SIZE;
-    uint32_t map_end     = (uint32_t)((uint64_t)target_va + aligned_len);
+    off_t    host_off    = (sh_fd >= 0) ? 0 : ((off_t)pgoffset * (off_t)PPC32_PAGE_SIZE);
     uint8_t  state       = (uint8_t)VM32_PAGE_ANON;
-    if ((host_flags & MAP_SHARED) != 0) {
+    if (is_shared) {
         state = (uint8_t)VM32_PAGE_SHARED;
     } else if ((host_flags & MAP_ANONYMOUS) == 0) {
         state = (uint8_t)VM32_PAGE_COW_CLEAN;
     }
 
-    if (vm32_is_a2()) {
-        if ((host_flags & MAP_ANONYMOUS) == 0 && fd < 0) {
-            return (uint32_t)(-EBADF);
+    bool shared_direct = is_shared && use_fd >= 0 &&
+                         ((uint64_t)target_va & (hpsz - 1ULL)) == 0ULL &&
+                         ((uint64_t)host_off & (hpsz - 1ULL)) == 0ULL &&
+                         (uint64_t)target_va + host_map_len <= (uint64_t)PPC32_TASK_SIZE_TOP;
+    if (shared_direct) {
+        int mprot = vm32_is_a2() ? (PROT_READ | PROT_WRITE) : host_prot;
+        void *res = mmap(host_target, (size_t)host_map_len, mprot,
+                         MAP_SHARED | MAP_FIXED, use_fd, host_off);
+        if (res == MAP_FAILED && vm32_is_a2() && mprot != host_prot) {
+            res = mmap(host_target, (size_t)host_map_len, host_prot,
+                       MAP_SHARED | MAP_FIXED, use_fd, host_off);
         }
+        if (res == MAP_FAILED) {
+            int err = -errno;
+            if (sh_fd >= 0) {
+                (void)close(sh_fd);
+            }
+            return (uint32_t)err;
+        }
+        vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
+        if (vm32_is_a2()) {
+            (void)vm32_sync_host_range(target_va, map_end);
+        }
+    } else if (vm32_is_a2()) {
         vm32_record_map(target_va, map_end,
             (uint8_t)(PROT_READ | PROT_WRITE), state);
         if (vm32_sync_host_range(target_va, map_end) != 0) {
             vm32_record_unmap(target_va, map_end);
+            if (sh_fd >= 0) {
+                (void)close(sh_fd);
+            }
             return (uint32_t)(-ENOMEM);
         }
-        if ((host_flags & MAP_ANONYMOUS) != 0) {
+        if (use_fd < 0 || sh_fd >= 0) {
             memset(host_target, 0, (size_t)aligned_len);
         } else {
-            int prc = vm_file_populate_private(host_target, fd,
+            int prc = vm_file_populate_private(host_target, use_fd,
                 (uint64_t)host_off, (size_t)aligned_len);
             if (prc != 0) {
                 vm32_record_unmap(target_va, map_end);
@@ -467,32 +483,41 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         (void)vm32_sync_host_range(target_va, map_end);
     } else {
         void *res = mmap(host_target, (size_t)aligned_len, host_prot,
-                         host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
-                         (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
+                         host_flags | MAP_FIXED, use_fd,
+                         (use_fd < 0) ? 0 : host_off);
         if (res == MAP_FAILED) {
-            return (uint32_t)(-errno);
+            int err = -errno;
+            if (sh_fd >= 0) {
+                (void)close(sh_fd);
+            }
+            return (uint32_t)err;
         }
-        if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
-            /* The file content is already in place via the host mmap
-             * above (the kernel zero-fills the partial EOF page and
-             * faults beyond-EOF pages exactly like the oracle); only
-             * the inode record is still needed for the mutation
-             * hooks. Userspace pread/memset here would fault on
-             * read-only mappings and on pages past EOF. */
-            vm_file_note_private(fd, target_va,
+        if ((host_flags & MAP_ANONYMOUS) == 0 && use_fd >= 0) {
+            vm_file_note_private(use_fd, target_va,
                 (uint32_t)(aligned_len / 4096ULL),
                 (uint64_t)host_off);
         }
         vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
     }
 
-    if (update_cursor) {
-        g_vm_mmap_cursor = map_end;
+    uint64_t rec_off = (use_fd >= 0) ? (uint64_t)host_off : 0ULL;
+    int rrc = vm_record_region_ex_locked(target_va, map_end,
+                                         prot & 0x7U, flags, use_fd, rec_off, "[mmap]");
+    if (sh_fd >= 0) {
+        (void)close(sh_fd);
     }
-    int rec_fd = ((host_flags & MAP_ANONYMOUS) != 0) ? -1 : fd;
-    uint64_t rec_off = (rec_fd >= 0) ? (uint64_t)host_off : 0ULL;
-    (void)vm_record_region_ex_locked(target_va, map_end,
-                                     prot & 0x7U, flags, rec_fd, rec_off, "[mmap]");
+    if (rrc < 0) {
+        if (vm32_is_a2()) {
+            (void)vm32_unmap_union(target_va, (uint32_t)aligned_len);
+        } else {
+            (void)vm_reserve_prot_none(ctx, target_va, (uint32_t)aligned_len);
+            vm32_record_unmap(target_va, map_end);
+        }
+        return (uint32_t)(-ENOMEM);
+    }
+    if (update_cursor) {
+        g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + host_map_len);
+    }
     return target_va;
 }
 
@@ -534,19 +559,14 @@ static int vm_mprotect_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     if (addr < PPC32_LOW_GUARD_SIZE ||
         aligned_len == 0ULL ||
         end64 > (uint64_t)PPC32_TASK_SIZE_TOP ||
-        !vm_check_mapped_range_locked(addr, (uint32_t)end64, NULL, NULL, NULL, 0U)) {
+        !vm_check_mapped_range_locked(addr, (uint32_t)end64, NULL, NULL, NULL, 0U) ||
+        !vm_can_modify_range_locked(addr, (uint32_t)end64, true)) {
         return -ENOMEM;
     }
 
     if (vm32_is_a2()) {
-        /* The 4K-granular host mprotect below would EINVAL on H > 4096
-         * hosts (addr/len are guest-4K granular, not host aligned), so
-         * the union engine applies the per-host-page union instead:
-         * every affected host page carries the OR of its mapped
-         * sub-pages' R/W bits, never PROT_EXEC. */
         int urc = vm32_protect_union(addr, (uint32_t)aligned_len,
             (uint8_t)(prot & 0x7U));
-
         if (urc != 0) {
             return urc;
         }
@@ -558,11 +578,10 @@ static int vm_mprotect_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
             (uint8_t)(prot & 0x7U));
     }
 
-    vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
-    /* A2 Soft-TLB coherence: a prot change can revoke write_tag. */
+    int mrc = vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
     vm32_tlb_invalidate_range(addr, (uint32_t)end64);
     vm32_ll_note_remap();
-    return 0;
+    return mrc;
 }
 
 int ppc32_vm_mprotect(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot)
@@ -596,18 +615,16 @@ static int vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
 
     uint32_t start = ppc32_page_down(addr);
     uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
+    if (!vm_can_modify_range_locked(start, end, false)) {
+        return -ENOMEM;
+    }
 
     if (vm32_is_a2()) {
-        /* Union unmap replaces the 4K-granular PROT_NONE reserve (which
-         * would EINVAL on H > 4096 hosts): fully-emptied host pages
-         * drop to PROT_NONE, shared ones keep the survivor union. */
         int urc = vm32_unmap_union(start, (uint32_t)aligned_len);
-
         if (urc != 0) {
             return urc;
         }
     } else {
-        /* Keep the [G, G+4GiB) reservation intact by replacing unmapped pages with PROT_NONE */
         int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
         if (rc != 0) {
             return rc;
@@ -616,7 +633,6 @@ static int vm_munmap_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
     }
 
     vm_unmap_regions_locked(start, end);
-    /* A2 Soft-TLB coherence: translations must not outlive the mapping. */
     vm32_tlb_invalidate_range(start, end);
     vm32_ll_note_remap();
     if (g_vm_mmap_cursor == end && start >= PPC32_MMAP_BASE_32) {
@@ -641,6 +657,25 @@ int ppc32_vm_munmap(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len)
         vm_invalidate_jit(ctx, addr, (uint32_t)((uint64_t)addr + page_align_up((uint64_t)len)));
     }
     return rc;
+}
+
+static void vm_restore_src_prot(ppc32_ctx_t *ctx, uint32_t addr, size_t len, uint32_t prot)
+{
+    if (vm32_is_a2()) {
+        (void)vm32_protect_union(addr, (uint32_t)len, (uint8_t)(prot & 0x7U));
+    } else {
+        (void)mprotect(ppc32_guest_ptr(ctx, addr), len, ppc32_host_prot(ctx, prot));
+    }
+}
+
+static uint32_t vm_mremap_unlock(ppc32_ctx_t *ctx, int mremap_fd, uint32_t ret)
+{
+    if (mremap_fd >= 0) {
+        (void)close(mremap_fd);
+    }
+    vm_sync_to_ctx(ctx);
+    vm_lock_release();
+    return ret;
 }
 
 uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
@@ -677,29 +712,44 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     if (!vm_check_mapped_range_ex_locked(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned),
                                          &prot, &orig_flags, &orig_fd, &orig_offset,
                                          orig_name, sizeof(orig_name))) {
-        vm_sync_to_ctx(ctx);
-        vm_lock_release();
-        return (uint32_t)(-EFAULT);
+        return vm_mremap_unlock(ctx, -1, (uint32_t)(-EFAULT));
+    }
+    int mremap_fd = -1;
+    if (orig_fd >= 0) {
+        mremap_fd = vm_dup_fd(orig_fd);
+        if (mremap_fd < 0) {
+            return vm_mremap_unlock(ctx, -1, (uint32_t)(-ENOMEM));
+        }
     }
     uint32_t    keep_flags  = orig_flags & 0x23U;
-    bool        is_anon     = (keep_flags & PPC32_MAP_ANONYMOUS) != 0U || orig_fd < 0;
-    uint32_t    map_flags   = (((keep_flags & 0x01U) != 0U) ? 0x01U : 0x02U) |
-                              (is_anon ? PPC32_MAP_ANONYMOUS : 0U);
-    int         map_fd      = is_anon ? -1 : orig_fd;
+    bool        is_shared   = (keep_flags & 0x01U) != 0U;
+    bool        has_fd      = (mremap_fd >= 0);
+    uint32_t    map_flags   = (is_shared ? 0x01U : 0x02U) |
+                              (has_fd ? 0U : PPC32_MAP_ANONYMOUS);
+    int         map_fd      = has_fd ? mremap_fd : -1;
     const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
+    uint64_t    hpsz        = (uint64_t)vm32_host_page_size();
+
+    if (is_shared && (keep_flags & PPC32_MAP_ANONYMOUS) != 0U && has_fd &&
+        new_aligned > old_aligned) {
+        uint64_t req_sz = orig_offset + new_aligned;
+        if (hpsz > (uint64_t)PPC32_PAGE_SIZE) {
+            req_sz = (req_sz + hpsz - 1ULL) & ~(hpsz - 1ULL);
+        }
+        if (ftruncate(mremap_fd, (off_t)req_sz) != 0) {
+            return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-errno));
+        }
+    }
 
     if ((flags & PPC32_MREMAP_FIXED) == 0U) {
         if (new_aligned == old_aligned) {
-            vm_sync_to_ctx(ctx);
-            vm_lock_release();
-            return old_addr;
+            return vm_mremap_unlock(ctx, mremap_fd, old_addr);
         }
         if (new_aligned < old_aligned) {
             uint32_t unmap_addr = old_addr + (uint32_t)new_aligned;
             uint32_t unmap_len  = (uint32_t)(old_aligned - new_aligned);
             int rc = vm_munmap_locked(ctx, unmap_addr, unmap_len);
-            vm_sync_to_ctx(ctx);
-            vm_lock_release();
+            (void)vm_mremap_unlock(ctx, mremap_fd, 0U);
             if (rc != 0) {
                 return (uint32_t)rc;
             }
@@ -709,23 +759,27 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
 
         uint32_t old_end = (uint32_t)((uint64_t)old_addr + old_aligned);
         uint64_t new_end = (uint64_t)old_addr + new_aligned;
-        if (new_end <= (uint64_t)PPC32_TASK_SIZE_TOP &&
+        bool can_ext_inplace = (!is_shared || !vm32_is_a2() ||
+                                ((uint64_t)old_end & (hpsz - 1ULL)) == 0ULL);
+        if (can_ext_inplace && new_end <= (uint64_t)PPC32_TASK_SIZE_TOP &&
             !vm_range_overlaps_locked(old_end, (uint32_t)new_end)) {
-            uint64_t ext_off   = is_anon ? 0ULL : (orig_offset + old_aligned);
+            uint64_t ext_off   = has_fd ? (orig_offset + old_aligned) : 0ULL;
             uint32_t ext_pgoff = (uint32_t)(ext_off / (uint64_t)PPC32_PAGE_SIZE);
             uint32_t ext = vm_mmap2_locked(ctx, old_end, (uint32_t)(new_aligned - old_aligned),
                                            prot, map_flags | PPC32_MAP_FIXED,
                                            map_fd, ext_pgoff);
             if (ext <= 0xFFFFF000U) {
-                (void)vm_record_region_ex_locked(old_end, (uint32_t)new_end,
-                                                 prot, keep_flags, map_fd, ext_off, region_name);
+                if (vm_record_region_ex_locked(old_end, (uint32_t)new_end,
+                                               prot, keep_flags, map_fd, ext_off, region_name) < 0) {
+                    (void)vm_munmap_locked(ctx, old_end, (uint32_t)(new_aligned - old_aligned));
+                    return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-ENOMEM));
+                }
                 uint32_t ext_end = (uint32_t)new_end;
                 if (g_vm_mmap_cursor >= old_addr && g_vm_mmap_cursor < ext_end &&
                     ext_end <= PPC32_MMAP_TOP_32) {
                     g_vm_mmap_cursor = ext_end;
                 }
-                vm_sync_to_ctx(ctx);
-                vm_lock_release();
+                (void)vm_mremap_unlock(ctx, mremap_fd, 0U);
                 if ((prot & (uint32_t)PROT_EXEC) != 0U) {
                     vm_invalidate_jit(ctx, old_end, ext_end);
                 }
@@ -734,38 +788,42 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         }
 
         if ((flags & PPC32_MREMAP_MAYMOVE) == 0U) {
-            vm_sync_to_ctx(ctx);
-            vm_lock_release();
-            return (uint32_t)(-ENOMEM);
+            return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-ENOMEM));
         }
     } else {
         if ((new_addr & (PPC32_PAGE_SIZE - 1U)) != 0U || new_addr < PPC32_LOW_GUARD_SIZE ||
             (uint64_t)new_addr + new_aligned > (uint64_t)PPC32_TASK_SIZE_TOP ||
             ((uint64_t)new_addr < (uint64_t)old_addr + old_aligned &&
-             (uint64_t)old_addr < (uint64_t)new_addr + new_aligned)) {
-            vm_sync_to_ctx(ctx);
-            vm_lock_release();
-            return (uint32_t)(-EINVAL);
+              (uint64_t)old_addr < (uint64_t)new_addr + new_aligned)) {
+            return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-EINVAL));
         }
     }
 
-    bool     is_fixed   = (flags & PPC32_MREMAP_FIXED) != 0U;
-    bool     shared_a1  = !is_anon && (keep_flags & 0x01U) != 0U && !vm32_is_a2();
-    uint32_t init_prot  = shared_a1 ? prot :
+    bool is_fixed      = (flags & PPC32_MREMAP_FIXED) != 0U;
+    bool shared_backed = is_shared && has_fd &&
+                         (!vm32_is_a2() ||
+                          ((!is_fixed || ((uint64_t)new_addr & (hpsz - 1ULL)) == 0ULL) &&
+                           (orig_offset & (hpsz - 1ULL)) == 0ULL));
+    if ((is_shared && !shared_backed) ||
+        !vm_can_modify_range_locked(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned), false)) {
+        return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-ENOMEM));
+    }
+
+    uint32_t init_prot  = shared_backed ? prot :
                           ((prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE));
-    uint32_t orig_pgoff = is_anon ? 0U : (uint32_t)(orig_offset / (uint64_t)PPC32_PAGE_SIZE);
+    uint32_t orig_pgoff = has_fd ? (uint32_t)(orig_offset / (uint64_t)PPC32_PAGE_SIZE) : 0U;
     uint32_t new_va     = vm_mmap2_locked(ctx, is_fixed ? new_addr : 0U, (uint32_t)new_aligned,
                                           init_prot, map_flags | (is_fixed ? PPC32_MAP_FIXED : 0U),
                                           map_fd, orig_pgoff);
     if (new_va > 0xFFFFF000U) {
-        vm_sync_to_ctx(ctx);
-        vm_lock_release();
-        return new_va;
+        return vm_mremap_unlock(ctx, mremap_fd, new_va);
     }
 
-    if (!shared_a1) {
-        size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
-        if (!is_anon && !vm32_is_a2()) {
+    bool src_reprotected = false;
+    size_t copy_bytes = 0U;
+    if (!shared_backed) {
+        copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
+        if (has_fd && !vm32_is_a2()) {
             struct stat st;
             if (fstat(map_fd, &st) == 0) {
                 uint64_t fsz   = (st.st_size > 0) ? (uint64_t)st.st_size : 0ULL;
@@ -777,39 +835,50 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         }
         if (copy_bytes > 0U) {
             if ((prot & 0x1U) == 0U) {
-                if (vm32_is_a2()) {
-                    (void)vm32_protect_union(old_addr, (uint32_t)copy_bytes, (uint8_t)PROT_READ);
-                } else {
-                    (void)mprotect(ppc32_guest_ptr(ctx, old_addr), copy_bytes, PROT_READ);
+                int prc = vm32_is_a2() ?
+                    vm32_protect_union(old_addr, (uint32_t)copy_bytes, (uint8_t)PROT_READ) :
+                    ((mprotect(ppc32_guest_ptr(ctx, old_addr), copy_bytes, PROT_READ) == 0) ? 0 : -errno);
+                if (prc != 0) {
+                    (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+                    return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)prc);
                 }
+                src_reprotected = true;
             }
             memcpy(ppc32_guest_ptr(ctx, new_va), ppc32_guest_ptr(ctx, old_addr), copy_bytes);
         }
         if (prot != init_prot) {
-            (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+            int mrc = vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+            if (mrc != 0) {
+                if (src_reprotected) {
+                    vm_restore_src_prot(ctx, old_addr, copy_bytes, prot);
+                }
+                (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+                return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)mrc);
+            }
         }
     }
-    (void)vm_record_region_ex_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
-                                     prot, keep_flags, map_fd,
-                                     is_anon ? 0ULL : orig_offset, region_name);
-    (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
-    vm_sync_to_ctx(ctx);
-    vm_lock_release();
+    if (vm_record_region_ex_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
+                                   prot, keep_flags, map_fd,
+                                   has_fd ? orig_offset : 0ULL, region_name) < 0) {
+        if (src_reprotected) {
+            vm_restore_src_prot(ctx, old_addr, copy_bytes, prot);
+        }
+        (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+        return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-ENOMEM));
+    }
+    int urc = vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
+    if (urc != 0) {
+        if (src_reprotected) {
+            vm_restore_src_prot(ctx, old_addr, copy_bytes, prot);
+        }
+        (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+        return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)urc);
+    }
+    (void)vm_mremap_unlock(ctx, mremap_fd, 0U);
 
     vm_invalidate_jit(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
     if (is_fixed || (prot & (uint32_t)PROT_EXEC) != 0U) {
         vm_invalidate_jit(ctx, new_va, (uint32_t)((uint64_t)new_va + new_aligned));
     }
     return new_va;
-}
-
-void ppc32_vm_sync_ctx(ppc32_ctx_t *ctx)
-{
-    if (!ctx) {
-        return;
-    }
-    vm_lock_acquire();
-    vm_sync_from_ctx(ctx);
-    vm_sync_to_ctx(ctx);
-    vm_lock_release();
 }

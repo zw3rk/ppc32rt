@@ -31,6 +31,27 @@ typedef struct {
 
 static ppc32_ll_line_t g_ll_table[1024];
 static _Atomic uint32_t g_ll_lock = 0U;
+static _Thread_local int g_ll_lock_held = 0;
+
+static void ll_lock_acquire(void)
+{
+    ppc32_spin_lock(&g_ll_lock);
+    g_ll_lock_held = 1;
+}
+
+static void ll_lock_release(void)
+{
+    g_ll_lock_held = 0;
+    ppc32_spin_unlock(&g_ll_lock);
+}
+
+void vm32_ll_unlock_if_held_by_self(void)
+{
+    if (g_ll_lock_held != 0) {
+        g_ll_lock_held = 0;
+        ppc32_spin_unlock(&g_ll_lock);
+    }
+}
 
 /* Shared mapping generation (RC-U3-r2 #1): guest-mm teardowns bump it
  * via vm32_ll_note_remap, so a pre-teardown reservation can never
@@ -43,7 +64,7 @@ void vm32_ll_record(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
     uint32_t al = gva_aligned & ~3U;
     uint32_t h = (al >> 6U) & 1023U;
 
-    ppc32_spin_lock(&g_ll_lock);
+    ll_lock_acquire();
     ctx->res_addr = al;
     ctx->res_val = val;
     ctx->res_valid = 1;
@@ -52,7 +73,7 @@ void vm32_ll_record(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
     g_ll_table[h].owner = ctx;
     g_ll_table[h].addr = al;
     g_ll_table[h].val = val;
-    ppc32_spin_unlock(&g_ll_lock);
+    ll_lock_release();
 }
 
 /* STWCX. as one SEQ_CST compare-exchange (vm/vm32.h): shared mapping
@@ -64,23 +85,27 @@ bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
     uint32_t *hva = (uint32_t *)ppc32_guest_ptr(ctx, al);
     uint32_t exp = ppc32_be32(ctx->res_val);
     uint32_t des = ppc32_be32(val);
-    bool ok;
+    bool pre_ok;
+    bool ok = false;
 
-    ppc32_spin_lock(&g_ll_lock);
-    ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx &&
+    ll_lock_acquire();
+    pre_ok = ctx->res_valid != 0U && ctx->res_addr == al && g_ll_table[h].owner == ctx &&
         g_ll_table[h].addr == al && g_ll_table[h].val == ctx->res_val &&
         __atomic_load_n(&g_ll_table[h].epoch, __ATOMIC_SEQ_CST) == ctx->res_snap &&
-        __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST) == ctx->res_gensnap &&
-        __atomic_compare_exchange_n(hva, &exp, des, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    if (ok) {
-        __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST);
-    }
+        __atomic_load_n(&g_ll_generation, __ATOMIC_SEQ_CST) == ctx->res_gensnap;
     ctx->res_valid = 0;
     if (g_ll_table[h].owner == ctx) {
         g_ll_table[h].owner = NULL;
     }
     ctx->reservation_epoch++;
-    ppc32_spin_unlock(&g_ll_lock);
+    if (pre_ok) {
+        ok = __atomic_compare_exchange_n(hva, &exp, des, false,
+            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        if (ok) {
+            __atomic_fetch_add(&g_ll_table[h].epoch, 1ULL, __ATOMIC_SEQ_CST);
+        }
+    }
+    ll_lock_release();
     return ok;
 }
 
@@ -210,17 +235,25 @@ void interp_step(ppc32_ctx_t *ctx)
     case PPC32_OP_ADDC:
     case PPC32_OP_ADDE:
     case PPC32_OP_ADDME:
-    case PPC32_OP_ADDZE:
+    case PPC32_OP_ADDZE: {
+        int64_t swide;
+
         a = ctx->gpr[insn.ra];
         b = ctx->gpr[insn.rb];
         wide = (uint64_t)a + (uint64_t)b;
+        swide = (int64_t)(int32_t)a + (int64_t)(int32_t)b;
         if (insn.op == PPC32_OP_ADDE) {
-            wide += (uint64_t)((ctx->xer >> 29U) & 1U);
+            uint32_t ca = (ctx->xer >> 29U) & 1U;
+            wide += (uint64_t)ca;
+            swide += (int64_t)ca;
         } else if (insn.op == PPC32_OP_ADDME) {
-            wide = (uint64_t)a + (uint64_t)((ctx->xer >> 29U) & 1U) +
-                0xFFFFFFFFULL;
+            uint32_t ca = (ctx->xer >> 29U) & 1U;
+            wide = (uint64_t)a + (uint64_t)ca + 0xFFFFFFFFULL;
+            swide = (int64_t)(int32_t)a + (int64_t)ca - 1LL;
         } else if (insn.op == PPC32_OP_ADDZE) {
-            wide = (uint64_t)a + (uint64_t)((ctx->xer >> 29U) & 1U);
+            uint32_t ca = (ctx->xer >> 29U) & 1U;
+            wide = (uint64_t)a + (uint64_t)ca;
+            swide = (int64_t)(int32_t)a + (int64_t)ca;
         }
         r = (uint32_t)wide;
         ctx->gpr[insn.rt] = r;
@@ -228,7 +261,7 @@ void interp_step(ppc32_ctx_t *ctx)
             xer_set_ca(ctx, (wide >> 32U) != 0U);
         }
         if (insn.oe != 0U) {
-            ov = add_overflow(a, (uint32_t)(wide - a), r);
+            ov = (swide < -2147483648LL) || (swide > 2147483647LL);
             xer_set_ov(ctx, ov);
         }
         if (insn.rc != 0U) {
@@ -236,23 +269,29 @@ void interp_step(ppc32_ctx_t *ctx)
         }
         ctx->nip += 4U;
         break;
+    }
     case PPC32_OP_SUBF:
     case PPC32_OP_SUBFC:
     case PPC32_OP_SUBFE:
     case PPC32_OP_SUBFME:
-    case PPC32_OP_SUBFZE:
+    case PPC32_OP_SUBFZE: {
+        int64_t swide;
+        uint32_t ca = (ctx->xer >> 29U) & 1U;
+
         a = ctx->gpr[insn.ra];
         b = ctx->gpr[insn.rb];
         if (insn.op == PPC32_OP_SUBFME) {
-            wide = (uint64_t)(~a) +
-                (uint64_t)((ctx->xer >> 29U) & 1U) + 0xFFFFFFFFULL;
+            wide = (uint64_t)(~a) + (uint64_t)ca + 0xFFFFFFFFULL;
+            swide = (int64_t)(int32_t)(~a) + (int64_t)ca - 1LL;
         } else if (insn.op == PPC32_OP_SUBFZE) {
-            wide = (uint64_t)(~a) +
-                (uint64_t)((ctx->xer >> 29U) & 1U);
+            wide = (uint64_t)(~a) + (uint64_t)ca;
+            swide = (int64_t)(int32_t)(~a) + (int64_t)ca;
         } else {
             wide = (uint64_t)(~a) + (uint64_t)b + 1ULL;
+            swide = (int64_t)(int32_t)b - (int64_t)(int32_t)a;
             if (insn.op == PPC32_OP_SUBFE) {
-                wide += (uint64_t)((ctx->xer >> 29U) & 1U) - 1ULL;
+                wide += (uint64_t)ca - 1ULL;
+                swide = (int64_t)(int32_t)(~a) + (int64_t)(int32_t)b + (int64_t)ca;
             }
         }
         r = (uint32_t)wide;
@@ -261,19 +300,15 @@ void interp_step(ppc32_ctx_t *ctx)
             xer_set_ca(ctx, (wide >> 32U) != 0U);
         }
         if (insn.oe != 0U) {
-            if (insn.op == PPC32_OP_SUBFME ||
-                insn.op == PPC32_OP_SUBFZE) {
-                ov = ((r >> 31U) & 1U) != ((~a >> 31U) & 1U);
-                xer_set_ov(ctx, ov);
-            } else {
-                xer_set_ov(ctx, sub_overflow(a, b, r));
-            }
+            ov = (swide < -2147483648LL) || (swide > 2147483647LL);
+            xer_set_ov(ctx, ov);
         }
         if (insn.rc != 0U) {
             set_cr0(ctx, r);
         }
         ctx->nip += 4U;
         break;
+    }
     case PPC32_OP_NEG:
         a = ctx->gpr[insn.ra];
         r = (uint32_t)(0U - a);
@@ -344,8 +379,10 @@ void interp_step(ppc32_ctx_t *ctx)
         }
         ctx->gpr[insn.rt] = r;
         if (insn.oe != 0U) {
-            xer_set_ov(ctx, insn.op == PPC32_OP_DIVW && sb != 0 &&
-                sa == (int32_t)0x80000000U && sb == -1);
+            bool div_ov = (ctx->gpr[insn.rb] == 0U) ||
+                (insn.op == PPC32_OP_DIVW &&
+                 sa == (int32_t)0x80000000U && sb == -1);
+            xer_set_ov(ctx, div_ov);
         }
         if (insn.rc != 0U) {
             set_cr0(ctx, r);
@@ -710,11 +747,13 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t val;
 
         if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+        ppc32_vm_lock();
         hva = (uint32_t *)ppc32_access_checked(ctx, al, 4U, false);
-        if (hva == NULL) { break; }
+        if (hva == NULL) { ppc32_vm_unlock(); break; }
         val = ppc32_be32(__atomic_load_n(hva, __ATOMIC_SEQ_CST));
         ctx->gpr[insn.rt] = val;
         vm32_ll_record(ctx, al, val);
+        ppc32_vm_unlock();
         ctx->nip += 4U;
         break;
     }
@@ -724,8 +763,10 @@ void interp_step(ppc32_ctx_t *ctx)
         bool ok;
 
         if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
-        if (ppc32_access_checked(ctx, al, 4U, true) == NULL) { break; }
+        ppc32_vm_lock();
+        if (ppc32_access_checked(ctx, al, 4U, true) == NULL) { ppc32_vm_unlock(); break; }
         ok = vm32_sc_attempt(ctx, al, ctx->gpr[insn.rs]);
+        ppc32_vm_unlock();
         set_crf(ctx, 0U, false, false, ok);
         ctx->nip += 4U;
         break;

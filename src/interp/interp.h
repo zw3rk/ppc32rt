@@ -154,9 +154,10 @@ static inline uint32_t add_overflow(uint32_t a, uint32_t b, uint32_t r)
     return (((a ^ r) & (b ^ r)) >> 31U) & 1U;
 }
 
+/* Signed overflow for r = b - a (PowerPC SUBF/SUBFC: RT = RB - RA). */
 static inline uint32_t sub_overflow(uint32_t a, uint32_t b, uint32_t r)
 {
-    return (((a ^ r) & (a ^ b)) >> 31U) & 1U;
+    return (((b ^ a) & (b ^ r)) >> 31U) & 1U;
 }
 
 /* Invalidate the lwarx reservation (E06: syscall/fault entry, helpers,

@@ -116,6 +116,8 @@ int ppc32_hostfault_run(ppc32_ctx_t *ctx, ppc32_hostfault_fn_t run)
         int signo = hf_signo;
 
         hf_armed = 0;
+        vm32_ll_unlock_if_held_by_self();
+        ppc32_vm_unlock_if_held_by_self();
         if (rc == NULL) {
             _Exit(128 + (signo & 0x7F));
         }

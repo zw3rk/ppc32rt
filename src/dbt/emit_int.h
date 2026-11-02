@@ -342,11 +342,11 @@ static inline void ei_add_ov(a64_buf_t *b, unsigned x, unsigned y, unsigned r)
     a64_emit_shift_imm_w(b, EI_A, EI_A, A64_SHIFT_LSR, 31U, false, NULL);
 }
 
-/* ((a ^ r) & (a ^ b)) >> 31: sub overflow bit into EI_A. */
+/* ((y ^ r) & (y ^ x)) >> 31: sub overflow bit for r = y - x into EI_A. */
 static inline void ei_sub_ov(a64_buf_t *b, unsigned x, unsigned y, unsigned r)
 {
-    a64_emit_eor_reg_w(b, EI_A, x, r, A64_SHIFT_LSL, 0U);
-    a64_emit_eor_reg_w(b, EI_B, x, y, A64_SHIFT_LSL, 0U);
+    a64_emit_eor_reg_w(b, EI_A, y, r, A64_SHIFT_LSL, 0U);
+    a64_emit_eor_reg_w(b, EI_B, y, x, A64_SHIFT_LSL, 0U);
     a64_emit_and_reg_w(b, false, EI_A, EI_A, EI_B, A64_SHIFT_LSL, 0U);
     a64_emit_shift_imm_w(b, EI_A, EI_A, A64_SHIFT_LSR, 31U, false, NULL);
 }
