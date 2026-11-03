@@ -57,6 +57,10 @@ static ppc32_emit_fn s_user_emitter = dbt_fallback_emit;
  * hook and bitmap base now live in dbt.h for the syscall layer). */
 extern void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
     uint32_t start, uint32_t end);
+/* P32-R6-1: generation-aware IBTC/RAS flush (defined in cache.c).
+ * Other threads bump g_cache_epoch on invalidation/eviction without
+ * touching this ctx, so the dispatch loop syncs before every lookup. */
+extern void ppc32_cache_sync_ctx(ppc32_ctx_t *ctx);
 
 /* H1 SMC: classify natively-emitted guest stores. Returns true with
  * *len_out = stored byte count and *back_out = how far w22 (the EA)

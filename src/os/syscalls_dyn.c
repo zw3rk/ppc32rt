@@ -37,6 +37,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -191,14 +192,24 @@ static long dyn_statx(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
     return dyn_put_statx(ctx, buf_va, &hs);
 }
 
+/* Publish landed dirents: evict overlapping blocks, kill LL/SC, fan
+ * out to staged aliases and shared files (same tail as dyn_getcwd). */
+static void dyn_dents_landed(ppc32_ctx_t *ctx, uint32_t base, uint32_t n)
+{
+    ppc32_smc_store(ctx, base, n, NULL);
+    vm32_store_invalidate_range(base, n);
+    vm_file_shared_cohere_store(ctx, base, n);
+}
+
 /* Host getdents64 entries are LE; the guest linux_dirent64 has the
- * identical layout but big-endian scalars. Lengths match, so convert
- * in place from the host buffer into the guest window. */
+ * identical layout but big-endian scalars. The host chunk buffer is a
+ * per-call stack array (no shared static: concurrent readers must not
+ * share state); each entry is staged in a per-entry buffer and
+ * published with one safe copyout, never raw guest stores. */
 static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
     uint32_t count)
 {
-    static uint8_t heap[8192U];
-    uint8_t *buf = heap;
+    uint8_t host[8192U];
     uint32_t done = 0U;
 
     if (count == 0U) {
@@ -207,20 +218,23 @@ static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
     if (!ppc32_range_ok(dirp_va, count)) {
         return -EFAULT;
     }
-    /* Guest counts exceed the staging heap (BusyBox passes 32K): refill
-     * per chunk; the fd position advances across host calls. */
+    if (!ppc32_vm_range_prot_ok(ctx, dirp_va, count, 2U)) {
+        return -EFAULT;
+    }
+    /* Guest counts exceed the staging buffer (BusyBox passes 32K):
+     * refill per chunk; the fd position advances across host calls. */
     while (done < count) {
         uint32_t want = count - done;
         uint32_t off = 0U;
         long n;
 
-        if (want > sizeof heap) {
-            want = sizeof heap;
+        if (want > sizeof host) {
+            want = sizeof host;
         }
-        n = syscall(SYS_getdents64, (int)fd, buf, (size_t)want);
+        n = syscall(SYS_getdents64, (int)fd, host, (size_t)want);
         if (n < 0) {
             if (done > 0U) {
-                ppc32_smc_store(ctx, dirp_va, done, NULL);
+                dyn_dents_landed(ctx, dirp_va, done);
             }
             return done > 0U ? (long)done : -(long)errno;
         }
@@ -231,29 +245,49 @@ static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
             uint64_t ino = 0ULL;
             uint64_t d_off = 0ULL;
             uint16_t reclen = 0U;
+            uint8_t *ent;
+            uint64_t be;
             uint32_t k;
 
-            memcpy(&ino, buf + off, sizeof ino);
-            memcpy(&d_off, buf + off + 8U, sizeof d_off);
-            memcpy(&reclen, buf + off + DYN_DENT_RECLEN_OFF,
+            memcpy(&ino, host + off, sizeof ino);
+            memcpy(&d_off, host + off + 8U, sizeof d_off);
+            memcpy(&reclen, host + off + DYN_DENT_RECLEN_OFF,
                 sizeof reclen);
             if (reclen < DYN_DENT_NAME_OFF + 1U ||
                 off + reclen > (uint32_t)n ||
                 done + reclen > count) {
                 break;
             }
-            ppc32_st64be(ctx, dirp_va + done, ino);
-            ppc32_st64be(ctx, dirp_va + done + 8U, d_off);
-            ppc32_st16be(ctx, dirp_va + done + DYN_DENT_RECLEN_OFF,
-                reclen);
+            ent = (uint8_t *)malloc(reclen);
+            if (ent == NULL) {
+                if (done > 0U) {
+                    dyn_dents_landed(ctx, dirp_va, done);
+                    return (long)done;
+                }
+                return -ENOMEM;
+            }
+            be = ppc32_be64(ino);
+            memcpy(ent, &be, sizeof be);
+            be = ppc32_be64(d_off);
+            memcpy(ent + 8U, &be, sizeof be);
+            ent[DYN_DENT_RECLEN_OFF] = (uint8_t)((reclen >> 8) & 0xFFU);
+            ent[DYN_DENT_RECLEN_OFF + 1U] = (uint8_t)(reclen & 0xFFU);
             /* Type byte + name copy raw (single bytes have no
-             * endianness); reclen stays the big-endian word above. */
+             * endianness). */
             for (k = DYN_DENT_RECLEN_OFF + 2U; k < (uint32_t)reclen;
                 k++) {
-                uint8_t b = buf[off + k];
-
-                memcpy(ppc32_guest_ptr(ctx, dirp_va + done + k), &b, 1U);
+                ent[k] = host[off + k];
             }
+            if (ppc32_vm_copyout_safe(ctx, dirp_va + done, ent,
+                    reclen) != 0) {
+                free(ent);
+                if (done > 0U) {
+                    dyn_dents_landed(ctx, dirp_va, done);
+                    return (long)done;
+                }
+                return -EFAULT;
+            }
+            free(ent);
             off += (uint32_t)reclen;
             done += (uint32_t)reclen;
         }
@@ -261,9 +295,8 @@ static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
             break;
         }
     }
-    /* P1: dirents landed in guest memory; evict overlapping blocks. */
     if (done > 0U) {
-        ppc32_smc_store(ctx, dirp_va, done, NULL);
+        dyn_dents_landed(ctx, dirp_va, done);
     }
     return (long)done;
 }

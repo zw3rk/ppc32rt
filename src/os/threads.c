@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "os/signals.h"
 #include "os/threads.h"
 #include "rt32/ppc32.h"
 
@@ -24,13 +25,10 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
-
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
-
 /* Local BE guest-memory helpers; private so this file links alone. */
-
 static bool thread_range_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
     uint32_t need_prot)
 {
@@ -56,29 +54,24 @@ typedef struct {
     pthread_t    host;
     uint32_t     guest_tid;
 } ppc32_thread_slot_t;
-
 static ppc32_thread_slot_t g_thread_table[PPC32_MAX_THREADS];
 static _Atomic uint32_t g_thread_lock = 0U;
 static _Atomic uint32_t g_next_tid = 0U;
 static bool g_threads_inited = false;
-
 static void thread_lock(void)
 {
     ppc32_spin_lock(&g_thread_lock);
 }
-
 static void thread_unlock(void)
 {
     ppc32_spin_unlock(&g_thread_lock);
 }
-
 /* Caller holds thread_lock; NULL when full. */
 static ppc32_thread_slot_t *thread_claim_locked(ppc32_ctx_t *ctx,
     uint32_t guest_tid)
 {
     uint32_t i;
     uint32_t j;
-
     for (j = 0U; j < PPC32_MAX_THREADS; j++) {
         pthread_t host;
         ppc32_ctx_t *dead;
@@ -144,11 +137,9 @@ static long host_gettid(void)
     return (long)getpid();
 }
 #endif
-
 long ppc32_thread_init_main(ppc32_ctx_t *ctx)
 {
     uint32_t tid;
-
     if (ctx == NULL) {
         return -EINVAL;
     }
@@ -175,16 +166,13 @@ void ppc32_thread_fork_prepare(void)
 {
     thread_lock();
 }
-
 void ppc32_thread_fork_parent(void)
 {
     thread_unlock();
 }
-
 void ppc32_thread_fork_child(ppc32_ctx_t *ctx)
 {
     uint32_t i;
-
     atomic_store_explicit(&g_thread_lock, 0U, memory_order_release);
     for (i = 0U; i < PPC32_MAX_THREADS; i++) {
         g_thread_table[i].used = false;
@@ -205,7 +193,6 @@ uint32_t ppc32_thread_count(void)
 {
     uint32_t n = 0U;
     uint32_t i;
-
     if (!g_threads_inited) {
         return 0U;
     }
@@ -217,6 +204,35 @@ uint32_t ppc32_thread_count(void)
     }
     thread_unlock();
     return n;
+}
+
+/* tkill/tgkill backend: signal a live sibling by guest TID (sig == 0
+ * probes; sig > 0 pends; tgid != 0 requires a group match). */
+long ppc32_thread_signal(uint32_t guest_tid, uint32_t tgid, int sig)
+{
+    ppc32_ctx_t *target = NULL;
+    uint32_t i;
+    if (sig < 0 || sig > (int)PPC32_NSIG) {
+        return -EINVAL;
+    }
+    thread_lock();
+    for (i = 0U; i < PPC32_MAX_THREADS; i++) {
+        ppc32_ctx_t *c = g_thread_table[i].ctx;
+        if (!g_thread_table[i].used || g_thread_table[i].exited ||
+            c == NULL || c->guest_tid != guest_tid) {
+            continue;
+        }
+        if (tgid != 0U && c->guest_pid != tgid) {
+            continue;
+        }
+        target = c;
+        break;
+    }
+    if (target != NULL && sig > 0) {
+        target->pending_signals |= 1ULL << (uint64_t)(sig - 1);
+    }
+    thread_unlock();
+    return target != NULL ? 0L : -ESRCH;
 }
 
 void ppc32_tls_set(ppc32_ctx_t *ctx, uint32_t tls_va)
@@ -251,21 +267,28 @@ void ppc32_thread_switch_invalidate(ppc32_ctx_t *prev, ppc32_ctx_t *next)
     ppc32_reservation_invalidate(next);
 }
 
+/* gettid (nr 207): guest TID when assigned, else cached/live host TID. */
+long ppc32_gettid(ppc32_ctx_t *ctx)
+{
+    if (ctx == NULL) {
+        return -EINVAL;
+    }
+    if (ctx->guest_tid != 0U) {
+        return (long)ctx->guest_tid;
+    }
+    if (ctx->host_tid <= 0) {
+        ctx->host_tid = (int)host_gettid();
+    }
+    return (long)ctx->host_tid;
+}
+
 long ppc32_set_tid_address(ppc32_ctx_t *ctx, uint32_t tidptr_va)
 {
-    long tid;
-
     if (ctx == NULL) {
         return -EINVAL;
     }
     ctx->clear_child_tid = tidptr_va;
-    if (ctx->host_tid > 0) {
-        tid = (long)ctx->host_tid;
-    } else {
-        tid = host_gettid();
-        ctx->host_tid = (int)tid;
-    }
-    return tid;
+    return ppc32_gettid(ctx);
 }
 
 static long futex_host(int32_t *uaddr, int op, int32_t val,
@@ -273,7 +296,6 @@ static long futex_host(int32_t *uaddr, int op, int32_t val,
 {
 #ifdef __linux__
     long r = syscall(SYS_futex, uaddr, op, val, timeout, uaddr2, val3);
-
     if (r < 0) {
         return -(long)errno;
     }
@@ -284,7 +306,6 @@ static long futex_host(int32_t *uaddr, int op, int32_t val,
         val3);
 #endif
 }
-
 /* BE guest timespec -> host; 0 or -EFAULT. */
 static int futex_get_timeout(const ppc32_ctx_t *ctx, uint32_t va,
     struct timespec *out)
@@ -292,7 +313,6 @@ static int futex_get_timeout(const ppc32_ctx_t *ctx, uint32_t va,
     uint32_t raw[2];
     uint32_t sec;
     uint32_t nsec;
-
     if (ppc32_vm_copyin_safe(ctx, va, raw, sizeof(raw)) != 0) {
         return -EFAULT;
     }
@@ -533,6 +553,7 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
     child->guest_tid = child_tid;
     child->nip += 4U;
     child->gpr[3] = 0U;
+    child->cr &= (uint32_t)~PPC32_CR0_SO;
     child->exit_reason = PPC32_EXIT_NONE;
     if (stack_va != 0U) {
         child->gpr[PPC32_REG_SP] = stack_va;

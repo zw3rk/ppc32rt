@@ -128,6 +128,10 @@ long ppc32_futex_emul(int32_t *uaddr, uint32_t op, int32_t val,
  * only written by set_robust_list (not in L4b scope). */
 long ppc32_set_tid_address(ppc32_ctx_t *ctx, uint32_t tidptr_va);
 
+/* gettid (nr 207) backend: guest TID when assigned, else the cached
+ * host TID, else the live host TID (cached like set_tid_address). */
+long ppc32_gettid(ppc32_ctx_t *ctx);
+
 /* TLS plumbing (E06): the PPC32 thread pointer is r2 (PPC64 r13 does
  * not apply; there is no set_thread_area: only clone(CLONE_SETTLS)
  * writes it). Set bumps the reservation epoch (register write). */
@@ -143,5 +147,10 @@ void ppc32_thread_switch_invalidate(ppc32_ctx_t *prev, ppc32_ctx_t *next);
 /* Live-thread count (main thread included). Useful to the L4c test
  * fixture; 0 means the table was never initialised. */
 uint32_t ppc32_thread_count(void);
+
+/* Signal a live sibling by guest TID (tkill/tgkill backend, owned by
+ * the signal layer): sig == 0 probes, sig > 0 pends the bit; tgid != 0
+ * also requires a thread-group match. 0, or -ESRCH/-EINVAL. */
+long ppc32_thread_signal(uint32_t guest_tid, uint32_t tgid, int sig);
 
 #endif /* PPC32RT_OS_THREADS_H */

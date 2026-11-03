@@ -35,6 +35,7 @@
 
 #include "os/sigframe_ppc32.h"
 #include "os/signals_priv.h"
+#include "os/threads.h"
 #include "os/syscall_nr.h"
 #include "rt32/ppc32.h"
 
@@ -829,7 +830,8 @@ int ppc32_sig_pid_nr(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
         return 0;
     }
     if (nr == PPC32_NR_GETTID) {
-        *out_ret = (long)ctx->guest_tid;
+        *out_ret = ctx->guest_tid != 0U ? (long)ctx->guest_tid :
+            (long)ppc32_gettid(ctx);
         return 0;
     }
     if (nr == PPC32_NR_KILL) {
@@ -841,7 +843,7 @@ int ppc32_sig_pid_nr(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
     }
     if (nr == PPC32_NR_TKILL) {
         if (a0 != ctx->guest_tid) {
-            *out_ret = -ESRCH;
+            *out_ret = ppc32_thread_signal(a0, 0U, (int)a1);
             return 0;
         }
         if (a1 == 0U) {
@@ -860,7 +862,7 @@ int ppc32_sig_pid_nr(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
             return 0;
         }
         if (a1 != ctx->guest_tid) {
-            *out_ret = -ESRCH;
+            *out_ret = ppc32_thread_signal(a1, a0, (int)a2);
             return 0;
         }
         if (a2 == 0U) {

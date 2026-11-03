@@ -43,8 +43,8 @@
 #include <sys/mman.h>
 #ifdef __APPLE__
 #include <libkern/OSCacheControl.h>
-#include <pthread.h>
 #endif
+#include <pthread.h>
 #include <unistd.h>
 
 #include "dbt/aot/aot_run.h"
@@ -61,7 +61,79 @@
 
 static ppc32_block_t *s_table[PPC32_DBT_HT_SIZE];
 static uint32_t s_page_ver[PPC32_DBT_NPAGES];
+/* P32-R6-1: atomic generation counter observed by JIT epoch checks and
+ * by dbt.c IBTC/RAS sync. All accesses use __atomic builtins; the
+ * pointer exposed via ppc32_cache_epoch_ptr stays a plain uint32_t*. */
 static uint32_t g_cache_epoch = 1U;
+/* P32-R6-1: serializes lookup/install/invalidation. Held only for
+ * table/pagever/epoch/retire-list mutation; mmap/mprotect and guest
+ * byte copies happen outside it where noted. */
+static pthread_mutex_t s_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint32_t cache_epoch_load(void)
+{
+    return __atomic_load_n(&g_cache_epoch, __ATOMIC_ACQUIRE);
+}
+
+static void cache_epoch_bump(void)
+{
+    uint32_t next =
+        __atomic_fetch_add(&g_cache_epoch, 1U, __ATOMIC_ACQ_REL) + 1U;
+
+    if (next == 0U) {
+        __atomic_store_n(&g_cache_epoch, 1U, __ATOMIC_RELEASE);
+    }
+}
+
+/* P32-R6-1: deferred code reclamation. Evicted blocks are unlinked and
+ * link-severed under lock but their host mappings stay live until a
+ * later generation, so threads already executing them never observe
+ * a munmap underfoot. Nodes carry the post-bump epoch; reclaim frees
+ * only nodes from older generations. */
+typedef struct retired_node {
+    ppc32_block_t *blk;
+    uint32_t epoch;
+    struct retired_node *next;
+} retired_node_t;
+
+static retired_node_t *s_retired = NULL;
+
+static void block_free_now(ppc32_block_t *e);
+
+static void retire_block_locked(ppc32_block_t *e, uint32_t epoch)
+{
+    retired_node_t *n;
+
+    if (e == NULL) {
+        return;
+    }
+    n = (retired_node_t *)malloc(sizeof(*n));
+    if (n == NULL) {
+        /* OOM: leak the mapping rather than unmapping live code. */
+        return;
+    }
+    n->blk = e;
+    n->epoch = epoch;
+    n->next = s_retired;
+    s_retired = n;
+}
+
+static void reclaim_retired_locked(uint32_t cur)
+{
+    retired_node_t **pp = &s_retired;
+
+    while (*pp != NULL) {
+        retired_node_t *n = *pp;
+
+        if (n->epoch != cur) {
+            *pp = n->next;
+            block_free_now(n->blk);
+            free(n);
+        } else {
+            pp = &n->next;
+        }
+    }
+}
 
 /* RC-H perf: one occupancy bit per guest 4 KiB page (1M bits = 128 KiB).
  * Set when a translated range covers the page, cleared only by
@@ -130,7 +202,8 @@ static uint32_t cache_index(uint32_t pc)
 }
 
 /* Fill the ctx IBTC slot for pc from a live cache entry (also heals a
- * slot collided by an unrelated block). */
+ * slot collided by an unrelated block). Caller holds s_cache_lock when
+ * the entry comes from the shared table; the slot itself is ctx-local. */
 static void ibtc_fill(ppc32_ctx_t *ctx, uint32_t pc, ppc32_block_t *e)
 {
     ppc32_ibtc_entry_t *slot;
@@ -140,7 +213,7 @@ static void ibtc_fill(ppc32_ctx_t *ctx, uint32_t pc, ppc32_block_t *e)
     }
     slot = &ctx->ibtc[ppc32_ibtc_hash(pc)];
     slot->key = pc;
-    slot->epoch = g_cache_epoch;
+    slot->epoch = cache_epoch_load();
     slot->host_code = e->host_code;
     /* The inline IBTC probe loads {key|epoch, host_code} from *entry,
      * so entry must be the block pointer, not the code address. */
@@ -198,7 +271,10 @@ static void sever_ctx_range(ppc32_ctx_t *ctx, uint32_t start, uint32_t end)
     }
 }
 
-static void block_free(ppc32_block_t *e)
+/* Only called for retired generations no thread can enter via the
+ * table/links/IBTC any more; the one-generation grace in retire/reclaim
+ * keeps live execution safe. */
+static void block_free_now(ppc32_block_t *e)
 {
     if (e == NULL) {
         return;
@@ -216,7 +292,8 @@ static void block_free(ppc32_block_t *e)
     free(e);
 }
 
-static ppc32_block_t *lookup_valid(uint32_t pc)
+/* Caller holds s_cache_lock. */
+static ppc32_block_t *lookup_valid_locked(uint32_t pc)
 {
     ppc32_block_t *e = s_table[cache_index(pc)];
 
@@ -226,7 +303,7 @@ static ppc32_block_t *lookup_valid(uint32_t pc)
     if (e->pagever != s_page_ver[pc >> 12U]) {
         return NULL;
     }
-    if ((uint32_t)(e->keyepoch >> 32U) != g_cache_epoch) {
+    if ((uint32_t)(e->keyepoch >> 32U) != cache_epoch_load()) {
         return NULL;
     }
     if (e->host_code == NULL || e->entry == NULL) {
@@ -243,34 +320,31 @@ void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
     uint32_t start, uint32_t end)
 {
     uint64_t len;
+    uint8_t *snap = NULL;
 
     if (e == NULL) {
         return;
     }
+    len = (uint64_t)end - (uint64_t)start;
+    if (ctx != NULL && ctx->vm_ready && end > start && len <= 4096ULL) {
+        snap = (uint8_t *)malloc((size_t)len);
+        if (snap != NULL) {
+            memcpy(snap, ppc32_guest_ptr(ctx, start), (size_t)len);
+        }
+    }
     /* Every install path funnels through here: mark the covered pages
      * (even past the 4096 snapshot cap — the store hook must still
      * evict over-long blocks by range overlap). Empty ranges mark
-     * nothing. */
+     * nothing. Shared bitmap and block range publish under lock. */
+    (void)pthread_mutex_lock(&s_cache_lock);
     code_pages_mark(start, end);
     e->pad0[1] = (uint64_t)start;
     e->pad0[2] = (uint64_t)end;
-    e->pad0[3] = (uint64_t)0;
-    if (ctx == NULL || !ctx->vm_ready) {
-        return;
-    }
-    len = (uint64_t)end - (uint64_t)start;
-    if (end <= start || len > 4096ULL) {
-        return;
-    }
-    {
-        uint8_t *snap = (uint8_t *)malloc((size_t)len);
-
-        if (snap == NULL) {
-            return;
-        }
-        memcpy(snap, ppc32_guest_ptr(ctx, start), (size_t)len);
-        e->pad0[3] = (uint64_t)(uintptr_t)snap;
-    }
+    /* H1 SMC snapshot (pad0[3]); NULL when never recorded. */
+    free((void *)(uintptr_t)e->pad0[3]);
+    e->pad0[3] = (uint64_t)(uintptr_t)snap;
+    snap = NULL;
+    (void)pthread_mutex_unlock(&s_cache_lock);
 }
 
 /* H1 SMC: verify the recorded guest bytes are still current. True
@@ -295,10 +369,20 @@ static bool snapshot_clean(ppc32_ctx_t *ctx, const ppc32_block_t *e)
         (size_t)len) == 0;
 }
 
+/* Internal range invalidation; caller holds s_cache_lock. Severs and
+ * retires overlapping blocks without unmapping live code, bumps the
+ * generation once, and reclaims the previous generation. */
+static void invalidate_range_skip_locked(ppc32_ctx_t *ctx, uint32_t start,
+    uint32_t end, ppc32_block_t *skip);
+
+/* P32-R6-1: serialized lookup. Snapshot mismatch evicts via the locked
+ * path so no nested lock is taken. */
 ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc)
 {
-    ppc32_block_t *e = lookup_valid(pc);
+    ppc32_block_t *e;
 
+    (void)pthread_mutex_lock(&s_cache_lock);
+    e = lookup_valid_locked(pc);
     if (e != NULL) {
         if (!snapshot_clean(ctx, e)) {
             /* Guest bytes changed under this block (store via the
@@ -307,33 +391,36 @@ ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc)
              * retranslates the fresh bytes. Chained entries cannot
              * reach here stale: native stores hook ppc32_smc_store
              * before any chained re-entry. */
-            ppc32_cache_invalidate_range(ctx, (uint32_t)e->pad0[1],
-                (uint32_t)e->pad0[2]);
+            uint32_t rs = (uint32_t)e->pad0[1];
+            uint32_t re = (uint32_t)e->pad0[2];
+
+            if (re > rs) {
+                invalidate_range_skip_locked(ctx, rs, re, NULL);
+            }
+            (void)pthread_mutex_unlock(&s_cache_lock);
             return NULL;
         }
         ibtc_fill(ctx, pc, e);
     }
+    (void)pthread_mutex_unlock(&s_cache_lock);
     return e;
 }
 
-/* Resolve a pc to a live entry without translating (slots/ret fill). */
-static ppc32_block_t *lookup_nofill(uint32_t pc)
+/* Resolve a pc to a live entry without translating (slots/ret fill).
+ * Caller holds s_cache_lock. */
+static ppc32_block_t *lookup_nofill_locked(uint32_t pc)
 {
-    return lookup_valid(pc);
+    return lookup_valid_locked(pc);
 }
 
 ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     const uint32_t *words, size_t nwords, const uint32_t *slot_pcs,
     unsigned nslots, bool is_call, uint32_t ret_pc)
 {
-    uint32_t idx = cache_index(pc);
-    ppc32_block_t *old = s_table[idx];
     ppc32_block_t *e;
     size_t span;
     size_t pagesz;
     void *code;
-    unsigned s;
-    size_t i;
 
     if (words == NULL || nwords == 0U) {
         return NULL;
@@ -380,72 +467,85 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
         (char *)code + nwords * sizeof(uint32_t));
 #endif
 
-    /* Evict the collided occupant first so no live link can reach freed
-     * code; sever cross-links and ctx entries by key. */
-    if (old != NULL) {
-        uint32_t old_pc = old->guest_pc;
+    /* P32-R6-1: table mutation under lock. The executable mapping is
+     * already sealed above; eviction retires (never munmaps live code)
+     * and bumps the generation so other threads stop entering it. */
+    {
+        uint32_t idx = cache_index(pc);
+        ppc32_block_t *old;
+        unsigned s;
+        size_t i;
+        uint32_t cur;
 
-        sever_links_to(old);
-        s_table[idx] = NULL;
-        block_free(old);
-        sever_ctx_range(ctx, old_pc, old_pc + 4U);
-    }
+        (void)pthread_mutex_lock(&s_cache_lock);
+        old = s_table[idx];
+        if (old != NULL) {
+            uint32_t old_pc = old->guest_pc;
 
-    e->keyepoch = (uint64_t)pc | ((uint64_t)g_cache_epoch << 32U);
-    e->host_code = code;
-    e->entry = code;
-    e->pad0[0] = (uint64_t)span;
-    e->ret_entry = NULL;
-    e->guest_pc = pc;
-    e->pagever = s_page_ver[pc >> 12U];
-    e->slot_count = nslots;
-    e->ret_pc = is_call ? ret_pc : 0U;
-    e->occupied = true;
-    for (s = 0U; s < 8U; s++) {
-        ppc32_block_t *t;
-
-        if (s < nslots && slot_pcs != NULL) {
-            e->slot_pc[s] = slot_pcs[s];
-            t = lookup_nofill(slot_pcs[s]);
-            e->slot_entry[s] = (t != NULL) ? (void *)t : NULL;
+            sever_links_to(old);
+            s_table[idx] = NULL;
+            cache_epoch_bump();
+            cur = cache_epoch_load();
+            retire_block_locked(old, cur);
+            reclaim_retired_locked(cur);
+            sever_ctx_range(ctx, old_pc, old_pc + 4U);
         } else {
-            e->slot_pc[s] = 0U;
-            e->slot_entry[s] = NULL;
+            reclaim_retired_locked(cache_epoch_load());
         }
-    }
-    if (is_call) {
-        ppc32_block_t *t = lookup_nofill(ret_pc);
+        cur = cache_epoch_load();
+        e->keyepoch = (uint64_t)pc | ((uint64_t)cur << 32U);
+        e->host_code = code;
+        e->entry = code;
+        e->pad0[0] = (uint64_t)span;
+        e->ret_entry = NULL;
+        e->guest_pc = pc;
+        e->pagever = s_page_ver[pc >> 12U];
+        e->slot_count = nslots;
+        e->ret_pc = is_call ? ret_pc : 0U;
+        e->occupied = true;
+        for (s = 0U; s < 8U; s++) {
+            ppc32_block_t *t;
 
-        if (t != NULL) {
-            e->ret_entry = (void *)t;
-        }
-    }
-    s_table[idx] = e;
-
-    /* Backfill: earlier blocks waiting on this pc (chain slots and call
-     * fallthroughs) link up now that the target exists. */
-    for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
-        ppc32_block_t *o = s_table[i];
-
-        if (o == NULL || o == e || !o->occupied) {
-            continue;
-        }
-        if (o->pagever != s_page_ver[o->guest_pc >> 12U]) {
-            continue;
-        }
-        for (s = 0U; s < o->slot_count && s < 8U; s++) {
-            if (o->slot_pc[s] == pc) {
-                o->slot_entry[s] = (void *)e;
+            if (s < nslots && slot_pcs != NULL) {
+                e->slot_pc[s] = slot_pcs[s];
+                t = lookup_nofill_locked(slot_pcs[s]);
+                e->slot_entry[s] = (t != NULL) ? (void *)t : NULL;
+            } else {
+                e->slot_pc[s] = 0U;
+                e->slot_entry[s] = NULL;
             }
         }
-        if (o->ret_pc == pc && o->ret_entry == NULL) {
-            o->ret_entry = (void *)e;
-        }
-    }
+        if (is_call) {
+            ppc32_block_t *t = lookup_nofill_locked(ret_pc);
 
-    ibtc_fill(ctx, pc, e);
-    if (ctx != NULL) {
-        ctx->blocks_compiled++;
+            if (t != NULL) {
+                e->ret_entry = (void *)t;
+            }
+        }
+        s_table[idx] = e;
+        for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
+            ppc32_block_t *o = s_table[i];
+
+            if (o == NULL || o == e || !o->occupied) {
+                continue;
+            }
+            if (o->pagever != s_page_ver[o->guest_pc >> 12U]) {
+                continue;
+            }
+            for (s = 0U; s < o->slot_count && s < 8U; s++) {
+                if (o->slot_pc[s] == pc) {
+                    o->slot_entry[s] = (void *)e;
+                }
+            }
+            if (o->ret_pc == pc && o->ret_entry == NULL) {
+                o->ret_entry = (void *)e;
+            }
+        }
+        ibtc_fill(ctx, pc, e);
+        if (ctx != NULL) {
+            ctx->blocks_compiled++;
+        }
+        (void)pthread_mutex_unlock(&s_cache_lock);
     }
     /* Persistent AOT record (Wave C2 row): no-op without --cache. The
      * freshly emitted words are recorded once per guest pc; warm runs
@@ -455,10 +555,11 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     return e;
 }
 
-void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
+static void invalidate_range_skip_locked(ppc32_ctx_t *ctx, uint32_t start,
     uint32_t end, ppc32_block_t *skip)
 {
     uint32_t pg;
+    uint32_t cur;
 
     if (start >= end) {
         return;
@@ -473,6 +574,10 @@ void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
             break;
         }
     }
+    /* P32-R6-1: bump the generation on every invalidation so other
+     * threads' IBTC/RAS sync observes it, even when nothing is evicted. */
+    cache_epoch_bump();
+    cur = cache_epoch_load();
     /* NOTE: pages stay marked here even though the sweep below evicts
      * the range. Unmarking would need per-page live-block accounting:
      * a surviving block overlapped-but-not-evicted (its start lies
@@ -494,7 +599,7 @@ void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
             }
             sever_links_to(e);
             s_table[i] = NULL;
-            block_free(e);
+            retire_block_locked(e, cur);
         }
     }
     if (skip != NULL && (uint32_t)skip->pad0[1] < end &&
@@ -513,7 +618,7 @@ void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
 
         if (e != NULL && e->ret_pc >= start && e->ret_pc < end &&
             e->ret_entry != NULL) {
-            ppc32_block_t *t = lookup_nofill(e->ret_pc);
+            ppc32_block_t *t = lookup_nofill_locked(e->ret_pc);
 
             if (t == NULL) {
                 e->ret_entry = NULL;
@@ -521,9 +626,18 @@ void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
         }
     }
     sever_ctx_range(ctx, start, end);
+    reclaim_retired_locked(cur);
     if (ctx != NULL) {
         ctx->icache_flushes++;
     }
+}
+
+void ppc32_cache_invalidate_range_skip(ppc32_ctx_t *ctx, uint32_t start,
+    uint32_t end, ppc32_block_t *skip)
+{
+    (void)pthread_mutex_lock(&s_cache_lock);
+    invalidate_range_skip_locked(ctx, start, end, skip);
+    (void)pthread_mutex_unlock(&s_cache_lock);
 }
 
 void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
@@ -532,50 +646,84 @@ void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
     ppc32_cache_invalidate_range_skip(ctx, start, end, NULL);
 }
 
+/* P32-R6-1: flush this ctx's IBTC/RAS when its entries predate the
+ * current generation. Other threads' invalidations bump g_cache_epoch
+ * without touching this ctx, so the dispatch loop calls this before
+ * every lookup; entries filled by ibtc_fill carry the epoch sampled
+ * under lock, and any mismatch retires the whole local cache. */
+void ppc32_cache_sync_ctx(ppc32_ctx_t *ctx)
+{
+    uint32_t cur;
+    size_t i;
+    bool stale = false;
+
+    if (ctx == NULL) {
+        return;
+    }
+    cur = cache_epoch_load();
+    for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
+        ppc32_ibtc_entry_t *s = &ctx->ibtc[i];
+
+        if (s->entry != NULL && s->epoch != cur) {
+            stale = true;
+            break;
+        }
+    }
+    if (!stale) {
+        for (i = 0U; i < PPC32_RAS_SIZE; i++) {
+            ppc32_ibtc_entry_t *s = &ctx->ras[i];
+
+            if (s->entry != NULL && s->epoch != cur) {
+                stale = true;
+                break;
+            }
+        }
+    }
+    if (!stale) {
+        return;
+    }
+    for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
+        ctx->ibtc[i].key = 0U;
+        ctx->ibtc[i].epoch = 0U;
+        ctx->ibtc[i].host_code = NULL;
+        ctx->ibtc[i].entry = NULL;
+        ctx->ibtc[i].pad = 0U;
+    }
+    for (i = 0U; i < PPC32_RAS_SIZE; i++) {
+        ctx->ras[i].key = 0U;
+        ctx->ras[i].epoch = 0U;
+        ctx->ras[i].host_code = NULL;
+        ctx->ras[i].entry = NULL;
+        ctx->ras[i].pad = 0U;
+    }
+    ctx->ras_top = 0U;
+}
+
 /* H1 SMC post-store hook (called from JIT-emitted code right after a
  * natively-emitted guest store of `len` bytes at `ea`; `cur` is the
  * executing entry, x27 at the call site). Evicts and severs every
  * overlapping translation so no chained re-entry can run stale
  * bytes; the executing entry itself is only link-severed, never
  * unmapped mid-execution. Wrap-around ranges flush everything. */
-void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
-    void *cur)
-{
-    uint64_t end;
-
-    if (ctx == NULL || len == 0U || len > 4096U) {
-        return;
-    }
-    end = (uint64_t)ea + (uint64_t)len;
-    if (end > 0x100000000ULL) {
-        ppc32_cache_invalidate_all(ctx);
-        return;
-    }
-    /* Fast path: no translated code on the touched pages, so the two
-     * full-table sweeps below would evict and sever nothing. Data
-     * writes (the overwhelmingly common store) return here. */
-    if (!code_pages_any(ea, (uint32_t)end)) {
-        return;
-    }
-    ppc32_cache_invalidate_range_skip(ctx, ea, (uint32_t)end,
-        (ppc32_block_t *)cur);
-}
-
-void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx)
+static void invalidate_all_locked(ppc32_ctx_t *ctx)
 {
     uint32_t i;
+    uint32_t cur;
 
+    /* P32-R6-1: retire everything without unmapping live code; the
+     * generation bump retires every emitted epoch check at once and
+     * lets other threads lazily flush via ppc32_cache_sync_ctx. */
+    cache_epoch_bump();
+    cur = cache_epoch_load();
     for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
-        block_free(s_table[i]);
-        s_table[i] = NULL;
+        if (s_table[i] != NULL) {
+            retire_block_locked(s_table[i], cur);
+            s_table[i] = NULL;
+        }
     }
     /* No live block survives: clear the occupancy map with it. */
     memset(s_code_pages, 0, sizeof s_code_pages);
-    /* Retire every emitted epoch check at once. */
-    g_cache_epoch++;
-    if (g_cache_epoch == 0U) {
-        g_cache_epoch = 1U;
-    }
+    reclaim_retired_locked(cur);
     if (ctx != NULL) {
         for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
             ctx->ibtc[i].key = 0U;
@@ -593,4 +741,39 @@ void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx)
         }
         ctx->ras_top = 0U;
     }
+}
+
+void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
+    void *cur)
+{
+    uint64_t end;
+    bool has_code;
+
+    if (ctx == NULL || len == 0U || len > 4096U) {
+        return;
+    }
+    end = (uint64_t)ea + (uint64_t)len;
+    if (end > 0x100000000ULL) {
+        ppc32_cache_invalidate_all(ctx);
+        return;
+    }
+    /* Fast path: no translated code on the touched pages, so the two
+     * full-table sweeps below would evict and sever nothing. Data
+     * writes (the overwhelmingly common store) return here. The bitmap
+     * is checked under lock so a concurrent invalidate_all clear cannot
+     * race the read. */
+    (void)pthread_mutex_lock(&s_cache_lock);
+    has_code = code_pages_any(ea, (uint32_t)end);
+    if (has_code) {
+        invalidate_range_skip_locked(ctx, ea, (uint32_t)end,
+            (ppc32_block_t *)cur);
+    }
+    (void)pthread_mutex_unlock(&s_cache_lock);
+}
+
+void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx)
+{
+    (void)pthread_mutex_lock(&s_cache_lock);
+    invalidate_all_locked(ctx);
+    (void)pthread_mutex_unlock(&s_cache_lock);
 }

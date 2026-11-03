@@ -34,6 +34,7 @@
 #include "os/convert.h"
 #include "os/hostfault.h"
 #include "os/signals.h"
+#include "os/syscall_nr.h"
 #include "os/syscalls.h"
 #include "os/threads.h"
 #include "dbt/dbt.h"
@@ -442,7 +443,15 @@ long ppc32_run_guest_child(ppc32_ctx_t *child)
             uint32_t nr = child->gpr[0];
 
             if (ppc32_syscall_is_exit(nr)) {
+                /* exit_group from a worker ends the whole process;
+                 * plain exit ends just this thread (thread_entry then
+                 * marks the slot exited). */
+                int group = (nr == PPC32_NR_EXIT_GROUP);
+
                 ppc32_syscall(child);
+                if (group != 0) {
+                    _exit((int)(child->exit_arg & 0xFFU));
+                }
                 return (long)(child->exit_arg & 0xFFU);
             }
             ppc32_syscall(child);
@@ -468,14 +477,25 @@ long ppc32_run_guest_child(ppc32_ctx_t *child)
     }
 }
 
-/* Dispatch one stopped-at-sc state; returns guest status on exit calls. */
+/* Dispatch one stopped-at-sc state; returns guest status on exit calls.
+ * exit_group ends the process; plain exit ends the calling thread, so
+ * the initial thread lingers until live siblings finish (native
+ * exit(2) semantics). */
 static int syscall_dispatch(ppc32_ctx_t *ctx, int *status)
 {
     uint32_t nr = ctx->gpr[0];
 
-    if (ppc32_syscall_is_exit(nr)) {
+    if (nr == PPC32_NR_EXIT_GROUP) {
         ppc32_syscall(ctx);
         *status = (int)(ctx->exit_arg & 0xFFU);
+        return 1;
+    }
+    if (nr == PPC32_NR_EXIT) {
+        ppc32_syscall(ctx);
+        *status = (int)(ctx->exit_arg & 0xFFU);
+        while (ppc32_thread_count() > 1U) {
+            sched_yield();
+        }
         return 1;
     }
     ppc32_syscall(ctx);

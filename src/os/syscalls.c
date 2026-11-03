@@ -543,10 +543,15 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
 
     switch (nr) {
     case PPC32_NR_EXIT:
+        /* Thread exit: ends the calling thread only (main.c waits out
+         * live siblings for the initial thread; workers return to the
+         * thread_entry teardown). */
         ctx->exit_arg = a0 & 0xFFU;
         ret = (long)(int32_t)ctx->exit_arg;
         break;
     case PPC32_NR_EXIT_GROUP:
+        /* Group exit: ends every thread (main.c _exit(2)s from workers
+         * and returns the status from the initial thread). */
         ctx->exit_arg = a0 & 0xFFU;
         ret = (long)(int32_t)ctx->exit_arg;
         break;
