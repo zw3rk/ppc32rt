@@ -504,6 +504,7 @@ aot_row hl
 # --- summary and gate -------------------------------------------------
 
 log "== summary PASS=$PASS_COUNT FAIL=$FAIL_COUNT GAP=$GAP_COUNT SKIP=$SKIP_COUNT =="
+log "PARITY_SUMMARY repo=ppc32rt pass=$PASS_COUNT fail=$FAIL_COUNT gap=$GAP_COUNT skip=$SKIP_COUNT"
 if [ "$FAIL_COUNT" != "0" ] || [ "$GAP_COUNT" != "0" ]; then
     log "GATE: FAIL/GAP present"
     exit 1
