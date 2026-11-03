@@ -405,7 +405,8 @@ static int deliver_sync(ppc32_ctx_t *ctx)
         uint32_t sig = (ctx->fault_signo == (uint32_t)PPC32_SIGBUS) ?
             (uint32_t)PPC32_SIGBUS : (uint32_t)PPC32_SIGSEGV;
 
-        r = ppc32_sig_deliver_sync(ctx, (int)sig, 0, ctx->fault_addr, 0U);
+        r = ppc32_sig_deliver_sync(ctx, (int)sig, 0, ctx->fault_addr,
+            ctx->fault_is_store);
     }
     if (r != 0L && r != 1L) {
         return 0;
@@ -470,7 +471,9 @@ long ppc32_run_guest_child(ppc32_ctx_t *child)
             if (ppc32_syscall_is_exit(child->gpr[0])) {
                 return (long)(child->exit_arg & 0xFFU);
             }
-            child->exit_reason = PPC32_EXIT_NONE;
+            if (child->exit_reason == PPC32_EXIT_SYSCALL) {
+                child->exit_reason = PPC32_EXIT_NONE;
+            }
             continue;
         }
         if (child->exit_reason == PPC32_EXIT_FAULT ||
@@ -512,12 +515,16 @@ static int syscall_dispatch(ppc32_ctx_t *ctx, int *status)
     }
     ppc32_syscall(ctx);
     /* Native execve delegation reparks gpr[0] on EXIT with the native
-     * status in exit_arg (proc.c): stop the engine like an exit call. */
+     * status in exit_arg (proc.c): stop the engine like an exit call.
+     * A failed rt_sigreturn parks FAULT here (see sys_rt_sigreturn);
+     * preserve it so the driver terminates instead of re-running sc. */
     if (ppc32_syscall_is_exit(ctx->gpr[0])) {
         *status = (int)(ctx->exit_arg & 0xFFU);
         return 1;
     }
-    ctx->exit_reason = PPC32_EXIT_NONE;
+    if (ctx->exit_reason == PPC32_EXIT_SYSCALL) {
+        ctx->exit_reason = PPC32_EXIT_NONE;
+    }
     return 0;
 }
 

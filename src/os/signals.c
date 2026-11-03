@@ -40,19 +40,13 @@
 #include "rt32/ppc32.h"
 #include "vm/vm32.h"
 
-/* Process-shared disposition table (kernel sighand equivalent; per-thread
- * state — the blocked mask — already lives in ppc32_ctx_t for L4b).
- * Guarded by g_sig_disp_lock: getters copy the whole entry and setters
- * replace it, so concurrent delivery never mixes a handler from one
- * update with flags/mask from another. Lock order is outermost: holders
- * may enter the VM (guest copy helpers) but no VM holder takes this. */
+/* Process-shared disposition table guarded by g_sig_disp_lock (outermost lock). */
 static ppc32_sigact_t sig_actions[PPC32_NSIG + 1U];
 static _Atomic uint32_t g_sig_disp_lock = 0U;
 
 static void sig_disp_lock_acquire(void)
 {
-    while (atomic_exchange_explicit(&g_sig_disp_lock, 1U,
-        memory_order_acquire) != 0U) {
+    while (atomic_exchange_explicit(&g_sig_disp_lock, 1U, memory_order_acquire) != 0U) {
         sched_yield();
     }
 }
@@ -62,23 +56,10 @@ static void sig_disp_lock_release(void)
     atomic_store_explicit(&g_sig_disp_lock, 0U, memory_order_release);
 }
 
-/* Fork coordination (ppc32_proc_fork protocol): the parent holds the
- * lock across fork so no update is half-written at the snapshot; the
- * child drops the inherited locked value (its owner is gone). */
-void ppc32_sig_fork_prepare(void)
-{
-    sig_disp_lock_acquire();
-}
-
-void ppc32_sig_fork_parent(void)
-{
-    sig_disp_lock_release();
-}
-
-void ppc32_sig_fork_child(void)
-{
-    atomic_store_explicit(&g_sig_disp_lock, 0U, memory_order_release);
-}
+/* Fork coordination (ppc32_proc_fork protocol). */
+void ppc32_sig_fork_prepare(void) { sig_disp_lock_acquire(); }
+void ppc32_sig_fork_parent(void)  { sig_disp_lock_release(); }
+void ppc32_sig_fork_child(void)   { atomic_store_explicit(&g_sig_disp_lock, 0U, memory_order_release); }
 
 /* ---- Frozen-layout compile checks (SPEC 2.3) ---- */
 _Static_assert(PPC32_SIGACTION_SIZE == 20U, "guest sigaction must be 20 B");
@@ -440,7 +421,7 @@ static void sig_default_trap(int sig, uint32_t fault_addr, uint32_t is_store,
         dar = fault_addr;
         break;
     case (int)PPC32_SIGTRAP:
-        trap = PPC32_TRAP_TRACE;
+        trap = PPC32_TRAP_PROGRAM;
         dar = fault_addr;
         break;
     default:
@@ -483,6 +464,11 @@ long ppc32_sig_deliver_sync(ppc32_ctx_t *ctx, int sig, int code,
     }
     sig_disp_lock_release();
     if (act.handler == PPC32_SIG_IGN) {
+        if (sig == (int)PPC32_SIGSEGV || sig == (int)PPC32_SIGBUS ||
+            sig == (int)PPC32_SIGILL || sig == (int)PPC32_SIGFPE ||
+            sig == (int)PPC32_SIGTRAP) {
+            return -EFAULT;
+        }
         return 1;
     }
     if (act.handler == PPC32_SIG_DFL) {
@@ -539,6 +525,9 @@ static long sys_rt_sigaction(ppc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
         SIG_MUST(sig_st32(ctx, old_va + 16U, old.mask[1]));
     }
     if (have_new != 0) {
+        if (!ppc32_sig_is_catchable((int)sig)) {
+            return -EINVAL;
+        }
         if (ppc32_sigaction_set_raw((int)sig, &neu) != 0) {
             return -EINVAL;
         }
@@ -628,8 +617,29 @@ static long sys_rt_sigreturn(ppc32_ctx_t *ctx)
 {
     /* The frame address is the current stack pointer (the vDSO
      * __kernel_sigtramp_rt issues `li r0,173; sc` without moving r1).
-     * nip is restored from the frame; the caller must not advance it. */
-    return (long)ppc32_sig_restore_frame(ctx, ctx->gpr[PPC32_REG_SP]);
+     * nip is restored from the frame; the caller must not advance it.
+     * A bad frame terminates via synchronous SIGSEGV instead of
+     * re-executing the sc forever. */
+    int r;
+    long dr;
+
+    if (ctx == NULL) {
+        return -EFAULT;
+    }
+    r = ppc32_sig_restore_frame(ctx, ctx->gpr[PPC32_REG_SP]);
+    if (r >= 0) {
+        return (long)r;
+    }
+    dr = ppc32_sig_deliver_sync(ctx, (int)PPC32_SIGSEGV, 0,
+        ctx->gpr[PPC32_REG_SP], 0U);
+    if (dr == 0L) {
+        return 0L;
+    }
+    ctx->exit_reason = PPC32_EXIT_FAULT;
+    ctx->fault_signo = (uint32_t)PPC32_SIGSEGV;
+    ctx->fault_addr = ctx->gpr[PPC32_REG_SP];
+    ctx->fault_is_store = 0U;
+    return (long)r;
 }
 
 static long sys_sigaltstack(ppc32_ctx_t *ctx, uint32_t uss_va,
@@ -691,15 +701,8 @@ int ppc32_sig_nr_no_advance(uint32_t nr)
     return (nr == PPC32_NR_RT_SIGRETURN) ? 1 : 0;
 }
 
-/* kill(2): self-delivery goes through the guest signal layer (a host
- * kill would bypass the installed handler and slay the translator);
- * anything else forwards to the host (fork children are real host
- * processes, so kill/wait4 on them behave natively). Returns 1 when the
- * call was fully applied inside (E01 + nip + syscalls_executed all
- * handled, ppc32_sig_deliver_sync entered the handler); 0 with *out_ret
- * set when the generic tail (E01 + advance) still applies. Moved here
- * from syscalls.c in RC5 (file-size discipline): the signal layer owns
- * delivery, so it owns the self-delivery fast path too. */
+/* kill(2): self-delivery goes through the guest signal layer; foreign pids
+ * forward to the host. Returns 1 when handler entered, 0 with *out_ret set. */
 int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
     long *out_ret)
 {
@@ -708,13 +711,17 @@ int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
     if (out_ret == NULL) {
         return 0;
     }
-    if (sig < 1U || sig > PPC32_NSIG) {
+    if (sig > PPC32_NSIG) {
         *out_ret = -EINVAL;
         return 0;
     }
+    if (sig == 0U) {
+        *out_ret = ((pid_t)(int32_t)pid_va != getpid())
+            ? ((kill((pid_t)(int32_t)pid_va, 0) == 0) ? 0L : -(long)errno) : 0L;
+        return 0;
+    }
     if ((pid_t)(int32_t)pid_va != getpid()) {
-        *out_ret = (kill((pid_t)(int32_t)pid_va, (int)sig) == 0) ? 0L :
-            -(long)errno;
+        *out_ret = (kill((pid_t)(int32_t)pid_va, (int)sig) == 0) ? 0L : -(long)errno;
         return 0;
     }
     if (ppc32_sigaction_get((int)sig, &act) != 0) {
@@ -722,17 +729,11 @@ int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
         return 0;
     }
     if (act.handler != PPC32_SIG_DFL && act.handler != PPC32_SIG_IGN) {
-        /* P32-R5-8: blocked signals enqueue as pending, never enter
-         * the handler while blocked; delivered on unmask/boundary. */
         if ((ctx->sig_mask & sig_bit((int)sig)) != 0ULL) {
-            __atomic_fetch_or(&ctx->pending_signals, sig_bit((int)sig),
-                __ATOMIC_ACQ_REL);
+            __atomic_fetch_or(&ctx->pending_signals, sig_bit((int)sig), __ATOMIC_ACQ_REL);
             *out_ret = 0L;
             return 0;
         }
-        /* Handled: success return first (post-sc nip is what the frame
-         * captures), then redirect into the handler; the tail must not
-         * advance nip a second time. */
         ctx->gpr[3] = 0U;
         ctx->cr &= (uint32_t)~PPC32_CR0_SO;
         ctx->nip += 4U;
@@ -748,14 +749,11 @@ int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
         *out_ret = 0L;
         return 0;
     }
-    /* Default disposition: let the host apply it (fatal signals terminate
-     * us exactly like the qemu-ppc oracle dies; ignore-defaults return). */
     *out_ret = (raise((int)sig) == 0) ? 0L : -(long)errno;
     return 0;
 }
 
-/* P32-R5-8: deliver first pending unblocked catchable signal (called
- * after the syscall tail so the frame captures post-sc nip). */
+/* Deliver first pending unblocked catchable signal after the syscall tail. */
 void ppc32_sig_pump_pending(ppc32_ctx_t *ctx)
 {
     uint32_t s;
@@ -765,32 +763,20 @@ void ppc32_sig_pump_pending(ppc32_ctx_t *ctx)
     for (s = 1U; s <= PPC32_NSIG; s++) {
         uint64_t bit = sig_bit((int)s);
         ppc32_sigact_t act;
-        /* P32-R6-6: atomic snapshot; sibling pends land via fetch_or
-         * while this thread clears with fetch_and, so no bit is lost. */
-        if ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) &
-            bit) == 0ULL) {
-            continue;
-        }
-        if ((ctx->sig_mask & bit) != 0ULL) {
-            continue;
-        }
-        if (ppc32_sigaction_get((int)s, &act) != 0) {
+        if ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) & bit) == 0ULL ||
+            (ctx->sig_mask & bit) != 0ULL || ppc32_sigaction_get((int)s, &act) != 0) {
             continue;
         }
         if (act.handler == PPC32_SIG_IGN) {
-            __atomic_fetch_and(&ctx->pending_signals, ~bit,
-                __ATOMIC_ACQ_REL);
+            __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_ACQ_REL);
             continue;
         }
         if (act.handler == PPC32_SIG_DFL) {
-            __atomic_fetch_and(&ctx->pending_signals, ~bit,
-                __ATOMIC_ACQ_REL);
+            __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_ACQ_REL);
             (void)raise((int)s);
             return;
         }
-        if (ppc32_sig_deliver_sync(ctx, (int)s, 0, 0U, 0U) == 0) {
-            return;
-        }
+        (void)ppc32_sig_deliver_sync(ctx, (int)s, 0, 0U, 0U);
         return;
     }
 }

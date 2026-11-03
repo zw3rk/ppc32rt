@@ -271,6 +271,12 @@ typedef struct ppc32_ctx {
      * deliver_sync. Zero (no fault recorded) delivers as SIGSEGV. */
     uint32_t fault_signo;
 
+    /* P32-R11-6: store direction for the last FAULT exit (0 = load,
+     * 1 = store). Set by interp fault paths and the host-fault guard;
+     * read by deliver_sync for the DSISR class. C-only tail, outside
+     * the locked prefix verified by check_abi_invariants. */
+    uint32_t fault_is_store;
+
     /* Per-thread LL/SC epoch snapshots (P32-10: no shared-slot race). */
     uint64_t res_snap;
     uint64_t res_gensnap;

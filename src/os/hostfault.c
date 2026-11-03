@@ -127,6 +127,11 @@ int ppc32_hostfault_run(ppc32_ctx_t *ctx, ppc32_hostfault_fn_t run)
             (uint32_t)((uintptr_t)hf_addr - (uintptr_t)guest_base);
         rc->fault_signo = (uint32_t)((signo == HF_SIGBUS) ?
             PPC32_SIGBUS : PPC32_SIGSEGV);
+        /* P32-R11-6: host faults record load-class direction (the
+         * interpreter store paths set fault_is_store = 1 before
+         * reaching this guard; DBT store direction arrives via the
+         * fault-site record where known). */
+        rc->fault_is_store = 0U;
         /* RC-U3-r4: a truncated-file page traps as SIGBUS even when the
          * host delivered SIGSEGV (PROT_NONE tail), matching Linux
          * beyond-EOF semantics for both interp and DBT faults. */

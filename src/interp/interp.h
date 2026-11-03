@@ -211,16 +211,19 @@ static inline void *ppc32_access_checked(ppc32_ctx_t *ctx, uint32_t ea,
 
     if (width < 1U || width > 4U) {
         fault(ctx, ea);
+        ctx->fault_is_store = is_store ? 1U : 0U;
         return NULL;
     }
     if (vm32_tlb_miss(ctx, ea, is_store, &hva) != 0 || hva == NULL) {
         if (vm32_page_is_eof_trap(ea)) {
             ctx->fault_addr = ea;
             ctx->fault_signo = (uint32_t)PPC32_SIGBUS;
+            ctx->fault_is_store = is_store ? 1U : 0U;
             ctx->exit_reason = PPC32_EXIT_FAULT;
             res_invalidate(ctx);
         } else {
             fault(ctx, ea);
+            ctx->fault_is_store = is_store ? 1U : 0U;
         }
         return NULL;
     }
@@ -233,10 +236,12 @@ static inline void *ppc32_access_checked(ppc32_ctx_t *ctx, uint32_t ea,
             if (vm32_page_is_eof_trap(last)) {
                 ctx->fault_addr = last;
                 ctx->fault_signo = (uint32_t)PPC32_SIGBUS;
+                ctx->fault_is_store = is_store ? 1U : 0U;
                 ctx->exit_reason = PPC32_EXIT_FAULT;
                 res_invalidate(ctx);
             } else {
                 fault(ctx, last);
+                ctx->fault_is_store = is_store ? 1U : 0U;
             }
             return NULL;
         }
@@ -447,11 +452,14 @@ static inline bool trap_cond(uint32_t to, uint32_t a, uint32_t b, bool is64,
 
 /* Fault helper: records fault_addr, clears the reservation, stops.
  * Software faults (low guard, misalignment) are SEGV-class; the
- * host-fault guard overwrites fault_signo with SEGV/BUS from si_signo. */
+ * host-fault guard overwrites fault_signo with SEGV/BUS from si_signo.
+ * P32-R11-6: load-class default (fault_is_store = 0); store paths
+ * overwrite with 1 after calling fault() or via ppc32_access_checked. */
 static inline void fault(ppc32_ctx_t *ctx, uint32_t ea)
 {
     ctx->fault_addr = ea;
     ctx->fault_signo = (uint32_t)PPC32_SIGSEGV;
+    ctx->fault_is_store = 0U;
     ctx->exit_reason = PPC32_EXIT_FAULT;
     res_invalidate(ctx);
 }
@@ -550,16 +558,28 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
         break;
     case PPC32_OP_STB:
     case PPC32_OP_STBU:
-        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ea, 1U)) {
+            fault(ctx, ea);
+            ctx->fault_is_store = 1U;
+            return;
+        }
         st8(ctx, ea, (uint8_t)ctx->gpr[insn->rs]);
         break;
     case PPC32_OP_STH:
     case PPC32_OP_STHU:
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ea, 2U)) {
+            fault(ctx, ea);
+            ctx->fault_is_store = 1U;
+            return;
+        }
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ea, 4U)) {
+            fault(ctx, ea);
+            ctx->fault_is_store = 1U;
+            return;
+        }
         st32(ctx, ea, ctx->gpr[insn->rs]);
         break;
     }
@@ -643,16 +663,28 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         break;
     case PPC32_OP_STBX:
     case PPC32_OP_STBUX:
-        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ea, 1U)) {
+            fault(ctx, ea);
+            ctx->fault_is_store = 1U;
+            return;
+        }
         st8(ctx, ea, (uint8_t)ctx->gpr[insn->rs]);
         break;
     case PPC32_OP_STHX:
     case PPC32_OP_STHUX:
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ea, 2U)) {
+            fault(ctx, ea);
+            ctx->fault_is_store = 1U;
+            return;
+        }
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ea, 4U)) {
+            fault(ctx, ea);
+            ctx->fault_is_store = 1U;
+            return;
+        }
         st32(ctx, ea, ctx->gpr[insn->rs]);
         break;
     }
