@@ -70,10 +70,8 @@
 #undef st_mtime
 #undef st_ctime
 
-/* Extended Provider-A helper (defined in src/vm/vm_file.c): identity
- * truncate matches one (host_fd, st_dev, st_ino) mapping. Declared at
- * use so the shared vm32.h contract stays untouched (RC-U3-r2 #4). */
-int vm_file_on_truncate_fd(int host_fd, uint64_t new_size);
+/* Identity truncate (P32-R4-10) is declared in vm/vm32.h alongside
+ * the other Provider-A helpers. */
 
 /* Numbers absent from the frozen os/syscall_nr.h (powerpc syscall.tbl):
  * clock_gettime 246, openat 286, getrandom 359. Guarded so a future
@@ -109,6 +107,19 @@ static long host_ret(ssize_t n, int err)
     return (long)n;
 }
 
+/* Landed read bytes: evict overlapping translated blocks, kill peer
+ * LL/SC reservations (P32-R4-12), and fan out to overlapping staged
+ * shared-file aliases (P32-R4-3). Reads never write the file back. */
+static void sys_read_landed(ppc32_ctx_t *ctx, uint32_t base, uint32_t n)
+{
+    if (n == 0U) {
+        return;
+    }
+    ppc32_smc_store(ctx, base, n, NULL);
+    vm32_store_invalidate_range(base, n);
+    vm_file_shared_cohere_read(ctx, base, n);
+}
+
 /* P1: read/pread64 helper; landed bytes evict overlapping blocks. */
 static long sys_read_at(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
     uint32_t count, bool use_pread, int64_t off)
@@ -118,11 +129,18 @@ static long sys_read_at(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
     if (count > 0U && !ppc32_range_ok(buf_va, count)) {
         return -EFAULT;
     }
+    /* P32-R4-11: the destination needs guest write permission, checked
+     * per sub-page so an accessible host-page neighbor cannot launder
+     * a read-only or unmapped target. */
+    if (count > 0U &&
+        !ppc32_vm_range_prot_ok(ctx, buf_va, count, 2U)) {
+        return -EFAULT;
+    }
     n = use_pread ? pread((int)fd, ppc32_guest_ptr(ctx, buf_va),
         (size_t)count, (off_t)off) :
         read((int)fd, ppc32_guest_ptr(ctx, buf_va), (size_t)count);
     if (n > 0) {
-        ppc32_smc_store(ctx, buf_va, (uint32_t)n, NULL);
+        sys_read_landed(ctx, buf_va, (uint32_t)n);
     }
     return host_ret(n, errno);
 }
@@ -134,27 +152,40 @@ static long sys_write(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t c
     if (count > 0U && !ppc32_range_ok(buf_va, count)) {
         return -EFAULT;
     }
+    /* P32-R4-11: the source needs guest read permission (sub-page). */
+    if (count > 0U &&
+        !ppc32_vm_range_prot_ok(ctx, buf_va, count, 1U)) {
+        return -EFAULT;
+    }
     n = write((int)fd, ppc32_guest_ptr(ctx, buf_va), (size_t)count);
     if (n > 0) {
         /* Provider-A hook: an extending write moves the inode EOF
-         * forward (no-op until a file mapping registers the fd). */
+         * forward (no-op until a file mapping registers the fd),
+         * then overlapping staged aliases refresh from the file. */
         off_t end = lseek((int)fd, 0, SEEK_CUR);
 
         if (end >= (off_t)0) {
             (void)vm_file_hook_write((int)fd, (uint64_t)end);
+            vm_file_shared_refresh_file_range((int)fd,
+                (uint64_t)(end - n), (uint64_t)end);
         }
     }
     return host_ret(n, errno);
 }
 
 /* Chunked vectored I/O: a fixed host iovec array (no VLA) walks the BE
- * guest array; partial transfers return the bytes moved so far. */
+ * guest array; partial transfers return the bytes moved so far. The
+ * transferred count lives in result and is never depleted: readv
+ * invalidates each landed chunk as it completes (P32-R4-1), so error
+ * returns after partial progress keep both the count and the
+ * invalidation. */
 static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
     uint32_t count, int is_write)
 {
     struct iovec hv[PPC32_IOV_CHUNK];
-    uint64_t total = 0ULL;
+    uint64_t result = 0ULL;
     uint32_t done = 0U;
+    uint32_t need_prot = (is_write != 0) ? 1U : 2U;
 
     if (count == 0U) {
         return 0;
@@ -163,6 +194,11 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
         return -EINVAL;
     }
     if (!ppc32_range_ok(iov_va, (size_t)count * sizeof(ppc32_iovec_t))) {
+        return -EFAULT;
+    }
+    /* P32-R4-11: the iovec table itself is guest-read in both modes. */
+    if (!ppc32_vm_range_prot_ok(ctx, iov_va,
+            (size_t)count * sizeof(ppc32_iovec_t), 1U)) {
         return -EFAULT;
     }
     while (done < count) {
@@ -179,7 +215,13 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
             uint32_t len = ppc32_ld32be(ctx, iov_va + (done + j) * 8U + 4U);
 
             if (len > 0U && !ppc32_range_ok(base, len)) {
-                return total > 0ULL ? (long)total : -EFAULT;
+                return result > 0ULL ? (long)result : -EFAULT;
+            }
+            /* P32-R4-11: per-destination sub-page permissions — guest
+             * read for writev sources, guest write for readv targets. */
+            if (len > 0U &&
+                !ppc32_vm_range_prot_ok(ctx, base, len, need_prot)) {
+                return result > 0ULL ? (long)result : -EFAULT;
             }
             hv[j].iov_base = ppc32_guest_ptr(ctx, base);
             hv[j].iov_len = (size_t)len;
@@ -187,33 +229,42 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
         }
         got = is_write ? writev((int)fd, hv, (int)n) : readv((int)fd, hv, (int)n);
         if (got < 0) {
-            return total > 0ULL ? (long)total : -(long)errno;
+            return result > 0ULL ? (long)result : -(long)errno;
         }
-        total += (uint64_t)got;
+        if (got > 0 && is_write == 0) {
+            /* P32-R4-1: invalidate each completed destination range
+             * now, partial-aware, without touching result. */
+            uint64_t rem = (uint64_t)got;
+
+            for (j = 0U; j < n && rem > 0ULL; j++) {
+                uint32_t base =
+                    ppc32_ld32be(ctx, iov_va + (done + j) * 8U);
+                uint32_t len =
+                    ppc32_ld32be(ctx, iov_va + (done + j) * 8U + 4U);
+                uint32_t hit =
+                    (uint64_t)len > rem ? (uint32_t)rem : len;
+
+                sys_read_landed(ctx, base, hit);
+                rem -= (uint64_t)hit;
+            }
+        }
+        result += (uint64_t)got;
         done += n;
         if ((uint64_t)got < (uint64_t)want) {
             break;
         }
     }
-    if (is_write == 0 && total > 0ULL) { /* P1: readv landed; evict. */
-        uint32_t i;
-        for (i = 0U; i < count && total > 0ULL; i++) {
-            uint32_t len = ppc32_ld32be(ctx, iov_va + i * 8U + 4U);
-            uint32_t hit = len > total ? (uint32_t)total : len;
-            ppc32_smc_store(ctx, ppc32_ld32be(ctx, iov_va + i * 8U), hit,
-                NULL);
-            total -= hit;
-        }
-    }
-    if (is_write != 0 && total > 0ULL) {
+    if (is_write != 0 && result > 0ULL) {
         /* Same Provider-A EOF hook as sys_write above. */
         off_t end = lseek((int)fd, 0, SEEK_CUR);
 
         if (end >= (off_t)0) {
             (void)vm_file_hook_write((int)fd, (uint64_t)end);
+            vm_file_shared_refresh_file_range((int)fd,
+                (uint64_t)((uint64_t)end - result), (uint64_t)end);
         }
     }
-    return (long)total;
+    return (long)result;
 }
 
 /* File opens, close, unlink, lseek, llseek, stat, and ioctl live in

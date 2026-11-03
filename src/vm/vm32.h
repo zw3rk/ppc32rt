@@ -199,6 +199,11 @@ bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val);
  * path (DBT slow path, interp, copyout, sigframe). Forces write_tag ==
  * ~0 on reserved pages so stores always trap here. */
 void vm32_reservation_bump(uint32_t gva_aligned);
+
+/* Invalidate every 64-byte LL/SC bucket spanned by [ea, ea + len)
+ * (src/interp/llsc.c): a wide store must kill middle-bucket
+ * reservations too, not just the first and last lines. */
+void vm32_store_invalidate_range(uint32_t ea, uint32_t len);
 void vm32_ll_unlock_if_held_by_self(void);
 
 /* Fork coordination (P32-R3-4): the parent holds the LL/SC reservation
@@ -270,10 +275,12 @@ void vm_file_note_private(int host_fd, uint32_t gva_base, uint32_t pages,
 void vm_file_untrack_range(uint32_t start_gva, uint32_t end_gva);
 
 /* Mark guest pages wholly beyond EOF as SIGBUS trap pages: staged
- * MAP_SHARED mappings have no host page fault to supply it. Only whole
- * pages past the rounded-up EOF move; the partial tail page keeps its
- * zero-filled bytes. Private mappings keep zero-filled reads (correct
- * Linux behavior), so callers gate on MAP_SHARED. */
+ * MAP_SHARED mappings have no host page fault to supply it, and A2
+ * private in-place mappings are pread-filled with accessible zeroes
+ * that Linux would SIGBUS instead. Only whole pages past the
+ * rounded-up EOF move; the partial tail page keeps its zero-filled
+ * bytes. An empty file traps the whole mapping, as does a mapping
+ * starting at or past the rounded EOF (P32-R4-7). */
 void vm_file_trap_beyond_eof(int host_fd, uint32_t gva_base,
     uint64_t map_offset, size_t len);
 
@@ -292,13 +299,45 @@ int vm_file_shared_acquire(int src_fd, uint64_t file_offset, size_t len,
 void vm_file_shared_writeback_file_range(int fd, uint64_t lo, uint64_t hi);
 size_t vm_file_shared_group_count(void);
 bool vm_file_shared_group_key(size_t idx, uint64_t *dev_out,
-    uint64_t *ino_out, uint64_t *off_out);
+    uint64_t *ino_out, uint64_t *off_out, size_t *len_out);
+int vm_file_on_truncate_fd(int host_fd, uint64_t new_size);
 void vm_file_shared_drop_group(uint64_t dev, uint64_t ino, uint64_t off);
 int vm_file_shared_map_at(void *host_target, size_t map_len, int use_fd,
     uint64_t host_off, uint32_t target_va, uint32_t map_end, uint8_t prot,
     uint8_t state);
 void vm_file_promote_cow(uint32_t gva_page);
-int vm_file_on_truncate(uint64_t new_size);
 int vm_file_hook_write(int host_fd, uint64_t end_offset);
+
+/* A2 sub-page staging coherence (P32-R4-3/R4-4, src/vm/vm_file_stage.c):
+ * fan a landed guest store at [ea, ea + len) out to every overlapping
+ * staged alias of the same file plus the file itself (write-through,
+ * so direct MAP_SHARED aliases and ordinary file I/O observe it).
+ * No-op when no staged group is live or the store hits no shared
+ * file-backed region. Takes the VM lock; never nests under it. */
+void vm_file_shared_cohere_store(const ppc32_ctx_t *ctx, uint32_t ea,
+    uint32_t len);
+
+/* Fan landed syscall-read bytes at [ea, ea + len) out to every
+ * overlapping staged alias of the same file (P32-R4-3 read path):
+ * like the store fan-out but without file writeback, since reads do
+ * not mutate the file. Private mappings never participate. */
+void vm_file_shared_cohere_read(const ppc32_ctx_t *ctx, uint32_t ea,
+    uint32_t len);
+
+/* Refresh staged groups of fd's file overlapping [lo, hi) from the
+ * file after ordinary file I/O mutated it (P32-R4-3 write path). */
+void vm_file_shared_refresh_file_range(int fd, uint64_t lo, uint64_t hi);
+
+/* True when some live staged group shares backing with the (dev, ino)
+ * file range [off, off + len): the region-side GC keeps such groups
+ * (P32-R4-5 overlap identity, not exact-offset match), and new
+ * host-aligned mappings join staging instead of going direct
+ * (P32-R4-3 consistent backing). The caller holds the VM lock. */
+bool vm_file_shared_group_referenced(int fd, uint64_t off, uint64_t len);
+
+/* Zero the staged groups of fd's file overlapping [lo, hi) in file
+ * coordinates (P32-R4-9 truncate path): pwrite zeros into the staging
+ * objects, never fault-prone guest accesses. Runs under the VM lock. */
+void vm_file_shared_truncate_range(int fd, uint64_t lo, uint64_t hi);
 
 #endif /* PPC32RT_VM_VM32_H */

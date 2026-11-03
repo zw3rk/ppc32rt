@@ -168,26 +168,22 @@ static inline void res_invalidate(ppc32_ctx_t *ctx)
     ctx->reservation_epoch++;
 }
 
-/* Ordinary guest stores invalidate LL/SC reservations (E06): bump the
- * shared 64-byte line epoch(s) so a peer stwcx. fails, plus the thread
- * epoch for the DBT-side fast check. A store wider than one byte can
- * straddle a 64-byte line boundary (RC-U3-r2 #1): both lines bump, so a
- * reservation on either side is lost. len is the access width (>= 1);
- * 32-bit EA wrap is honored by unsigned arithmetic. Loads never bump. */
+/* Ordinary guest stores invalidate LL/SC reservations (E06): every
+ * shared 64-byte line bucket spanned by [ea, ea + len) bumps, so a
+ * wide store cannot leave a middle-bucket reservation live, plus the
+ * thread epoch for the DBT-side fast check. The same store fans out
+ * to overlapping staged shared-file aliases (P32-R4-3 coherence).
+ * len is the access width (>= 1); 32-bit EA wrap is honored by
+ * unsigned arithmetic. Loads never bump. */
 static inline void vm32_store_inval(uint32_t ea, uint32_t len)
 {
-    uint32_t first = (ea & ~3U) >> 6U;
-    uint32_t last = ((ea + len - 1U) & ~3U) >> 6U;
-
-    vm32_reservation_bump(ea & ~3U);
-    if (last != first) {
-        vm32_reservation_bump((ea + len - 1U) & ~3U);
-    }
+    vm32_store_invalidate_range(ea, len);
 }
 
 static inline void store_bump(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len)
 {
     vm32_store_inval(ea, len);
+    vm_file_shared_cohere_store(ctx, ea, len);
     ctx->reservation_epoch++;
 }
 

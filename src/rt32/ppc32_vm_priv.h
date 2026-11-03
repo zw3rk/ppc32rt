@@ -37,6 +37,11 @@ extern size_t           g_vm_region_count;
 
 void     vm_lock_acquire(void);
 void     vm_lock_release(void);
+/* True when the calling thread already holds the VM lock (P32-R4-8):
+ * lock-order-safe helpers acquire it only when not held, so they stay
+ * callable from both locked (region/mmap paths) and unlocked
+ * (syscall/store paths) contexts without nesting. */
+bool     vm_lock_held_by_self(void);
 uint64_t page_align_up(uint64_t v);
 int      vm_reserve_prot_none(ppc32_ctx_t *ctx, uint32_t start,
                               uint32_t len);

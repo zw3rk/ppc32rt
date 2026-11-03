@@ -21,6 +21,8 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "rt32/ppc32.h"
+
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -120,16 +122,20 @@ int ppc32_range_ok(uint32_t va, size_t len)
     return 1;
 }
 
+/* P32-R4-11: byte-stream copies enforce guest sub-page permissions
+ * through the permission-aware helpers (an accessible A2 host-page
+ * neighbor cannot launder a read-only or unmapped target). Copyout
+ * additionally invalidates overlapping LL/SC reservations and fans
+ * out to staged shared-file aliases (P32-R4-12). */
 int ppc32_copyin(const ppc32_ctx_t *ctx, uint32_t va, void *dst, size_t len)
 {
     if (len == 0U) {
         return 0;
     }
-    if (dst == NULL || !ppc32_range_ok(va, len)) {
+    if (dst == NULL) {
         return -EFAULT;
     }
-    memcpy(dst, ppc32_guest_ptr(ctx, va), len);
-    return 0;
+    return ppc32_vm_copyin_safe(ctx, va, dst, len);
 }
 
 int ppc32_copyout(const ppc32_ctx_t *ctx, uint32_t va, const void *src, size_t len)
@@ -137,11 +143,10 @@ int ppc32_copyout(const ppc32_ctx_t *ctx, uint32_t va, const void *src, size_t l
     if (len == 0U) {
         return 0;
     }
-    if (src == NULL || !ppc32_range_ok(va, len)) {
+    if (src == NULL) {
         return -EFAULT;
     }
-    memcpy(ppc32_guest_ptr(ctx, va), src, len);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, src, len);
 }
 
 int ppc32_copyin_str(const ppc32_ctx_t *ctx, uint32_t va, char *dst, size_t dstsz)

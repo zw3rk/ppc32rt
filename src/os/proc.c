@@ -113,7 +113,11 @@ long ppc32_proc_getpid(void)
  * locked copy helpers; file and TLB updates run under the VM lock):
  * signal dispositions, thread table, VM, TLB, inode, LL/SC. The fork
  * syscall path holds none of these on entry, so the prepare cannot
- * self-deadlock; a concurrent holder only delays the snapshot. */
+ * self-deadlock; a concurrent holder only delays the snapshot. The
+ * truncate/write file paths honor the same order (P32-R4-8): the
+ * inode lock is only ever taken alone or under the VM lock, and TLB
+ * updates happen after it is released, so no thread can hold the
+ * inode lock while waiting on the TLB lock fork holds. */
 static void proc_fork_prepare(void)
 {
     ppc32_sig_fork_prepare();

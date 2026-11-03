@@ -84,8 +84,7 @@ static int try_reserve_window(uint64_t base)
     return 0;
 }
 
-/* Publish the two-regime state when the legacy probe owns the window:
- * regime from the live host page size, A2 TLB armed empty. */
+/* Publish two-regime state around the legacy probe-owned window. */
 static void vm32_attach_legacy(void)
 {
     long host_page = sysconf(_SC_PAGESIZE);
@@ -96,11 +95,9 @@ static void vm32_attach_legacy(void)
     vm32_tlb_invalidate_all();
 }
 
-/* Reserve one window candidate (RC-U3-r2 #4): the two-regime vm32 layer
- * owns the [G, G+4GiB) reservation when the platform allows it (regime
- * select + arena publish + A2 TLB arm inside vm32_init); otherwise the
- * legacy PROT_NONE probe keeps the G=0 guard-hole layout and the regime
- * is published around it. Exactly one owner reserves per boot. */
+/* Reserve one window candidate: the vm32 layer owns [G, G+4GiB) when
+ * the platform allows it, else the legacy PROT_NONE probe keeps the
+ * G=0 guard-hole layout. Exactly one owner reserves per boot. */
 static int reserve_window(ppc32_ctx_t *ctx, uint64_t base)
 {
     if (base != 0ULL && vm32_init(ctx, base) == 0) {
@@ -147,12 +144,9 @@ int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
         }
     } else if (ctx->has_host_info && ctx->host_info.window_hint != 0ULL &&
                reserve_window(ctx, ctx->host_info.window_hint) == 0) {
-        /* reserve_window published ctx->guest_base. */
     } else {
-        /* Try G = 0 first; if occupied, scan 4 GiB-aligned windows [4G, 64G). */
-        if (reserve_window(ctx, 0ULL) == 0) {
-            /* reserve_window published ctx->guest_base. */
-        } else {
+        /* G = 0 first, else 4 GiB-aligned windows [4G, 64G). */
+        if (reserve_window(ctx, 0ULL) != 0) {
             bool found = false;
             for (uint64_t cand = 0x100000000ULL; cand < 0x1000000000ULL; cand += 0x100000000ULL) {
                 if (reserve_window(ctx, cand) == 0) {
@@ -176,17 +170,14 @@ int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
     ctx->mmap_cursor  = PPC32_MMAP_BASE_32;
     ctx->region_count = 0U;
     ctx->vm_ready     = true;
-    /* Publish the reserved window to the Regime A2 union layer (no
-     * reservation: legacy init already owns [G, G+4GiB)). No-op data
-     * on 4K hosts; selects the union regime on H > 4096. */
+    /* Publish the reserved window to the Regime A2 union layer. */
     vm32_shadow_window(ctx->guest_base);
     vm_lock_release();
     return 0;
 }
 
-/* Exec teardown: drop every region except the vdso from the AUTHORITATIVE
- * global list (ctx->regions is a mirror; vm_sync_from_ctx never copies it
- * back, so a ctx-only clear is undone by the next vm_sync_to_ctx). */
+/* Exec teardown: drop every region except the vdso from the global
+ * list (ctx->regions is a one-way mirror, so only this clear sticks). */
 void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
 {
     vm_lock_acquire();
@@ -205,28 +196,19 @@ void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
     g_vm_mmap_cursor = PPC32_MMAP_BASE_32;
     vm_lock_release();
 
-    /* Kernel exec semantics (RC7b T4b): execve destroys ALL old address
-     * space.  Only the region bookkeeping was cleared above, so the
-     * stale host mappings of the previous image (in a posix_spawn fork
-     * child: the wineserver's whole COW-inherited address space) stayed
-     * resident in the window — later ld.so/NTDLL allocations then
-     * collided with foreign leftover data (foreign TCBs, foreign code),
-     * which killed the boot with NULL-call threads and "could not load
-     * kernel32.dll".  Tear the window down; the next stack setup re-maps
-     * the vDSO and the stack, and the new image loads fresh pages. */
+    /* Kernel exec semantics: execve destroys ALL old address space, so
+     * tear the window down too — stale host mappings of the previous
+     * image would otherwise collide with the new image's allocations.
+     * The next stack setup re-maps the vDSO and the stack. */
     (void)munmap((void *)(uintptr_t)(ctx->guest_base + (uint64_t)PPC32_LOW_GUARD_SIZE),
                  (size_t)(PPC32_WINDOW_SIZE - (uint64_t)PPC32_LOW_GUARD_SIZE));
-    /* The old address space is gone: translations and reservations die. */
+    /* The old address space is gone: translations and reservations die,
+     * and no recorded prot/state may outlive it (A2 union layer too). */
     vm32_tlb_invalidate_all();
     vm32_ll_note_remap();
 
-    /* The whole window is gone: no recorded prot/state or translation
-     * may outlive the address space (A2 union layer included). */
-    vm32_tlb_invalidate_all();
-
-    /* Mirror the cleared state into the caller's ctx.  vdso_base must
-     * clear too: ppc32_vdso_map is idempotent on it, and a fork child
-     * would otherwise skip the re-map and run without the vDSO page. */
+    /* Mirror the cleared state into the caller's ctx (vdso_base clears
+     * too, or a fork child would skip the re-map and lose the vDSO). */
     ctx->brk_base    = 0U;
     ctx->brk_curr    = 0U;
     ctx->mmap_cursor = PPC32_MMAP_BASE_32;
@@ -429,17 +411,18 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         ((uint64_t)target_va + host_map_len <= (uint64_t)PPC32_TASK_SIZE_TOP);
     bool shared_direct = is_shared && use_fd >= 0 &&
                          va_host_aligned && off_host_aligned && in_window;
-    /* A2 sub-page shared file staging (P32-R3-3): guest-4K-aligned file
-     * offsets below host granularity cannot map MAP_SHARED from the file,
-     * so they share a memfd-backed staging object with the same alias and
-     * fork visibility as a direct mapping instead of failing. */
+    /* P32-R4-3: a host-aligned mapping overlapping a live staged group
+     * of the same file joins staging, keeping one coherent backing. */
+    if (shared_direct && vm_file_shared_group_referenced(use_fd,
+            (uint64_t)host_off, (size_t)aligned_len)) {
+        shared_direct = false;
+    }
     bool shared_staged = !shared_direct && vm32_is_a2() && is_shared &&
                          use_fd >= 0 &&
                          (host_flags & MAP_ANONYMOUS) == 0 &&
                          va_host_aligned && in_window;
-    /* Guest-visible extent stays map_end: host_map_len may round up to a
-     * host page, but the padding is backing only — publishing guest perms
-     * over it would grant accessible memory past the requested mapping. */
+    /* Guest-visible extent stays map_end: host rounding pads backing
+     * only, never accessible memory past the requested mapping. */
     if ((shared_direct || shared_staged) && host_map_len > aligned_len) {
         uint32_t host_end = (uint32_t)((uint64_t)target_va + host_map_len);
         bool tail_busy = vm_range_overlaps_locked(map_end, host_end);
@@ -471,8 +454,7 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             (void)vm32_sync_host_range(target_va, map_end);
         }
     } else if (shared_staged) {
-        /* Coherent sub-page sharing through the staged object (sh_fd is
-         * always -1 here: staging is file-backed only). */
+        /* Coherent sub-page sharing through the staged object. */
         int serr = vm_file_shared_map_at(host_target, (size_t)host_map_len,
             use_fd, (uint64_t)host_off, target_va, map_end,
             (uint8_t)(prot & 0x7U), state);
@@ -481,11 +463,8 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             return (uint32_t)serr;
         }
     } else if (vm32_is_a2()) {
-        /* Shared mappings that are neither host-eligible (direct) nor
-         * file-staged (anonymous MAP_SHARED below host granularity, or a
-         * host-rounded tail past the window) still have no coherent
-         * backing here: fail instead of reporting MAP_SHARED semantics
-         * that a private copy could not honor. */
+        /* Shared mappings with no coherent backing fail instead of
+         * reporting MAP_SHARED semantics a private copy could not honor. */
         if (is_shared) {
             bool misaligned = !va_host_aligned || !off_host_aligned;
 
@@ -558,7 +537,9 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         vm_file_note_private(use_fd, target_va,
             (uint32_t)(aligned_len / 4096ULL),
             (uint64_t)host_off);
-        if (is_shared && vm32_is_a2()) {
+        /* Beyond-EOF pages trap for shared and (A2) private mappings
+         * alike (P32-R4-7); A1 private mappings stay kernel-owned. */
+        if (vm32_is_a2()) {
             vm_file_trap_beyond_eof(use_fd, target_va,
                 (uint64_t)host_off, (size_t)aligned_len);
         }
@@ -588,8 +569,7 @@ uint32_t ppc32_vm_mmap2(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t 
         vm_invalidate_jit(ctx, res, (uint32_t)((uint64_t)res + page_align_up((uint64_t)len)));
     }
 
-    /* a32rt's AOT cache preload (a32_aot_load_fd) was dropped: ppc32rt has no
-     * AOT pre-translator (the DBT compiles lazily, Phase 3). */
+    /* No AOT pre-translator: the DBT compiles lazily (Phase 3). */
 
     return res;
 }
@@ -814,8 +794,7 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     bool fixed_va_ok   = !is_fixed ||
                          (((uint64_t)new_addr & (hpsz - 1ULL)) == 0ULL);
     bool direct_ok     = ((orig_offset & (hpsz - 1ULL)) == 0ULL);
-    /* A2 file-backed sub-page sharing restages through the same shared
-     * object (P32-R3-3), so it moves like a directly backed mapping. */
+    /* A2 sub-page sharing restages through its object (P32-R3-3). */
     bool staged_ok     = vm32_is_a2() &&
                          (keep_flags & PPC32_MAP_ANONYMOUS) == 0U;
     bool shared_backed = is_shared && has_fd && fixed_va_ok &&

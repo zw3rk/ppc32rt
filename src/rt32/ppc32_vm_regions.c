@@ -43,6 +43,11 @@ void vm_lock_release(void)
     ppc32_spin_unlock(&g_vm_lock);
 }
 
+bool vm_lock_held_by_self(void)
+{
+    return g_vm_lock_held != 0;
+}
+
 void ppc32_vm_lock(void)
 {
     vm_lock_acquire();
@@ -576,111 +581,8 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                                            NULL, NULL, out_name, name_sz);
 }
 
-static bool vm_range_prot_ok_locked(const ppc32_ctx_t *ctx, uint32_t va,
-                                    uint32_t end, uint32_t need_prot)
-{
-    const ppc32_region_t *regs = NULL;
-    size_t count = 0U;
-
-    if (ctx->vm_ready) {
-        regs  = g_vm_regions;
-        count = g_vm_region_count;
-    } else if (ctx->region_count > 0U) {
-        regs  = ctx->regions;
-        count = (ctx->region_count <= PPC32_MAX_REGIONS) ?
-            ctx->region_count : PPC32_MAX_REGIONS;
-    } else {
-        return true;
-    }
-
-    uint32_t cur = va;
-    for (size_t i = 0U; i < count && cur < end; i++) {
-        const ppc32_region_t *r = &regs[i];
-        if (r->end <= cur) {
-            continue;
-        }
-        if (r->start > cur || (r->prot & need_prot) != need_prot) {
-            return false;
-        }
-        cur = (r->end < end) ? r->end : end;
-    }
-    return cur >= end;
-}
-
-bool ppc32_vm_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va,
-                            size_t len, uint32_t need_prot)
-{
-    if (!ctx) {
-        return false;
-    }
-    if (len == 0U) {
-        return true;
-    }
-    if (len > PPC32_TASK_SIZE_TOP || va < PPC32_LOW_GUARD_SIZE) {
-        return false;
-    }
-    uint64_t end = (uint64_t)va + (uint64_t)len;
-    if (end > (uint64_t)PPC32_TASK_SIZE_TOP || end < (uint64_t)va) {
-        return false;
-    }
-    vm_lock_acquire();
-    bool ok = vm_range_prot_ok_locked(ctx, va, (uint32_t)end, need_prot);
-    vm_lock_release();
-    return ok;
-}
-
-int ppc32_vm_copyin_safe(const ppc32_ctx_t *ctx, uint32_t va,
-                         void *dst, size_t len)
-{
-    if (!ctx || (!dst && len > 0U)) {
-        return -EFAULT;
-    }
-    if (len == 0U) {
-        return 0;
-    }
-    if (len > PPC32_TASK_SIZE_TOP || va < PPC32_LOW_GUARD_SIZE) {
-        return -EFAULT;
-    }
-    uint64_t end = (uint64_t)va + (uint64_t)len;
-    if (end > (uint64_t)PPC32_TASK_SIZE_TOP || end < (uint64_t)va) {
-        return -EFAULT;
-    }
-    vm_lock_acquire();
-    if (!vm_range_prot_ok_locked(ctx, va, (uint32_t)end, 1U)) {
-        vm_lock_release();
-        return -EFAULT;
-    }
-    memcpy(dst, ppc32_guest_ptr(ctx, va), len);
-    vm_lock_release();
-    return 0;
-}
-
-int ppc32_vm_copyout_safe(const ppc32_ctx_t *ctx, uint32_t va,
-                          const void *src, size_t len)
-{
-    if (!ctx || (!src && len > 0U)) {
-        return -EFAULT;
-    }
-    if (len == 0U) {
-        return 0;
-    }
-    if (len > PPC32_TASK_SIZE_TOP || va < PPC32_LOW_GUARD_SIZE) {
-        return -EFAULT;
-    }
-    uint64_t end = (uint64_t)va + (uint64_t)len;
-    if (end > (uint64_t)PPC32_TASK_SIZE_TOP || end < (uint64_t)va) {
-        return -EFAULT;
-    }
-    vm_lock_acquire();
-    if (!vm_range_prot_ok_locked(ctx, va, (uint32_t)end, 2U)) {
-        vm_lock_release();
-        return -EFAULT;
-    }
-    memcpy(ppc32_guest_ptr(ctx, va), src, len);
-    vm_lock_release();
-    return 0;
-}
-
+/* Permission-checked copies live in ppc32_vm_copy.c (file-size
+ * discipline); the gap finder below stays here with the region list. */
 int vm_find_free_gap_aligned_locked(uint64_t aligned_len, uint64_t align,
                                     uint32_t *out_va)
 {
@@ -693,12 +595,23 @@ int vm_find_free_gap_aligned_locked(uint64_t aligned_len, uint64_t align,
         return -1;
     }
 
+    /* Every candidate — cursor, gap, and tail — must avoid live A2
+     * shared host-page tails (P32-R4-6), or an automatic private
+     * placement would land in the unpublished 4 KiB tail of a live
+     * shared host page. Busy skips advance one guest alignment step
+     * at a time so no fitting placement is jumped over. */
     uint64_t cursor_cand = ((uint64_t)g_vm_mmap_cursor + mask) & ~mask;
     if (cursor_cand < (uint64_t)PPC32_MMAP_BASE_32) {
         cursor_cand = ((uint64_t)PPC32_MMAP_BASE_32 + mask) & ~mask;
     }
+    while (cursor_cand + aligned_len <= (uint64_t)PPC32_MMAP_TOP_32 &&
+        !vm_range_overlaps_locked((uint32_t)cursor_cand, (uint32_t)(cursor_cand + aligned_len)) &&
+        ppc32_vm_a2_host_page_busy((uint32_t)cursor_cand, (uint32_t)(cursor_cand + aligned_len))) {
+        cursor_cand += align;
+    }
     if (cursor_cand + aligned_len <= (uint64_t)PPC32_MMAP_TOP_32 &&
-        !vm_range_overlaps_locked((uint32_t)cursor_cand, (uint32_t)(cursor_cand + aligned_len))) {
+        !vm_range_overlaps_locked((uint32_t)cursor_cand, (uint32_t)(cursor_cand + aligned_len)) &&
+        !ppc32_vm_a2_host_page_busy((uint32_t)cursor_cand, (uint32_t)(cursor_cand + aligned_len))) {
         *out_va = (uint32_t)cursor_cand;
         return 0;
     }
@@ -710,18 +623,28 @@ int vm_find_free_gap_aligned_locked(uint64_t aligned_len, uint64_t align,
         if (r_end <= cand) {
             continue;
         }
-        if (cand + aligned_len <= r_start) {
-            break;
+        while (cand + aligned_len <= r_start &&
+            cand + aligned_len <= (uint64_t)PPC32_MMAP_TOP_32) {
+            if (!ppc32_vm_a2_host_page_busy((uint32_t)cand, (uint32_t)(cand + aligned_len))) {
+                *out_va = (uint32_t)cand;
+                return 0;
+            }
+            cand += align;
         }
-        cand = r_end;
+        if (cand < r_end) {
+            cand = r_end;
+        }
     }
 
-    if (cand + aligned_len > (uint64_t)PPC32_MMAP_TOP_32) {
-        return -1;
+    while (cand + aligned_len <= (uint64_t)PPC32_MMAP_TOP_32) {
+        if (!vm_range_overlaps_locked((uint32_t)cand, (uint32_t)(cand + aligned_len)) &&
+            !ppc32_vm_a2_host_page_busy((uint32_t)cand, (uint32_t)(cand + aligned_len))) {
+            *out_va = (uint32_t)cand;
+            return 0;
+        }
+        cand += align;
     }
-
-    *out_va = (uint32_t)cand;
-    return 0;
+    return -1;
 }
 
 int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
@@ -771,24 +694,35 @@ int vm_reserve_prot_none(ppc32_ctx_t *ctx, uint32_t start, uint32_t len)
  * file-backed, so its inode records go too. Moved from ppc32_vm.c
  * (Phase 0 file-size discipline). */
 
-/* A staged MAP_SHARED group stays alive while any live region references
- * its (dev, ino, offset) key; regions keep the caller's file fd/offset,
- * so identity is compared through fstat. */
+/* A staged MAP_SHARED group stays alive while any live MAP_SHARED
+ * region of the same file overlaps the group's file range (P32-R4-5):
+ * front-trimming a VMA in munmap shifts its offset, so exact-offset
+ * matching would GC a group the surviving tail still references.
+ * Regions keep the caller's file fd/offset; identity and overlap are
+ * resolved through fstat. Private regions never reference staging. */
 static bool staged_group_referenced_locked(uint64_t dev, uint64_t ino,
-    uint64_t off)
+    uint64_t off, size_t len)
 {
+    uint64_t end = off + (uint64_t)len;
     size_t i;
 
     for (i = 0U; i < g_vm_region_count; i++) {
         struct stat st;
+        uint64_t rlo;
+        uint64_t rhi;
 
-        if (g_vm_regions[i].fd < 0 || g_vm_regions[i].offset != off) {
+        if (g_vm_regions[i].fd < 0 ||
+            (g_vm_regions[i].flags & 0x01U) == 0U) {
             continue;
         }
-        if (fstat(g_vm_regions[i].fd, &st) != 0) {
+        if (fstat(g_vm_regions[i].fd, &st) != 0 ||
+            (uint64_t)st.st_dev != dev || (uint64_t)st.st_ino != ino) {
             continue;
         }
-        if ((uint64_t)st.st_dev == dev && (uint64_t)st.st_ino == ino) {
+        rlo = g_vm_regions[i].offset;
+        rhi = rlo + (uint64_t)(g_vm_regions[i].end -
+            g_vm_regions[i].start);
+        if (rlo < end && off < rhi) {
             return true;
         }
     }
@@ -807,11 +741,12 @@ static void vm_file_shared_gc_locked(void)
         uint64_t dev;
         uint64_t ino;
         uint64_t off;
+        size_t len = 0U;
 
-        if (!vm_file_shared_group_key(i, &dev, &ino, &off)) {
+        if (!vm_file_shared_group_key(i, &dev, &ino, &off, &len)) {
             continue;
         }
-        if (!staged_group_referenced_locked(dev, ino, off)) {
+        if (!staged_group_referenced_locked(dev, ino, off, len)) {
             vm_file_shared_drop_group(dev, ino, off);
         }
     }
