@@ -433,7 +433,6 @@ static long sys_getrandom(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
 }
 
 extern long ppc32_run_guest_child(ppc32_ctx_t *child);
-extern void ppc32_sig_pump_pending(ppc32_ctx_t *ctx);
 /* Concurrent clone runner (P32-R5-1): runs the guest child to exit on a
  * host pthread via threads.c thread_entry; parent returns immediately. */
 static void sys_clone_run(ppc32_ctx_t *child, void *opaque)
@@ -537,6 +536,7 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
             sys_apply_ret(ctx, nr, dyn);
             ctx->nip += 4U;
             ctx->syscalls_executed++;
+            ppc32_sig_pump_pending(ctx);
             return;
         }
     }
@@ -740,4 +740,10 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     sys_apply_ret(ctx, nr, ret);
     ctx->syscalls_executed++;
     ctx->nip += 4U;
+    /* P32-R6-6: serve sibling-pended signals at every syscall boundary
+     * (the frame captures post-sc nip); exiting threads skip it so a
+     * pending bit cannot hijack exit/exit_group. */
+    if (!ppc32_syscall_is_exit(nr)) {
+        ppc32_sig_pump_pending(ctx);
+    }
 }

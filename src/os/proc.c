@@ -42,6 +42,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "dbt/dbt.h"
 #include "os/convert.h"
 #include "os/signals.h"
 #include "os/syscall_nr.h"
@@ -111,17 +112,20 @@ long ppc32_proc_getpid(void)
  * surviving thread. Global acquisition order (outermost first, matching
  * all observed runtime nesting: dispositions enter the VM through the
  * locked copy helpers; file and TLB updates run under the VM lock):
- * signal dispositions, thread table, VM, TLB, inode, LL/SC. The fork
- * syscall path holds none of these on entry, so the prepare cannot
- * self-deadlock; a concurrent holder only delays the snapshot. The
- * truncate/write file paths honor the same order (P32-R4-8): the
- * inode lock is only ever taken alone or under the VM lock, and TLB
- * updates happen after it is released, so no thread can hold the
- * inode lock while waiting on the TLB lock fork holds. */
+ * signal dispositions, thread table, translation cache, VM, TLB,
+ * inode, LL/SC. The fork syscall path holds none of these on entry,
+ * so the prepare cannot self-deadlock; a concurrent holder only
+ * delays the snapshot. The cache sits before the VM (snapshot reads
+ * nest cache -> VM). The truncate/write file paths honor the same
+ * order (P32-R4-8): the inode lock is only ever taken alone or under
+ * the VM lock, and TLB updates happen after it is released, so no
+ * thread can hold the inode lock while waiting on the TLB lock fork
+ * holds. */
 static void proc_fork_prepare(void)
 {
     ppc32_sig_fork_prepare();
     ppc32_thread_fork_prepare();
+    ppc32_cache_fork_prepare();
     ppc32_vm_lock();
     vm32_tlb_fork_prepare();
     vm_file_fork_prepare();
@@ -134,6 +138,7 @@ static void proc_fork_parent(void)
     vm_file_fork_parent();
     vm32_tlb_fork_parent();
     ppc32_vm_unlock();
+    ppc32_cache_fork_parent();
     ppc32_thread_fork_parent();
     ppc32_sig_fork_parent();
 }
@@ -146,6 +151,7 @@ static void proc_fork_child(ppc32_ctx_t *ctx)
     ppc32_vm_fork_child();
     proc_child_refresh(ctx);
     ppc32_thread_fork_child(ctx);
+    ppc32_cache_fork_child();
     ppc32_sig_fork_child();
 }
 

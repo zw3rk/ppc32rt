@@ -49,6 +49,8 @@
 
 #include "dbt/aot/aot_run.h"
 #include "dbt/dbt.h"
+#include "os/threads.h"
+#include "rt32/ppc32.h"
 
 #ifndef MAP_ANONYMOUS
 #ifdef MAP_ANON
@@ -98,6 +100,42 @@ typedef struct retired_node {
 
 static retired_node_t *s_retired = NULL;
 
+/* P32-R6-1: dispatcher sync registry for quiescent reclamation. Every
+ * syncing/looking-up/installing ctx is tracked with its last synced
+ * generation; a retired block is freed only after all tracked peers
+ * synced past it (or when single-threaded). Epochs are by value, so
+ * stale slots only delay freeing; forget_ctx releases dead slots, and
+ * a full table latches overflow to stall freeing conservatively. */
+#define PPC32_CACHE_MAX_REG 32U
+static ppc32_ctx_t *s_reg_ctx[PPC32_CACHE_MAX_REG];
+static uint32_t s_reg_epoch[PPC32_CACHE_MAX_REG];
+static bool s_reg_overflow = false;
+
+/* Caller holds s_cache_lock. */
+static void reg_ctx_locked(ppc32_ctx_t *ctx, uint32_t cur)
+{
+    size_t i;
+
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->ibtc_synced_epoch = cur;
+    for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
+        if (s_reg_ctx[i] == ctx) {
+            s_reg_epoch[i] = cur;
+            return;
+        }
+    }
+    for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
+        if (s_reg_ctx[i] == NULL) {
+            s_reg_ctx[i] = ctx;
+            s_reg_epoch[i] = cur;
+            return;
+        }
+    }
+    s_reg_overflow = true;
+}
+
 static void block_free_now(ppc32_block_t *e);
 
 static void retire_block_locked(ppc32_block_t *e, uint32_t epoch)
@@ -118,14 +156,35 @@ static void retire_block_locked(ppc32_block_t *e, uint32_t epoch)
     s_retired = n;
 }
 
+/* Caller holds s_cache_lock. Frees only generations no thread can run:
+ * single-threaded has no peer in chained code, otherwise every tracked
+ * dispatcher must have synced past the retired node. */
 static void reclaim_retired_locked(uint32_t cur)
 {
     retired_node_t **pp = &s_retired;
+    bool single = (ppc32_thread_count() <= 1U);
+    bool quiet = !s_reg_overflow;
 
     while (*pp != NULL) {
         retired_node_t *n = *pp;
+        bool freeable = false;
 
         if (n->epoch != cur) {
+            freeable = single;
+            if (!freeable && quiet) {
+                size_t i;
+
+                freeable = true;
+                for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
+                    if (s_reg_ctx[i] != NULL &&
+                        s_reg_epoch[i] <= n->epoch) {
+                        freeable = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (freeable) {
             *pp = n->next;
             block_free_now(n->blk);
             free(n);
@@ -348,11 +407,19 @@ void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
 }
 
 /* H1 SMC: verify the recorded guest bytes are still current. True
- * when no snapshot was recorded, or the bytes still match. */
+ * when no snapshot was recorded, or the bytes still match. Caller
+ * holds s_cache_lock; the guest read uses the VM safe copy
+ * (range-checked under the VM lock, never a raw fault), so a
+ * concurrent munmap reports -EFAULT instead of siglongjmp'ing with
+ * s_cache_lock held. Lock order stays cache -> VM (guest mm ops
+ * invalidate only after releasing the VM lock). An unreadable range
+ * counts dirty, so the caller evicts and retranslates into a fault. */
 static bool snapshot_clean(ppc32_ctx_t *ctx, const ppc32_block_t *e)
 {
     const uint8_t *snap;
     uint64_t len;
+    uint32_t start;
+    uint8_t buf[4096];
 
     if (ctx == NULL || e == NULL) {
         return true;
@@ -365,8 +432,11 @@ static bool snapshot_clean(ppc32_ctx_t *ctx, const ppc32_block_t *e)
     if (len == 0ULL || len > 4096ULL || !ctx->vm_ready) {
         return true;
     }
-    return memcmp(snap, ppc32_guest_ptr(ctx, (uint32_t)e->pad0[1]),
-        (size_t)len) == 0;
+    start = (uint32_t)e->pad0[1];
+    if (ppc32_vm_copyin_safe(ctx, start, buf, (size_t)len) != 0) {
+        return false;
+    }
+    return memcmp(snap, buf, (size_t)len) == 0;
 }
 
 /* Internal range invalidation; caller holds s_cache_lock. Severs and
@@ -382,6 +452,7 @@ ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc)
     ppc32_block_t *e;
 
     (void)pthread_mutex_lock(&s_cache_lock);
+    reg_ctx_locked(ctx, cache_epoch_load());
     e = lookup_valid_locked(pc);
     if (e != NULL) {
         if (!snapshot_clean(ctx, e)) {
@@ -493,6 +564,7 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
             reclaim_retired_locked(cache_epoch_load());
         }
         cur = cache_epoch_load();
+        reg_ctx_locked(ctx, cur);
         e->keyepoch = (uint64_t)pc | ((uint64_t)cur << 32U);
         e->host_code = code;
         e->entry = code;
@@ -661,6 +733,9 @@ void ppc32_cache_sync_ctx(ppc32_ctx_t *ctx)
         return;
     }
     cur = cache_epoch_load();
+    (void)pthread_mutex_lock(&s_cache_lock);
+    reg_ctx_locked(ctx, cur);
+    (void)pthread_mutex_unlock(&s_cache_lock);
     for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
         ppc32_ibtc_entry_t *s = &ctx->ibtc[i];
 
@@ -775,5 +850,50 @@ void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx)
 {
     (void)pthread_mutex_lock(&s_cache_lock);
     invalidate_all_locked(ctx);
+    (void)pthread_mutex_unlock(&s_cache_lock);
+}
+
+/* P32-R6-1 fork protocol: prepare holds s_cache_lock across the
+ * address-space snapshot (the forker owns it at fork, so the child
+ * just releases it); the child also drops peer registrations, whose
+ * owners are gone, plus any overflow mark. */
+void ppc32_cache_fork_prepare(void)
+{
+    (void)pthread_mutex_lock(&s_cache_lock);
+}
+
+void ppc32_cache_fork_parent(void)
+{
+    (void)pthread_mutex_unlock(&s_cache_lock);
+}
+
+void ppc32_cache_fork_child(void)
+{
+    size_t i;
+
+    for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
+        s_reg_ctx[i] = NULL;
+        s_reg_epoch[i] = 0U;
+    }
+    s_reg_overflow = false;
+    (void)pthread_mutex_unlock(&s_cache_lock);
+}
+
+/* Release one ctx slot before it is freed; epochs are by value, so a
+ * missed call only delays freeing, never frees early. */
+void ppc32_cache_forget_ctx(const ppc32_ctx_t *ctx)
+{
+    size_t i;
+
+    if (ctx == NULL) {
+        return;
+    }
+    (void)pthread_mutex_lock(&s_cache_lock);
+    for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
+        if (s_reg_ctx[i] == ctx) {
+            s_reg_ctx[i] = NULL;
+            s_reg_epoch[i] = 0U;
+        }
+    }
     (void)pthread_mutex_unlock(&s_cache_lock);
 }

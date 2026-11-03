@@ -302,7 +302,8 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
     /* Reservation dies on delivery (SPEC 2.2); anchor the frame. */
     ctx->res_valid = 0U;
     ctx->reservation_epoch++;
-    ctx->pending_signals &= ~sig_bit(sig);
+    __atomic_fetch_and(&ctx->pending_signals, ~sig_bit(sig),
+        __ATOMIC_ACQ_REL);
     ctx->sync_sig_delivered = 1;
     ctx->sig_last_frame_va = frame;
     ctx->sig_last_frame_rt = 1U;
@@ -610,7 +611,8 @@ static long sys_rt_sigpending(ppc32_ctx_t *ctx, uint32_t set_va,
         return -EFAULT;
     }
     /* Blocked-but-raised signals awaiting delivery. */
-    pend = ctx->pending_signals & ctx->sig_mask;
+    pend = __atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) &
+        ctx->sig_mask;
     SIG_MUST(sig_st32(ctx, set_va, (uint32_t)(pend & 0xFFFFFFFFULL)));
     SIG_MUST(sig_st32(ctx, set_va + 4U,
         (uint32_t)((pend >> 32) & 0xFFFFFFFFULL)));
@@ -718,7 +720,8 @@ int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
         /* P32-R5-8: blocked signals enqueue as pending, never enter
          * the handler while blocked; delivered on unmask/boundary. */
         if ((ctx->sig_mask & sig_bit((int)sig)) != 0ULL) {
-            ctx->pending_signals |= sig_bit((int)sig);
+            __atomic_fetch_or(&ctx->pending_signals, sig_bit((int)sig),
+                __ATOMIC_ACQ_REL);
             *out_ret = 0L;
             return 0;
         }
@@ -757,7 +760,10 @@ void ppc32_sig_pump_pending(ppc32_ctx_t *ctx)
     for (s = 1U; s <= PPC32_NSIG; s++) {
         uint64_t bit = sig_bit((int)s);
         ppc32_sigact_t act;
-        if ((ctx->pending_signals & bit) == 0ULL) {
+        /* P32-R6-6: atomic snapshot; sibling pends land via fetch_or
+         * while this thread clears with fetch_and, so no bit is lost. */
+        if ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) &
+            bit) == 0ULL) {
             continue;
         }
         if ((ctx->sig_mask & bit) != 0ULL) {
@@ -767,11 +773,13 @@ void ppc32_sig_pump_pending(ppc32_ctx_t *ctx)
             continue;
         }
         if (act.handler == PPC32_SIG_IGN) {
-            ctx->pending_signals &= ~bit;
+            __atomic_fetch_and(&ctx->pending_signals, ~bit,
+                __ATOMIC_ACQ_REL);
             continue;
         }
         if (act.handler == PPC32_SIG_DFL) {
-            ctx->pending_signals &= ~bit;
+            __atomic_fetch_and(&ctx->pending_signals, ~bit,
+                __ATOMIC_ACQ_REL);
             (void)raise((int)s);
             return;
         }

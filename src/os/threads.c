@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -46,6 +47,9 @@ static void thread_st32be(ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
     (void)thread_st32be_safe(ctx, va, v);
 }
+
+/* P32-R6-1: release a ctx's cache sync slot before it is freed. */
+extern void ppc32_cache_forget_ctx(const ppc32_ctx_t *ctx);
 
 typedef struct {
     bool         used;
@@ -90,9 +94,9 @@ static ppc32_thread_slot_t *thread_claim_locked(ppc32_ctx_t *ctx,
             break;
         }
         thread_unlock();
-        if (memcmp(&host, &(pthread_t){ 0 }, sizeof(host)) != 0) {
+        if (memcmp(&host, &(pthread_t){ 0 }, sizeof(host)) != 0)
             (void)pthread_join(host, NULL);
-        }
+        ppc32_cache_forget_ctx(dead);
         free(dead);
         thread_lock();
     }
@@ -137,11 +141,25 @@ static long host_gettid(void)
     return (long)getpid();
 }
 #endif
+/* P32-R6-6 wake nudge: no-op handler without SA_RESTART, so a host
+ * block fails EINTR and the syscall-tail pump serves the signal. */
+static void thread_nudge_handle(int sig)
+{
+    (void)sig;
+}
 long ppc32_thread_init_main(ppc32_ctx_t *ctx)
 {
     uint32_t tid;
     if (ctx == NULL) {
         return -EINVAL;
+    }
+    {
+        struct sigaction sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = thread_nudge_handle;
+        (void)sigemptyset(&sa.sa_mask);
+        (void)sigaction(SIGURG, &sa, NULL);
     }
     tid = (uint32_t)host_gettid();
     thread_lock();
@@ -207,11 +225,19 @@ uint32_t ppc32_thread_count(void)
 }
 
 /* tkill/tgkill backend: signal a live sibling by guest TID (sig == 0
- * probes; sig > 0 pends; tgid != 0 requires a group match). */
+ * probes; sig > 0 pends; tgid != 0 needs a group match). The pend is
+ * an atomic OR (the target clears bits from its own thread), and a
+ * pended sibling on another host thread gets a SIGURG wake nudge so a
+ * host block fails EINTR into the syscall-tail pump. The nudge is
+ * wake-only: the guest sig rides in pending_signals, and self pends
+ * need no poke. */
 long ppc32_thread_signal(uint32_t guest_tid, uint32_t tgid, int sig)
 {
     ppc32_ctx_t *target = NULL;
+    pthread_t host = 0;
+    bool poke = false;
     uint32_t i;
+
     if (sig < 0 || sig > (int)PPC32_NSIG) {
         return -EINVAL;
     }
@@ -226,12 +252,20 @@ long ppc32_thread_signal(uint32_t guest_tid, uint32_t tgid, int sig)
             continue;
         }
         target = c;
+        host = g_thread_table[i].host;
         break;
     }
     if (target != NULL && sig > 0) {
-        target->pending_signals |= 1ULL << (uint64_t)(sig - 1);
+        uint64_t bit = 1ULL << (uint64_t)(sig - 1);
+
+        __atomic_fetch_or(&target->pending_signals, bit, __ATOMIC_ACQ_REL);
+        poke = memcmp(&host, &(pthread_t){ 0 }, sizeof(host)) != 0 &&
+            !pthread_equal(host, pthread_self());
     }
     thread_unlock();
+    if (poke) {
+        (void)pthread_kill(host, SIGURG);
+    }
     return target != NULL ? 0L : -ESRCH;
 }
 
@@ -648,6 +682,7 @@ long ppc32_thread_join(uint32_t guest_tid)
         }
     }
     thread_unlock();
+    ppc32_cache_forget_ctx(child);
     free(child);
     return 0;
 }
@@ -678,6 +713,7 @@ void ppc32_thread_exit(ppc32_ctx_t *child)
             slot->used = false;
             slot->ctx = NULL;
             thread_unlock();
+            ppc32_cache_forget_ctx(child);
             free(child);
             return;
         }
@@ -747,51 +783,37 @@ int main(void)
     parent.reservation_epoch = 41U;
 
     rc = ppc32_thread_init_main(&parent);
-    if (rc != 0) {
-        return test_fail("init_main", rc, 0);
-    }
-    if (ppc32_thread_count() != 1U) {
+    if (rc != 0) return test_fail("init_main", rc, 0);
+    if (ppc32_thread_count() != 1U)
         return test_fail("count-after-init", (long)ppc32_thread_count(), 1);
-    }
 
     ppc32_tls_set(&parent, TEST_TLS_VA);
-    if (ppc32_tls_get(&parent) != TEST_TLS_VA) {
-        return test_fail("tls", (long)ppc32_tls_get(&parent),
-            (long)TEST_TLS_VA);
-    }
+    if (ppc32_tls_get(&parent) != TEST_TLS_VA)
+        return test_fail("tls", (long)ppc32_tls_get(&parent), (long)TEST_TLS_VA);
 
     /* Epoch so far 43; this invalidation -> 44. */
     parent.res_valid = 1;
     ppc32_reservation_invalidate(&parent);
-    if (parent.res_valid != 0U || parent.reservation_epoch != 44U) {
-        return test_fail("res-invalidate", (long)parent.reservation_epoch,
-            44);
-    }
+    if (parent.res_valid != 0U || parent.reservation_epoch != 44U)
+        return test_fail("res-invalidate", (long)parent.reservation_epoch, 44);
 
     tid = ppc32_set_tid_address(&parent, TEST_PARENT_TID_VA);
-    if (tid <= 0 || parent.clear_child_tid != TEST_PARENT_TID_VA) {
+    if (tid <= 0 || parent.clear_child_tid != TEST_PARENT_TID_VA)
         return test_fail("set-tid-address", tid, 1);
-    }
 
     /* Clone validation cases. */
     rc = ppc32_clone(&parent, PPC32_CLONE_FS, 0U, 0U, 0U, 0U, NULL,
         NULL, NULL);
-    if (rc != -ENOSYS) {
-        return test_fail("clone-no-vm", rc, -ENOSYS);
-    }
+    if (rc != -ENOSYS) return test_fail("clone-no-vm", rc, -ENOSYS);
     rc = ppc32_clone(&parent,
         PPC32_CLONE_VM | PPC32_CLONE_THREAD, 0U, 0U, 0U, 0U, NULL,
         NULL, NULL);
-    if (rc != -EINVAL) {
-        return test_fail("clone-thread-no-sighand", rc, -EINVAL);
-    }
+    if (rc != -EINVAL) return test_fail("clone-thread-no-sighand", rc, -EINVAL);
     rc = ppc32_clone(&parent,
         PPC32_CLONE_VM | PPC32_CLONE_THREAD | PPC32_CLONE_SIGHAND |
         PPC32_CLONE_PARENT_SETTID, 0U, 0xFFFFFFFFU, 0U, 0U, NULL,
         NULL, NULL);
-    if (rc != -EFAULT) {
-        return test_fail("clone-bad-tidaddr", rc, -EFAULT);
-    }
+    if (rc != -EFAULT) return test_fail("clone-bad-tidaddr", rc, -EFAULT);
 
     flags = PPC32_CLONE_VM | PPC32_CLONE_FS | PPC32_CLONE_FILES |
         PPC32_CLONE_SIGHAND | PPC32_CLONE_THREAD | PPC32_CLONE_SETTLS |
@@ -800,56 +822,37 @@ int main(void)
     parent.res_valid = 1;
     rc = ppc32_clone(&parent, flags, TEST_STACK_VA, TEST_PARENT_TID_VA,
         TEST_TLS_VA, TEST_CHILD_TID_VA, test_child_run, NULL, &child);
-    if (rc <= 0 || child == NULL) {
-        return test_fail("clone-ok", rc, 1);
-    }
+    if (rc <= 0 || child == NULL) return test_fail("clone-ok", rc, 1);
     child_tid = (uint32_t)rc;
-    if (child->gpr[PPC32_REG_SP] != TEST_STACK_VA) {
+    if (child->gpr[PPC32_REG_SP] != TEST_STACK_VA)
         return test_fail("clone-stack", (long)child->gpr[PPC32_REG_SP],
             (long)TEST_STACK_VA);
-    }
-    if (child->gpr[PPC32_REG_TP] != TEST_TLS_VA) {
+    if (child->gpr[PPC32_REG_TP] != TEST_TLS_VA)
         return test_fail("clone-tls", (long)child->gpr[PPC32_REG_TP],
             (long)TEST_TLS_VA);
-    }
-    if (child->gpr[3] != 0U || child->nip != parent.nip + 4U) {
+    if (child->gpr[3] != 0U || child->nip != parent.nip + 4U)
         return test_fail("clone-child-ret", (long)child->gpr[3], 0);
-    }
-    if (parent.res_valid != 0U) {
-        return test_fail("clone-parent-res", (long)parent.res_valid, 0);
-    }
-    if (thread_ld32be(&parent, TEST_PARENT_TID_VA) != (uint32_t)rc) {
+    if (parent.res_valid != 0U) return test_fail("clone-parent-res",
+        (long)parent.res_valid, 0);
+    if (thread_ld32be(&parent, TEST_PARENT_TID_VA) != (uint32_t)rc)
         return test_fail("clone-parent-tid", 0, rc);
-    }
-    if (thread_ld32be(&parent, TEST_CHILD_TID_VA) != (uint32_t)rc) {
+    if (thread_ld32be(&parent, TEST_CHILD_TID_VA) != (uint32_t)rc)
         return test_fail("clone-child-tid", 0, rc);
-    }
-    if (ppc32_thread_count() != 2U) {
-        return test_fail("count-after-clone", (long)ppc32_thread_count(),
-            2);
-    }
-    if (child_tid != (uint32_t)tid + 1U) {
+    if (ppc32_thread_count() != 2U)
+        return test_fail("count-after-clone", (long)ppc32_thread_count(), 2);
+    if (child_tid != (uint32_t)tid + 1U)
         return test_fail("clone-tid-seq", (long)child_tid,
             (long)((uint32_t)tid + 1U));
-    }
     rc = ppc32_thread_join(child_tid);
-    if (rc != 0) {
-        return test_fail("join", rc, 0);
-    }
-    if (g_test_child_ran != 1) {
-        return test_fail("child-ran", (long)g_test_child_ran, 1);
-    }
-    if (thread_ld32be(&parent, TEST_CHILD_TID_VA) != 0U) {
+    if (rc != 0) return test_fail("join", rc, 0);
+    if (g_test_child_ran != 1) return test_fail("child-ran",
+        (long)g_test_child_ran, 1);
+    if (thread_ld32be(&parent, TEST_CHILD_TID_VA) != 0U)
         return test_fail("cleartid", 0, 0);
-    }
-    if (ppc32_thread_count() != 1U) {
-        return test_fail("count-after-join", (long)ppc32_thread_count(),
-            1);
-    }
+    if (ppc32_thread_count() != 1U)
+        return test_fail("count-after-join", (long)ppc32_thread_count(), 1);
     rc = ppc32_thread_join(child_tid);
-    if (rc != -ESRCH) {
-        return test_fail("join-double", rc, -ESRCH);
-    }
+    if (rc != -ESRCH) return test_fail("join-double", rc, -ESRCH);
 
     /* Futex cases. */
     thread_st32be(&parent, TEST_UADDR, 5U);
@@ -857,28 +860,18 @@ int main(void)
     thread_st32be(&parent, TEST_TIMEOUT_VA + 4U, 50000000U);
     rc = ppc32_futex(&parent, TEST_UADDR, PPC32_FUTEX_WAIT, 5U,
         TEST_TIMEOUT_VA, 0U, 0U);
-    if (rc != -110L) {
-        return test_fail("futex-wait-timeout", rc, -110L);
-    }
+    if (rc != -110L) return test_fail("futex-wait-timeout", rc, -110L);
     rc = ppc32_futex(&parent, TEST_UADDR, PPC32_FUTEX_WAIT, 6U, 0U, 0U,
         0U);
-    if (rc != -11L) {
-        return test_fail("futex-wait-mismatch", rc, -11L);
-    }
+    if (rc != -11L) return test_fail("futex-wait-mismatch", rc, -11L);
     rc = ppc32_futex(&parent, TEST_UADDR,
         PPC32_FUTEX_WAKE | PPC32_FUTEX_PRIVATE_FLAG, 1U, 0U, 0U, 0U);
-    if (rc != 0) {
-        return test_fail("futex-wake", rc, 0);
-    }
+    if (rc != 0) return test_fail("futex-wake", rc, 0);
     rc = ppc32_futex(&parent, 0xFFFFFFFFU, PPC32_FUTEX_WAKE, 1U, 0U, 0U,
         0U);
-    if (rc != -EFAULT) {
-        return test_fail("futex-bad-addr", rc, -EFAULT);
-    }
+    if (rc != -EFAULT) return test_fail("futex-bad-addr", rc, -EFAULT);
     rc = ppc32_futex(&parent, TEST_UADDR, 6U, 0U, 0U, 0U, 0U);
-    if (rc != -ENOSYS) {
-        return test_fail("futex-bad-op", rc, -ENOSYS);
-    }
+    if (rc != -ENOSYS) return test_fail("futex-bad-op", rc, -ENOSYS);
 
     {
         ppc32_ctx_t other;
@@ -887,9 +880,8 @@ int main(void)
         parent.res_valid = 1;
         other.res_valid = 1;
         ppc32_thread_switch_invalidate(&parent, &other);
-        if (parent.res_valid != 0U || other.res_valid != 0U) {
+        if (parent.res_valid != 0U || other.res_valid != 0U)
             return test_fail("switch-invalidate", 0, 0);
-        }
     }
 
     free(win);

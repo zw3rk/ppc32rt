@@ -738,6 +738,76 @@ static void test_p32_r3_3_subpage_shared(void)
     (void)close(fd);
 }
 
+/* P32-R6-1/R6-6 follow-ups: cache fork protocol + sync epoch record,
+ * atomic sibling pend + IGN pump, and the generic syscall-tail pump. */
+static void test_p32_r6_followups(void)
+{
+    ppc32_ctx_t ctx;
+    ppc32_sigact_t ign;
+    uint64_t usr1 = 1ULL << (uint64_t)(PPC32_SIGUSR1 - 1U);
+    uint64_t urg = 1ULL << (uint64_t)(PPC32_SIGURG - 1U);
+
+    ppc32_sig_reset();
+
+    /* Fork protocol smoke: balanced prepare/parent, plus a child drop
+     * that can be re-locked right after. */
+    ppc32_cache_fork_prepare();
+    ppc32_cache_fork_parent();
+    ppc32_cache_fork_prepare();
+    ppc32_cache_fork_child();
+    ppc32_cache_fork_prepare();
+    ppc32_cache_fork_parent();
+
+    /* Sync records the live generation on the ctx. */
+    memset(&ctx, 0, sizeof(ctx));
+    ppc32_cache_sync_ctx(&ctx);
+    CHECK(ctx.ibtc_synced_epoch == *ppc32_cache_epoch_ptr(),
+        "r6-1 sync records epoch");
+    ppc32_cache_forget_ctx(&ctx);
+    ppc32_cache_sync_ctx(NULL);
+
+    /* Sibling pend path: ignored SIGUSR1 pends atomically, survives
+     * the pump while blocked, and clears once unmasked. */
+    CHECK(ppc32_vm_init(&ctx, UINT64_MAX) == 0, "r6-6 vm init");
+    CHECK(ppc32_thread_init_main(&ctx) == 0, "r6-6 init main");
+    memset(&ign, 0, sizeof(ign));
+    ign.handler = PPC32_SIG_IGN;
+    CHECK(ppc32_sigaction_set_raw((int)PPC32_SIGUSR1, &ign) == 0,
+        "r6-6 ignore usr1");
+    CHECK(ppc32_thread_signal(ctx.guest_tid, 0U, 0) == 0, "r6-6 probe");
+    CHECK(ppc32_thread_signal(ctx.guest_tid + 1U, 0U, 0) == -ESRCH,
+        "r6-6 probe missing");
+    CHECK(ppc32_thread_signal(ctx.guest_tid, 0U, (int)PPC32_SIGUSR1) == 0,
+        "r6-6 pend usr1");
+    CHECK((__atomic_load_n(&ctx.pending_signals, __ATOMIC_ACQUIRE) &
+        usr1) != 0ULL, "r6-6 bit set");
+    ctx.sig_mask |= usr1;
+    ppc32_sig_pump_pending(&ctx);
+    CHECK((__atomic_load_n(&ctx.pending_signals, __ATOMIC_ACQUIRE) &
+        usr1) != 0ULL, "r6-6 blocked stays");
+    ctx.sig_mask &= ~usr1;
+    ppc32_sig_pump_pending(&ctx);
+    CHECK((__atomic_load_n(&ctx.pending_signals, __ATOMIC_ACQUIRE) &
+        usr1) == 0ULL, "r6-6 pump clears ign");
+    CHECK(ppc32_thread_signal(ctx.guest_tid, ctx.guest_pid + 1U,
+        (int)PPC32_SIGUSR1) == -ESRCH, "r6-6 tgkill group mismatch");
+
+    /* Generic syscall-tail pump: GETPID with an ignored SIGURG pending
+     * returns normally, advances past sc, and the bit is gone after. */
+    CHECK(ppc32_sigaction_set_raw((int)PPC32_SIGURG, &ign) == 0,
+        "r6-6 ignore urg");
+    CHECK(ppc32_thread_signal(ctx.guest_tid, 0U, (int)PPC32_SIGURG) == 0,
+        "r6-6 pend urg");
+    ctx.gpr[0] = PPC32_NR_GETPID;
+    ctx.nip = 0x00100000U;
+    ppc32_syscall(&ctx);
+    CHECK(ctx.gpr[3] == (uint32_t)getpid(), "r6-6 getpid ret");
+    CHECK(ctx.nip == 0x00100004U, "r6-6 syscall advanced");
+    CHECK((__atomic_load_n(&ctx.pending_signals, __ATOMIC_ACQUIRE) &
+        urg) == 0ULL, "r6-6 syscall tail pumps");
+    ppc32_sig_reset();
+}
+
 int main(void)
 {
     uint8_t *base = (uint8_t *)mmap(NULL, 0x200000U, PROT_READ | PROT_WRITE,
@@ -755,6 +825,7 @@ int main(void)
 
     test_p32_5_6_11_vm_and_syscalls();
     test_p32_r3_3_subpage_shared();
+    test_p32_r6_followups();
 
     if (g_fails != 0) {
         fprintf(stderr, "check_p32_defects: %d FAILURES\n", g_fails);

@@ -125,6 +125,11 @@ typedef struct ppc32_sigact {
 /* Reset every disposition to SIG_DFL (test setup). */
 void ppc32_sig_reset(void);
 
+/* P32-R6-6: deliver the first pending unblocked catchable signal (the
+ * DBT dispatcher bail and the syscall tails call this so the frame
+ * captures the boundary nip). */
+void ppc32_sig_pump_pending(ppc32_ctx_t *ctx);
+
 /* execve reset: caught dispositions return to SIG_DFL, ignored stay
  * ignored; the calling thread's mask and pending set are preserved. */
 void ppc32_sig_reset_exec(void);

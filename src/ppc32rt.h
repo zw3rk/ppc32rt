@@ -240,6 +240,12 @@ typedef struct ppc32_ctx {
     uint64_t res_snap;
     uint64_t res_gensnap;
 
+    /* P32-R6-1: last cache generation this ctx synced (set by
+     * ppc32_cache_sync_ctx at DBT dispatcher entry; 0 = never). The
+     * reclaimer frees a retired block only once every registered ctx
+     * has synced past it, so threads inside chained code stay safe. */
+    uint32_t ibtc_synced_epoch;
+
 } ppc32_ctx_t;
 
 /* ABI-locked offsets (future trampoline, Phase 3+, must agree). */

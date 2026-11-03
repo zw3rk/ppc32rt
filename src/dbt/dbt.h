@@ -141,6 +141,18 @@ ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc);
 ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     const uint32_t *words, size_t nwords, const uint32_t *slot_pcs,
     unsigned nslots, bool is_call, uint32_t ret_pc);
+/* P32-R6-1: flush this ctx's IBTC/RAS when its entries predate the
+ * current generation, and record ctx->ibtc_synced_epoch for the
+ * quiescent reclaimer. The dispatch loop calls this before lookup. */
+void ppc32_cache_sync_ctx(ppc32_ctx_t *ctx);
+/* P32-R6-1: fork protocol for s_cache_lock (wired into proc.c):
+ * prepare holds it across the snapshot, parent releases, child drops
+ * the inherited held value and forgets dead peer registrations. */
+void ppc32_cache_fork_prepare(void);
+void ppc32_cache_fork_parent(void);
+void ppc32_cache_fork_child(void);
+/* Drop one ctx from the sync registry (call before freeing it). */
+void ppc32_cache_forget_ctx(const ppc32_ctx_t *ctx);
 void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
     uint32_t end);
 void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx);
