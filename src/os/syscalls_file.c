@@ -191,7 +191,7 @@ long sys_fcntl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t cmd, uint32_t arg)
         }
         r = fcntl((int)fd, (int)cmd, &hs);
         if (r < 0) {
-            return -(long)errno;
+            return (errno == EDEADLK) ? -58L : -(long)errno;
         }
         if (cmd == 5U && ppc32_flock_to_guest(ctx, arg, &hs) != 0) {
             return -EFAULT;
@@ -230,7 +230,7 @@ long sys_fcntl(ppc32_ctx_t *ctx, uint32_t fd, uint32_t cmd, uint32_t arg)
         }
         r = fcntl((int)fd, host_cmd, &hs);
         if (r < 0) {
-            return -(long)errno;
+            return (errno == EDEADLK) ? -58L : -(long)errno;
         }
         if (cmd == 12U && ppc32_flock64_to_guest(ctx, arg, &hs) != 0) {
             return -EFAULT;

@@ -120,6 +120,7 @@ static long dyn_put_statx(ppc32_ctx_t *ctx, uint32_t va,
     if (!ppc32_range_ok(va, DYN_STATX_SIZE)) {
         return -EFAULT;
     }
+    memset(ppc32_guest_ptr(ctx, va), 0, DYN_STATX_SIZE);
     memcpy(&mnt_id, (const unsigned char *)hs + 144U, sizeof mnt_id);
     ppc32_st32be(ctx, va + 0U, hs->stx_mask);
     ppc32_st32be(ctx, va + 4U, hs->stx_blksize);
@@ -323,6 +324,7 @@ static long dyn_put_stat_fallback(ppc32_ctx_t *ctx, uint32_t va,
     if (!ppc32_range_ok(va, DYN_STATX_SIZE)) {
         return -EFAULT;
     }
+    memset(ppc32_guest_ptr(ctx, va), 0, DYN_STATX_SIZE);
     ppc32_st32be(ctx, va + 0U, DYN_STATX_BASIC);
     ppc32_st32be(ctx, va + 4U, (uint32_t)hs->st_blksize);
     ppc32_st64be(ctx, va + 8U, 0ULL);

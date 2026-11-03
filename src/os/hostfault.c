@@ -22,6 +22,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "os/hostfault.h"
+#include "os/convert.h"
 #include "vm/vm32.h"
 
 #include <setjmp.h>
@@ -127,11 +128,30 @@ int ppc32_hostfault_run(ppc32_ctx_t *ctx, ppc32_hostfault_fn_t run)
             (uint32_t)((uintptr_t)hf_addr - (uintptr_t)guest_base);
         rc->fault_signo = (uint32_t)((signo == HF_SIGBUS) ?
             PPC32_SIGBUS : PPC32_SIGSEGV);
-        /* P32-R11-6: host faults record load-class direction (the
-         * interpreter store paths set fault_is_store = 1 before
-         * reaching this guard; DBT store direction arrives via the
-         * fault-site record where known). */
+        /* P32-R11-6: determine load vs store fault direction from the
+         * faulting PowerPC instruction at rc->nip when readable. */
         rc->fault_is_store = 0U;
+        if (rc->fault_addr != rc->nip &&
+            ppc32_range_ok(rc->nip, 4U)) {
+            uint32_t w = ppc32_ld32be(rc, rc->nip);
+            uint32_t opcd = w >> 26U;
+            uint32_t xo = (w >> 1U) & 0x3FFU;
+
+            if ((opcd >= 36U && opcd <= 39U) || opcd == 44U || opcd == 45U ||
+                opcd == 47U || (opcd >= 52U && opcd <= 55U)) {
+                rc->fault_is_store = 1U;
+            } else if (opcd == 31U &&
+                (xo == 150U || xo == 151U || xo == 183U || xo == 215U ||
+                 xo == 247U || xo == 407U || xo == 439U || xo == 661U ||
+                 xo == 662U || xo == 663U || xo == 695U || xo == 725U ||
+                 xo == 727U || xo == 759U || xo == 918U || xo == 983U ||
+                 xo == 1014U)) {
+                rc->fault_is_store = 1U;
+            } else if (opcd == 4U &&
+                ((w & 0x7FFU) == 800U || (w & 0x7FFU) == 802U)) {
+                rc->fault_is_store = 1U;
+            }
+        }
         /* RC-U3-r4: a truncated-file page traps as SIGBUS even when the
          * host delivered SIGSEGV (PROT_NONE tail), matching Linux
          * beyond-EOF semantics for both interp and DBT faults. */

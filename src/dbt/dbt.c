@@ -704,6 +704,24 @@ int dbt_run(ppc32_ctx_t *ctx)
         }
         default:
             /* TRAP/FAULT: nip already stored by the exit stub. */
+            if (reason == PPC32_EXIT_FAULT) {
+                ctx->fault_is_store = 0U;
+                if (ctx->vm_ready && ctx->fault_addr != ctx->nip &&
+                    ctx->nip >= 0x1000U && ctx->nip <= 0xFFFFFFFCU) {
+                    uint32_t raw = 0U;
+                    ppc32_insn_t fi;
+                    uint32_t len = 0U;
+                    uint32_t back = 0U;
+
+                    memcpy(&raw, ppc32_guest_ptr(ctx, ctx->nip), 4U);
+                    memset(&fi, 0, sizeof(fi));
+                    if (ppc_decode(ppc32_be32(raw), &fi) == 0 &&
+                        (fi.op == PPC32_OP_STWCX ||
+                         dbt_store_shape(&fi, &len, &back))) {
+                        ctx->fault_is_store = 1U;
+                    }
+                }
+            }
             return (int)ctx->exit_reason;
         }
     }
