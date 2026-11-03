@@ -76,9 +76,13 @@ static _Atomic uint32_t g_stage_live = 0U;
 /* P32-R5-7: prefer a writable retained fd for write-through. */
 static bool stage_fd_writable(int fd)
 {
-    int fl = fcntl(fd, F_GETFL);
+    int fl;
     int acc;
-    if (fl < 0 || fd < 0) {
+    if (fd < 0) {
+        return false;
+    }
+    fl = fcntl(fd, F_GETFL);
+    if (fl < 0) {
         return false;
     }
     acc = fl & O_ACCMODE;

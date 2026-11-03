@@ -20,7 +20,7 @@
  * rt_sigprocmask, rt_sigpending, rt_sigreturn, sigaltstack (signals
  * layer), fork/vfork/execve/wait4/waitpid/waitid/pipe/pipe2/dup/dup2
  * (proc layer). Old-style sigaction/sigprocmask stay -ENOSYS. Replaces
- * syscalls_min callers; syscalls_min.c itself is untouched.
+ * the syscalls_min callers.
  */
 
 #ifndef PPC32_SYSCALLS_H

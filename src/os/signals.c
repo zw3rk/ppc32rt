@@ -45,7 +45,6 @@
  * update with flags/mask from another. Lock order is outermost: holders
  * may enter the VM (guest copy helpers) but no VM holder takes this. */
 static ppc32_sigact_t sig_actions[PPC32_NSIG + 1U];
-static int sig_installed[PPC32_NSIG + 1U];
 static _Atomic uint32_t g_sig_disp_lock = 0U;
 
 static void sig_disp_lock_acquire(void)
@@ -112,7 +111,6 @@ void ppc32_sig_reset(void)
         sig_actions[i].restorer = 0U;
         sig_actions[i].mask[0] = 0U;
         sig_actions[i].mask[1] = 0U;
-        sig_installed[i] = 0;
     }
     sig_disp_lock_release();
 }
@@ -138,7 +136,6 @@ int ppc32_sigaction_set_raw(int sig, const ppc32_sigact_t *act)
     }
     sig_disp_lock_acquire();
     sig_actions[(uint32_t)sig] = *act;
-    sig_installed[(uint32_t)sig] = 1;
     sig_disp_lock_release();
     return 0;
 }
@@ -159,7 +156,6 @@ void ppc32_sig_reset_exec(void)
             sig_actions[i].restorer = 0U;
             sig_actions[i].mask[0] = 0U;
             sig_actions[i].mask[1] = 0U;
-            sig_installed[i] = 0;
         }
     }
     sig_disp_lock_release();

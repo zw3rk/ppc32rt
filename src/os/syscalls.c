@@ -94,7 +94,6 @@
 #define PPC32_UTS_FIELD 65U
 #define PPC32_UTS_FIELDS 6U
 
-#define PPC32_IOV_CHUNK 16U
 #define PPC32_IOV_MAX 1024U
 
 /* Convert a host return (bytes or negative errno) to the kernel-style
@@ -419,8 +418,11 @@ static long sys_getrandom(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
         }
         sys_read_landed(ctx, buf_va, (uint32_t)n);
     }
-    free(host);
-    return host_ret(n, errno);
+    {
+        int err = errno;
+        free(host);
+        return host_ret(n, err);
+    }
 #else
     (void)ctx;
     (void)buf_va;
@@ -461,65 +463,6 @@ static void sys_apply_ret(ppc32_ctx_t *ctx, uint32_t nr, long ret)
 
 /* getpid(2) and kill(2) live in their owning layers (proc.c, signals.c):
  * the switch below calls ppc32_proc_getpid and ppc32_sig_kill. */
-
-/* RC4 synchronous-clone reaping. Inline clone children (see the CLONE
- * case) exit before the clone sc returns and own no host process, so a
- * host wait4/waitpid would report ECHILD; consult this table first. The
- * stored status is the guest exit code; the reported word is status<<8
- * like a native wait4 status for _exit(status). WNOHANG with no exited
- * child reports 0 instead of hanging. */
-#define SYNC_KID_MAX 32U
-
-typedef struct {
-    uint32_t tid;
-    int status;
-    bool used;
-} sync_kid_t;
-
-static sync_kid_t sync_kids[SYNC_KID_MAX];
-
-/* Returns 1 with *out_ret set when pid matched a reaped inline child
- * (E01 + advance still apply in the caller); 0 when pid is not ours. */
-static int sync_kid_reap(ppc32_ctx_t *ctx, uint32_t pid_va,
-    uint32_t status_va, uint32_t options, uint32_t rusage_va, long *out_ret)
-{
-    uint32_t i;
-    uint32_t word;
-
-    for (i = 0U; i < SYNC_KID_MAX; i++) {
-        if (!sync_kids[i].used) {
-            continue;
-        }
-        if (pid_va != 0xFFFFFFFFU && pid_va != sync_kids[i].tid) {
-            continue;
-        }
-        if (status_va != 0U && !ppc32_range_ok(status_va, 4U)) {
-            *out_ret = -EFAULT;
-            return 1;
-        }
-        word = (sync_kids[i].status < 0) ?
-            (uint32_t)(-sync_kids[i].status & 0x7F) :
-            (((uint32_t)sync_kids[i].status & 0xFFU) << 8U);
-        if (status_va != 0U) {
-            ppc32_st32be(ctx, status_va, word);
-        }
-        if (rusage_va != 0U) {
-            if (!ppc32_range_ok(rusage_va, 72U)) {
-                *out_ret = -EFAULT;
-                return 1;
-            }
-            memset(ppc32_guest_ptr(ctx, rusage_va), 0, 72U);
-        }
-        sync_kids[i].used = false;
-        *out_ret = (long)(int32_t)sync_kids[i].tid;
-        return 1;
-    }
-    if (pid_va == 0xFFFFFFFFU && (options & (uint32_t)WNOHANG) != 0U) {
-        *out_ret = 0L;
-        return 1;
-    }
-    return 0;
-}
 
 int ppc32_syscall_is_exit(uint32_t nr)
 {
@@ -576,18 +519,6 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
             }
             ctx->syscalls_executed++;
             ppc32_sig_pump_pending(ctx);
-            return;
-        }
-    }
-    /* Inline-clone children own no host process: reap them here before
-     * the host wait4/waitpid path (which would report ECHILD). */
-    if (nr == PPC32_NR_WAIT4 || nr == PPC32_NR_WAITPID) {
-        long waited = 0L;
-
-        if (sync_kid_reap(ctx, a0, a1, a2, a3, &waited)) {
-            sys_apply_ret(ctx, nr, waited);
-            ctx->nip += 4U;
-            ctx->syscalls_executed++;
             return;
         }
     }
