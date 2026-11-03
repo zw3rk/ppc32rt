@@ -59,33 +59,70 @@ static long ul_errno(void)
 
 /* Emulated futex op (same arg shape as threads.c futex_host): uaddr is
  * the pinned host word, op carries PRIVATE/CLOCK bits plus the low cmd
- * nibble (WAIT 0, WAKE 1, REQUEUE 3, CMP_REQUEUE 4), val is the
- * host-endian comparand for WAIT/CMP_REQUEUE and the count otherwise,
- * timeout a relative bound for WAIT, uaddr2/val3 the requeue target
- * and CMP comparand. */
+ * nibble (WAIT 0, WAKE 1, REQUEUE 3, CMP_REQUEUE 4, WAIT_BITSET 9),
+ * val is the host-endian comparand for WAIT/WAIT_BITSET/CMP_REQUEUE
+ * and the count otherwise, timeout a relative bound for WAIT but an
+ * absolute time for WAIT_BITSET, uaddr2/val3 the requeue target and
+ * the CMP comparand or bitset mask. */
 long ppc32_futex_emul(int32_t *uaddr, uint32_t op, int32_t val,
     const struct timespec *timeout, int32_t *uaddr2, int32_t val3)
 {
 #if defined(__APPLE__)
     uint32_t cmd = op & 15U;
 
-    if (cmd == PPC32_FUTEX_WAIT) {
+    if (cmd == PPC32_FUTEX_WAIT || cmd == PPC32_FUTEX_WAIT_BITSET) {
         uint64_t timeout_ns = 0ULL;
 
         if (uaddr == NULL) {
+            return -UL_LINUX_EINVAL;
+        }
+        if (cmd == PPC32_FUTEX_WAIT_BITSET && val3 == 0) {
             return -UL_LINUX_EINVAL;
         }
         if ((uint32_t)*uaddr != (uint32_t)val) {
             return -UL_LINUX_EAGAIN;
         }
         if (timeout != NULL) {
-            if (timeout->tv_sec < 0 ||
-                timeout->tv_nsec < 0L ||
+            if (timeout->tv_nsec < 0L ||
                 timeout->tv_nsec >= 1000000000L) {
                 return -UL_LINUX_EINVAL;
             }
-            timeout_ns = (uint64_t)timeout->tv_sec * 1000000000ULL +
-                (uint64_t)timeout->tv_nsec;
+            if (cmd == PPC32_FUTEX_WAIT_BITSET) {
+                /* BITSET carries an absolute timeout (realtime when
+                 * the flag is set, monotonic otherwise); __ulock
+                 * wants a relative bound, so convert here. */
+                clockid_t clk =
+                    ((op & PPC32_FUTEX_CLOCK_REALTIME) != 0U) ?
+                    CLOCK_REALTIME : CLOCK_MONOTONIC;
+                struct timespec now;
+                int64_t dsec;
+                int64_t dnsec;
+
+                if (timeout->tv_sec < 0) {
+                    return -UL_LINUX_ETIMEDOUT;
+                }
+                if (clock_gettime(clk, &now) != 0) {
+                    return ul_errno();
+                }
+                dsec = (int64_t)timeout->tv_sec - (int64_t)now.tv_sec;
+                dnsec = (int64_t)timeout->tv_nsec -
+                    (int64_t)now.tv_nsec;
+                if (dsec < 0L || (dsec == 0L && dnsec <= 0L)) {
+                    return -UL_LINUX_ETIMEDOUT;
+                }
+                timeout_ns = (uint64_t)dsec * 1000000000ULL;
+                if (dnsec >= 0L) {
+                    timeout_ns += (uint64_t)dnsec;
+                } else {
+                    timeout_ns -= (uint64_t)-dnsec;
+                }
+            } else {
+                if (timeout->tv_sec < 0) {
+                    return -UL_LINUX_EINVAL;
+                }
+                timeout_ns = (uint64_t)timeout->tv_sec * 1000000000ULL +
+                    (uint64_t)timeout->tv_nsec;
+            }
         }
         if (__ulock_wait2((uint32_t)ULOCK_COMPARE_AND_WAIT,
                 (void *)uaddr, (uint64_t)(uint32_t)val, timeout_ns,

@@ -705,6 +705,18 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
                 ret = -EINVAL;
                 break;
             }
+            /* P32-R10-6: validate TID addresses before the fork side
+             * effect, mirroring the CLONE_VM path (write prot). */
+            if ((a0 & PPC32_CLONE_PARENT_SETTID) != 0U && a2 != 0U &&
+                !ppc32_vm_range_prot_ok(ctx, a2, 4U, 2U)) {
+                ret = -EFAULT;
+                break;
+            }
+            if ((a0 & PPC32_CLONE_CHILD_SETTID) != 0U && a4 != 0U &&
+                !ppc32_vm_range_prot_ok(ctx, a4, 4U, 2U)) {
+                ret = -EFAULT;
+                break;
+            }
             pid = ppc32_proc_fork(ctx);
             if (pid < 0L) {
                 ret = pid;

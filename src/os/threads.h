@@ -59,6 +59,7 @@
 #define PPC32_FUTEX_WAKE          1U
 #define PPC32_FUTEX_REQUEUE       3U
 #define PPC32_FUTEX_CMP_REQUEUE   4U
+#define PPC32_FUTEX_WAIT_BITSET   9U
 #define PPC32_FUTEX_PRIVATE_FLAG  128U
 #define PPC32_FUTEX_CLOCK_REALTIME 256U
 #define PPC32_FUTEX_CMD_MASK      (~(128U | 256U))
@@ -110,10 +111,11 @@ void ppc32_thread_fork_child(ppc32_ctx_t *ctx);
 void ppc32_thread_exit(ppc32_ctx_t *child);
 
 /* Futex op on a guest word (nr 221 arg order: uaddr, op, val, timeout,
- * uaddr2, val3). WAIT/CMP_REQUEUE compare against the byte-swapped
- * register value because guest memory is big-endian while the host
- * futex compares raw little-endian words. WAKE/REQUEUE counts pass
- * through. PI ops and FUTEX_FD take -ENOSYS. */
+ * uaddr2, val3). WAIT/WAIT_BITSET/CMP_REQUEUE compare against the
+ * byte-swapped register value (guest memory is big-endian, the host
+ * futex compares raw little-endian words). WAKE/REQUEUE counts pass
+ * through; the WAIT_BITSET mask (val3) passes unswapped, nonzero.
+ * PI ops and FUTEX_FD take -ENOSYS. */
 long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
     uint32_t val, uint32_t timeout_va, uint32_t uaddr2, uint32_t val3);
 

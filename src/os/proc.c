@@ -105,22 +105,14 @@ long ppc32_proc_getpid(void)
 }
 
 /* Coordinated fork protocol (P32-R3-4): the parent holds every
- * process-global runtime lock across the snapshot so no update is
- * half-written when the address space clones, releases them after a
- * parent return, and the child drops every inherited locked value
- * (each owner is gone) and rebuilds the thread table around the sole
- * surviving thread. Global acquisition order (outermost first, matching
- * all observed runtime nesting: dispositions enter the VM through the
- * locked copy helpers; file and TLB updates run under the VM lock):
- * signal dispositions, thread table, translation cache, VM, TLB,
- * inode, LL/SC. The fork syscall path holds none of these on entry,
- * so the prepare cannot self-deadlock; a concurrent holder only
- * delays the snapshot. The cache sits before the VM (snapshot reads
- * nest cache -> VM). The truncate/write file paths honor the same
- * order (P32-R4-8): the inode lock is only ever taken alone or under
- * the VM lock, and TLB updates happen after it is released, so no
- * thread can hold the inode lock while waiting on the TLB lock fork
- * holds. */
+ * process-global runtime lock across the snapshot, releases them
+ * after a parent return, and the child drops every inherited locked
+ * value and rebuilds the thread table around the sole survivor.
+ * Global order (outermost first): signal dispositions, thread table,
+ * translation cache, VM, TLB, inode, LL/SC (cache sits before the VM;
+ * the inode lock is only ever taken alone or under the VM lock, per
+ * P32-R4-8). The fork path holds none of these on entry, so prepare
+ * cannot self-deadlock. */
 static void proc_fork_prepare(void)
 {
     ppc32_sig_fork_prepare();
@@ -182,8 +174,7 @@ long ppc32_proc_fork(ppc32_ctx_t *ctx)
 long ppc32_proc_vfork(ppc32_ctx_t *ctx)
 {
     /* No address-space sharing fast path: plain fork preserves the
-     * observable result (0 in the child, the child pid in the parent)
-     * and is safe when the child promptly execves or exits. */
+     * observable result and is safe when the child promptly execves. */
     return ppc32_proc_fork(ctx);
 }
 
@@ -302,14 +293,11 @@ static long proc_copy_vec(ppc32_ctx_t *ctx, uint32_t vec_va, char ***out,
 }
 
 /* Header probe mirroring the loader's admission (ppc32_elf32.c):
- * magic, ELFCLASS32, ELFDATA2MSB, EM_PPC(20), ET_EXEC(2)/ET_DYN(3).
- * Runs on the already-open fd via pread, so the caller can reject a
- * foreign binary before ppc32_vm_reset_for_exec. */
-/* Admission classes: 1 runs (32-bit big-endian PowerPC EXEC/DYN),
- * 0 is a script-or-text fallback (-ENOEXEC, the shell re-execs its own
- * interpreter like the kernel would), -1 is a valid ELF of another
- * machine (the caller runs it natively in a host child: qemu-user
- * parity for host binaries on PATH). */
+ * magic, ELFCLASS32, ELFDATA2MSB, EM_PPC(20), ET_EXEC(2)/ET_DYN(3),
+ * via pread so a foreign binary is rejected before the old image is
+ * torn down. Classes: 1 runs (32-bit BE PowerPC EXEC/DYN), 0 is a
+ * script-or-text fallback (-ENOEXEC), -1 is a foreign ELF the caller
+ * runs natively in a host child (qemu-user parity for host PATH). */
 static int proc_admission_ok(int fd, const char *path)
 {
     uint8_t h[20];
@@ -345,6 +333,28 @@ static int proc_admission_ok(int fd, const char *path)
     return 1;
 }
 
+/* P32-R10-3: image replacement never crosses host execve, so the
+ * host never closes CLOEXEC fds for us; close every FD_CLOEXEC fd
+ * here (the probe fd is skipped: elf_load still reads through it). */
+static void proc_close_cloexec(int skip_fd)
+{
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    long fd;
+    if (maxfd <= 0L) {
+        maxfd = 1024L;
+    }
+    for (fd = 0L; fd < maxfd; fd++) {
+        int fl;
+        if ((int)fd == skip_fd) {
+            continue;
+        }
+        fl = fcntl((int)fd, F_GETFD);
+        if (fl >= 0 && (fl & FD_CLOEXEC) != 0) {
+            (void)close((int)fd);
+        }
+    }
+}
+
 long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     uint32_t envp_va)
 {
@@ -363,6 +373,11 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         return -EFAULT;
     }
     proc_invalidate_reservation(ctx);
+    /* P32-R10-2: siblings cannot survive image replacement; refuse
+     * rather than strand them on an unmapped window. */
+    if (ppc32_thread_count() > 1U) {
+        return -EBUSY;
+    }
     if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
         return -EFAULT;
     }
@@ -376,11 +391,9 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         return rc;
     }
     /* Admission re-entry (SPEC 1.1): resolve through the sysroot, then
-     * probe the header BEFORE tearing the old address space down, so a
-     * foreign binary (scripts, native host binaries) is rejected with
-     * -ENOEXEC while the old image still runs. Deeper load failures past
-     * this point still destroy the image (partial-teardown exposure, as
-     * on Linux). */
+     * probe BEFORE tearing the old image down, so a foreign binary is
+     * rejected with -ENOEXEC while the old image still runs. Deeper
+     * load failures past this point still destroy the image (as Linux). */
     /* RC5: /proc/self/exe names the running guest image (BusyBox applets
      * re-exec it); substitute the guest executable path with the same
      * priority procfs uses (exec_path, else argv[0]). The literal host
@@ -430,11 +443,9 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         }
         if (adm < 0) {
             /* Foreign ELF (host arch): run it natively in a host child
-             * (qemu-user parity: the oracle execs host binaries like
-             * /usr/bin/ls natively, so BusyBox applets resolve through
-             * PATH). The waiting guest exits with the native status;
-             * gpr[0] is reparked on EXIT so the engine stops (the
-             * dispatch post-check in main.c picks it up). */
+             * (qemu-user parity for host PATH binaries). The waiting
+             * guest exits with the native status; gpr[0] reparks on
+             * EXIT so the engine stops (see the main.c post-check). */
             pid_t pid;
             int st = 0;
             int code;
@@ -467,17 +478,17 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     }
     memset(&info, 0, sizeof info);
     ppc32_vm_reset_for_exec(ctx);
+    ppc32_cache_invalidate_all(ctx);
+    proc_close_cloexec(fd);
     if (ppc32_elf_load(ctx, fd, path, &info) != 0) {
         proc_free_vec(args, argc);
         proc_free_vec(env, envc);
         return -ENOEXEC;
     }
-    /* Fresh process image: the register file, signal stack, thread
-     * identity, and heap/stack mirrors reset to the load state; then
-     * the new stack + auxv. Linux exec semantics for signals: caught
-     * dispositions return to SIG_DFL (ignored ones stay ignored), while
-     * the calling thread's blocked mask and pending set survive the
-     * image replacement, so neither is cleared here. */
+    /* Fresh process image: registers, heap/stack mirrors, and thread
+     * identity reset to the load state; then the new stack + auxv.
+     * Signals: caught dispositions return to SIG_DFL (ignored stay
+     * ignored); the blocked mask and pending set survive (uncleared). */
     memset(ctx->gpr, 0, sizeof ctx->gpr);
     memset(ctx->gpr_hi, 0, sizeof ctx->gpr_hi);
     memset(ctx->fpr, 0, sizeof ctx->fpr);
@@ -505,6 +516,7 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     ctx->host_tid = (int)(long)getpid();
     ctx->guest_pid = (uint32_t)(long)getpid();
     ctx->guest_tid = ctx->guest_pid;
+    ctx->is_thread_clone = false;
     /* AT_EXECFN/_dl_get_origin needs the guest-absolute path (the kernel
      * reports d_path; BusyBox re-execs relative argv[0] when running a
      * script fallback). Guest cwd == host cwd (no chdir emulation). */

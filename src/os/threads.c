@@ -54,6 +54,7 @@ extern void ppc32_cache_forget_ctx(const ppc32_ctx_t *ctx);
 typedef struct {
     bool         used;
     bool         exited;
+    bool         joining; /* join/reap in flight: pinned, skip me */
     ppc32_ctx_t *ctx;
     pthread_t    host;
     uint32_t     guest_tid;
@@ -77,20 +78,21 @@ static ppc32_thread_slot_t *thread_claim_locked(ppc32_ctx_t *ctx,
     uint32_t i;
     uint32_t j;
     for (j = 0U; j < PPC32_MAX_THREADS; j++) {
+        uint32_t ri = PPC32_MAX_THREADS;
         pthread_t host;
         ppc32_ctx_t *dead;
-        bool reap = false;
 
         for (i = 0U; i < PPC32_MAX_THREADS; i++) {
-            if (g_thread_table[i].used && g_thread_table[i].exited) {
+            if (g_thread_table[i].used && g_thread_table[i].exited &&
+                !g_thread_table[i].joining) {
+                g_thread_table[i].joining = true;
                 host = g_thread_table[i].host;
                 dead = g_thread_table[i].ctx;
-                memset(&g_thread_table[i], 0, sizeof(g_thread_table[i]));
-                reap = true;
+                ri = i;
                 break;
             }
         }
-        if (!reap) {
+        if (ri == PPC32_MAX_THREADS) {
             break;
         }
         thread_unlock();
@@ -99,11 +101,15 @@ static ppc32_thread_slot_t *thread_claim_locked(ppc32_ctx_t *ctx,
         ppc32_cache_forget_ctx(dead);
         free(dead);
         thread_lock();
+        if (g_thread_table[ri].joining && g_thread_table[ri].ctx == dead) {
+            memset(&g_thread_table[ri], 0, sizeof(g_thread_table[ri]));
+        }
     }
     for (i = 0U; i < PPC32_MAX_THREADS; i++) {
         if (!g_thread_table[i].used) {
             g_thread_table[i].used = true;
             g_thread_table[i].exited = false;
+            g_thread_table[i].joining = false;
             g_thread_table[i].ctx = ctx;
             g_thread_table[i].guest_tid = guest_tid;
             memset(&g_thread_table[i].host, 0, sizeof(pthread_t));
@@ -195,6 +201,7 @@ void ppc32_thread_fork_child(ppc32_ctx_t *ctx)
     for (i = 0U; i < PPC32_MAX_THREADS; i++) {
         g_thread_table[i].used = false;
         g_thread_table[i].exited = false;
+        g_thread_table[i].joining = false;
         g_thread_table[i].ctx = NULL;
         memset(&g_thread_table[i].host, 0, sizeof(pthread_t));
         g_thread_table[i].guest_tid = 0U;
@@ -225,12 +232,9 @@ uint32_t ppc32_thread_count(void)
 }
 
 /* tkill/tgkill backend: signal a live sibling by guest TID (sig == 0
- * probes; sig > 0 pends; tgid != 0 needs a group match). The pend is
- * an atomic OR (the target clears bits from its own thread), and a
- * pended sibling on another host thread gets a SIGURG wake nudge so a
- * host block fails EINTR into the syscall-tail pump. The nudge is
- * wake-only: the guest sig rides in pending_signals, and self pends
- * need no poke. */
+ * probes; sig > 0 pends via atomic OR; tgid != 0 needs a group match).
+ * A pended sibling on another host thread gets a SIGURG wake nudge so
+ * a host block fails EINTR into the syscall-tail pump. */
 long ppc32_thread_signal(uint32_t guest_tid, uint32_t tgid, int sig)
 {
     ppc32_ctx_t *target = NULL;
@@ -375,7 +379,8 @@ long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
     if (ctx == NULL) {
         return -EINVAL;
     }
-    if (cmd != PPC32_FUTEX_WAIT && cmd != PPC32_FUTEX_WAKE &&
+    if (cmd != PPC32_FUTEX_WAIT && cmd != PPC32_FUTEX_WAIT_BITSET &&
+        cmd != PPC32_FUTEX_WAKE &&
         cmd != PPC32_FUTEX_REQUEUE && cmd != PPC32_FUTEX_CMP_REQUEUE) {
         return -ENOSYS;
     }
@@ -386,7 +391,7 @@ long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
         !thread_range_ok(ctx, uaddr2, 4U, 1U)) {
         return -EFAULT;
     }
-    if (cmd == PPC32_FUTEX_WAIT && timeout_va != 0U) {
+    if (timeout_va != 0U && (cmd == PPC32_FUTEX_WAIT || cmd == PPC32_FUTEX_WAIT_BITSET)) {
         get_rc = futex_get_timeout(ctx, timeout_va, &ts);
         if (get_rc != 0) {
             return (long)get_rc;
@@ -397,11 +402,16 @@ long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
     if (cmd == PPC32_FUTEX_REQUEUE || cmd == PPC32_FUTEX_CMP_REQUEUE) {
         up2 = (int32_t *)ppc32_guest_ptr(ctx, uaddr2);
     }
-    /* Guest is BE; byte-swap numeric comparands to the LE image. */
-    if (cmd == PPC32_FUTEX_WAIT) {
+    if (cmd == PPC32_FUTEX_WAIT_BITSET && val3 == 0U) {
+        return -EINVAL;
+    }
+    /* Guest is BE: swap comparands to the LE image; the WAIT_BITSET
+     * mask (val3) passes unswapped. */
+    if (cmd == PPC32_FUTEX_WAIT || cmd == PPC32_FUTEX_WAIT_BITSET) {
         int32_t expect = (int32_t)ppc32_be32(val);
 
-        return futex_host(up, host_op, expect, tsp, NULL, 0);
+        return futex_host(up, host_op, expect, tsp, NULL,
+            cmd == PPC32_FUTEX_WAIT_BITSET ? (int32_t)val3 : 0);
     }
     if (cmd == PPC32_FUTEX_WAKE) {
         return futex_host(up, host_op, (int32_t)val, NULL, NULL, 0);
@@ -564,7 +574,7 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
         return -EFAULT;
     }
     if ((flags & PPC32_CLONE_CHILD_CLEARTID) != 0U && child_tid_va != 0U &&
-        !thread_range_ok(parent, child_tid_va, 4U, 1U)) {
+        !thread_range_ok(parent, child_tid_va, 4U, 2U)) {
         return -EFAULT;
     }
     child = (ppc32_ctx_t *)calloc(1, sizeof(ppc32_ctx_t));
@@ -644,43 +654,40 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
     return (long)(int32_t)child_tid;
 }
 
+/* The slot pins with joining under the first lock, so a concurrent
+ * clone-reap can neither join the handle nor free the context twice. */
 long ppc32_thread_join(uint32_t guest_tid)
 {
-    pthread_t host = 0;
-    ppc32_ctx_t *child = NULL;
-    bool found = false;
+    ppc32_thread_slot_t *slot;
+    pthread_t host;
+    ppc32_ctx_t *child;
 
     thread_lock();
-    {
-        ppc32_thread_slot_t *slot = thread_find_locked(guest_tid);
-
-        if (slot != NULL) {
-            host = slot->host;
-            child = slot->ctx;
-            found = true;
-        }
-    }
-    thread_unlock();
-    if (!found) {
+    slot = thread_find_locked(guest_tid);
+    if (slot == NULL || slot->joining) {
+        thread_unlock();
         return -ESRCH;
     }
-    if (host == 0) {
+    if (memcmp(&slot->host, &(pthread_t){ 0 }, sizeof(slot->host)) == 0) {
+        thread_unlock();
         return -EINVAL;
     }
+    slot->joining = true;
+    host = slot->host;
+    child = slot->ctx;
+    thread_unlock();
     if (pthread_join(host, NULL) != 0) {
+        thread_lock();
+        slot->joining = false;
+        thread_unlock();
         return -ESRCH;
     }
     thread_lock();
-    {
-        ppc32_thread_slot_t *slot = thread_find_locked(guest_tid);
-
-        if (slot != NULL && slot->ctx == child) {
-            slot->used = false;
-            slot->ctx = NULL;
-            slot->exited = false;
-            memset(&slot->host, 0, sizeof(pthread_t));
-        }
+    if (slot->ctx != child) {
+        thread_unlock();
+        return -ESRCH;
     }
+    memset(slot, 0, sizeof(*slot));
     thread_unlock();
     ppc32_cache_forget_ctx(child);
     free(child);
