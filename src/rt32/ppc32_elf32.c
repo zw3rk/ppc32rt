@@ -133,8 +133,8 @@ static int gnu_attrs_have_power_spe(const uint8_t *buf, size_t len)
         if ((size_t)(end - p) < 4U) {
             return 0;
         }
-        slen = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-               ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        slen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+               ((uint32_t)p[2] << 8) | (uint32_t)p[3];
         if (slen < 5U || (size_t)(end - p) < slen) {
             return 0;
         }

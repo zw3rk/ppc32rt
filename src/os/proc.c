@@ -538,19 +538,17 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         ctx->exec_path = (ep != NULL) ? ep : NULL;
     }
     use_env = env;
+    ppc32_proc_redetect_profile(ctx, info.text_start, info.text_end);
+    /* P32-R9-7: a PT_GNU_ATTRIBUTES SPE marker upgrades auto-detected
+     * CLASSIC to SPE before stack setup publishes AT_HWCAP. */
+    if (info.gnu_power_spe != 0U && ctx->profile == PPC32_PROFILE_CLASSIC) {
+        ctx->profile = PPC32_PROFILE_SPE;
+        ctx->is_spe = 1U;
+    }
     if (ppc32_stack_setup(ctx, &info, (int)argc, args, use_env, &sp) != 0) {
         proc_free_vec(args, argc);
         proc_free_vec(env, envc);
         return -ENOMEM;
-    }
-    ppc32_proc_redetect_profile(ctx, info.text_start, info.text_end);
-    /* P32-R9-7: a PT_GNU_ATTRIBUTES SPE marker wins over the opcode
-     * scan (an explicit --profile still wins; redetect honors it). */
-    if (info.gnu_power_spe != 0U &&
-        ctx->profile != PPC32_PROFILE_CLASSIC &&
-        ctx->profile != PPC32_PROFILE_SPE) {
-        ctx->profile = PPC32_PROFILE_SPE;
-        ctx->is_spe = 1U;
     }
     /* RC5: interpreter entry when PT_INTERP is present (see main.c). */
     ctx->nip = ctx->elf_entry;
