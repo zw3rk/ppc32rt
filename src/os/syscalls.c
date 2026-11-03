@@ -39,6 +39,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -107,9 +108,9 @@ static long host_ret(ssize_t n, int err)
     return (long)n;
 }
 
-/* Landed read bytes: evict overlapping translated blocks, kill peer
- * LL/SC reservations (P32-R4-12), and fan out to overlapping staged
- * shared-file aliases (P32-R4-3). Reads never write the file back. */
+/* Landed read bytes: evict blocks, kill LL/SC (P32-R4-12), fan out to
+ * staged aliases and write through to the file (P32-R5-6: a read into a
+ * writable staged MAP_SHARED mapping is a coherent store). */
 static void sys_read_landed(ppc32_ctx_t *ctx, uint32_t base, uint32_t n)
 {
     if (n == 0U) {
@@ -117,7 +118,7 @@ static void sys_read_landed(ppc32_ctx_t *ctx, uint32_t base, uint32_t n)
     }
     ppc32_smc_store(ctx, base, n, NULL);
     vm32_store_invalidate_range(base, n);
-    vm_file_shared_cohere_read(ctx, base, n);
+    vm_file_shared_cohere_store(ctx, base, n);
 }
 
 /* P1: read/pread64 helper; landed bytes evict overlapping blocks. */
@@ -173,19 +174,19 @@ static long sys_write(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t c
     return host_ret(n, errno);
 }
 
-/* Chunked vectored I/O: a fixed host iovec array (no VLA) walks the BE
- * guest array; partial transfers return the bytes moved so far. The
- * transferred count lives in result and is never depleted: readv
- * invalidates each landed chunk as it completes (P32-R4-1), so error
- * returns after partial progress keep both the count and the
- * invalidation. */
+/* Single-shot vectored I/O (P32-R5-4/5): snapshot guest (base,len)
+ * pairs before issuing one host readv/writev (atomic datagram/pipe
+ * semantics, no re-read of guest iovec after I/O). */
 static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
     uint32_t count, int is_write)
 {
-    struct iovec hv[PPC32_IOV_CHUNK];
+    struct iovec *hv = NULL;
+    uint32_t *bases = NULL;
+    uint32_t *lens = NULL;
     uint64_t result = 0ULL;
-    uint32_t done = 0U;
     uint32_t need_prot = (is_write != 0) ? 1U : 2U;
+    ssize_t got;
+    uint32_t j;
 
     if (count == 0U) {
         return 0;
@@ -201,59 +202,62 @@ static long sys_vec(ppc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
             (size_t)count * sizeof(ppc32_iovec_t), 1U)) {
         return -EFAULT;
     }
-    while (done < count) {
-        uint32_t n = count - done;
-        size_t want = 0U;
-        ssize_t got;
-        uint32_t j;
+    hv = (struct iovec *)malloc((size_t)count * sizeof(*hv));
+    bases = (uint32_t *)malloc((size_t)count * sizeof(*bases));
+    lens = (uint32_t *)malloc((size_t)count * sizeof(*lens));
+    if (hv == NULL || bases == NULL || lens == NULL) {
+        free(hv);
+        free(bases);
+        free(lens);
+        return -ENOMEM;
+    }
+    for (j = 0U; j < count; j++) {
+        uint32_t base = ppc32_ld32be(ctx, iov_va + j * 8U);
+        uint32_t len = ppc32_ld32be(ctx, iov_va + j * 8U + 4U);
 
-        if (n > PPC32_IOV_CHUNK) {
-            n = PPC32_IOV_CHUNK;
+        if (len > 0U && !ppc32_range_ok(base, len)) {
+            free(hv);
+            free(bases);
+            free(lens);
+            return -EFAULT;
         }
-        for (j = 0U; j < n; j++) {
-            uint32_t base = ppc32_ld32be(ctx, iov_va + (done + j) * 8U);
-            uint32_t len = ppc32_ld32be(ctx, iov_va + (done + j) * 8U + 4U);
+        /* P32-R4-11: per-range sub-page perms (read src / write dst). */
+        if (len > 0U &&
+            !ppc32_vm_range_prot_ok(ctx, base, len, need_prot)) {
+            free(hv);
+            free(bases);
+            free(lens);
+            return -EFAULT;
+        }
+        bases[j] = base;
+        lens[j] = len;
+        hv[j].iov_base = len == 0U ? NULL : ppc32_guest_ptr(ctx, base);
+        hv[j].iov_len = (size_t)len;
+    }
+    got = is_write ? writev((int)fd, hv, (int)count) :
+        readv((int)fd, hv, (int)count);
+    if (got < 0) {
+        int e = errno;
+        free(hv);
+        free(bases);
+        free(lens);
+        return -(long)e;
+    }
+    if (got > 0 && is_write == 0) {
+        /* P32-R4-1 + R5-4: landed bookkeeping from the snapshot. */
+        uint64_t rem = (uint64_t)got;
 
-            if (len > 0U && !ppc32_range_ok(base, len)) {
-                return result > 0ULL ? (long)result : -EFAULT;
-            }
-            /* P32-R4-11: per-destination sub-page permissions — guest
-             * read for writev sources, guest write for readv targets. */
-            if (len > 0U &&
-                !ppc32_vm_range_prot_ok(ctx, base, len, need_prot)) {
-                return result > 0ULL ? (long)result : -EFAULT;
-            }
-            hv[j].iov_base = ppc32_guest_ptr(ctx, base);
-            hv[j].iov_len = (size_t)len;
-            want += (size_t)len;
-        }
-        got = is_write ? writev((int)fd, hv, (int)n) : readv((int)fd, hv, (int)n);
-        if (got < 0) {
-            return result > 0ULL ? (long)result : -(long)errno;
-        }
-        if (got > 0 && is_write == 0) {
-            /* P32-R4-1: invalidate each completed destination range
-             * now, partial-aware, without touching result. */
-            uint64_t rem = (uint64_t)got;
-
-            for (j = 0U; j < n && rem > 0ULL; j++) {
-                uint32_t base =
-                    ppc32_ld32be(ctx, iov_va + (done + j) * 8U);
-                uint32_t len =
-                    ppc32_ld32be(ctx, iov_va + (done + j) * 8U + 4U);
-                uint32_t hit =
-                    (uint64_t)len > rem ? (uint32_t)rem : len;
-
-                sys_read_landed(ctx, base, hit);
-                rem -= (uint64_t)hit;
-            }
-        }
-        result += (uint64_t)got;
-        done += n;
-        if ((uint64_t)got < (uint64_t)want) {
-            break;
+        for (j = 0U; j < count && rem > 0ULL; j++) {
+            uint32_t hit = (uint64_t)lens[j] > rem ?
+                (uint32_t)rem : lens[j];
+            sys_read_landed(ctx, bases[j], hit);
+            rem -= (uint64_t)hit;
         }
     }
+    result = (uint64_t)got;
+    free(hv);
+    free(bases);
+    free(lens);
     if (is_write != 0 && result > 0ULL) {
         /* Same Provider-A EOF hook as sys_write above. */
         off_t end = lseek((int)fd, 0, SEEK_CUR);
@@ -390,13 +394,32 @@ static long sys_getrandom(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     uint32_t flags)
 {
 #ifdef __linux__
+    char *host;
     ssize_t n;
 
-    if (len > 0U && !ppc32_range_ok(buf_va, len)) {
+    if (len == 0U) {
+        return 0;
+    }
+    if (!ppc32_range_ok(buf_va, len)) {
         return -EFAULT;
     }
+    if (!ppc32_vm_range_prot_ok(ctx, buf_va, len, 2U)) {
+        return -EFAULT;
+    }
+    host = (char *)malloc((size_t)len);
+    if (host == NULL) {
+        return -ENOMEM;
+    }
     /* GRND_* flag bits are Linux-generic: pass through. */
-    n = getrandom(ppc32_guest_ptr(ctx, buf_va), (size_t)len, (unsigned int)flags);
+    n = getrandom(host, (size_t)len, (unsigned int)flags);
+    if (n > 0) {
+        if (ppc32_vm_copyout_safe(ctx, buf_va, host, (size_t)n) != 0) {
+            free(host);
+            return -EFAULT;
+        }
+        sys_read_landed(ctx, buf_va, (uint32_t)n);
+    }
+    free(host);
     return host_ret(n, errno);
 #else
     (void)ctx;
@@ -405,6 +428,18 @@ static long sys_getrandom(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     (void)flags;
     return -ENOSYS;
 #endif
+}
+
+extern long ppc32_run_guest_child(ppc32_ctx_t *child);
+extern void ppc32_sig_pump_pending(ppc32_ctx_t *ctx);
+/* Concurrent clone runner (P32-R5-1): runs the guest child to exit on a
+ * host pthread via threads.c thread_entry; parent returns immediately. */
+static void sys_clone_run(ppc32_ctx_t *child, void *opaque)
+{
+    (void)opaque;
+    if (child != NULL) {
+        (void)ppc32_run_guest_child(child);
+    }
 }
 
 /* E01 return convention (SPEC 2.3, experiments/E01): classify on the
@@ -442,20 +477,6 @@ typedef struct {
 } sync_kid_t;
 
 static sync_kid_t sync_kids[SYNC_KID_MAX];
-
-static void sync_kid_record(uint32_t tid, int status)
-{
-    uint32_t i;
-
-    for (i = 0U; i < SYNC_KID_MAX; i++) {
-        if (!sync_kids[i].used) {
-            sync_kids[i].tid = tid;
-            sync_kids[i].status = status;
-            sync_kids[i].used = true;
-            return;
-        }
-    }
-}
 
 /* Returns 1 with *out_ret set when pid matched a reaped inline child
  * (E01 + advance still apply in the caller); 0 when pid is not ours. */
@@ -554,6 +575,7 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
                 ctx->nip += 4U;
             }
             ctx->syscalls_executed++;
+            ppc32_sig_pump_pending(ctx);
             return;
         }
     }
@@ -716,14 +738,10 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         break;
     case PPC32_NR_CLONE:
     {
-        /* PPC clone arg order (threads.h): flags, stack, parent_tid,
-         * tls, child_tid in r3..r7. RC4 runs the child inline on the
-         * calling host thread to guest exit: single-threaded, so the
-         * fixture's lwarx/stwcx counter (1000 = parent 500 + child
-         * 500) reproduces the oracle exactly under interp, dbt, and
-         * difftest (whose snapshot refreshes after this dispatch). A
-         * host-thread child would race the interpreter's non-atomic
-         * reservation ops; true concurrency is a Phase 7 concern. */
+        /* PPC clone arg order: flags, stack, parent_tid, tls,
+         * child_tid in r3..r7. P32-R5-1 runs the CLONE_VM child
+         * concurrently on a host pthread (threads.c runner) so
+         * parent/child handshakes never deadlock. */
         /* Fork-style clone (no CLONE_VM): process semantics, e.g. the
          * BusyBox posix_spawn idiom SIGCHLD|CHILD_CLEARTID|CHILD_SETTID.
          * A host fork copies mm/files/fs exactly like fork(2); thread
@@ -757,8 +775,8 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
             break;
         }
         ppc32_ctx_t *child = NULL;
-        long tid = ppc32_clone(ctx, a0, a1, a2, a3, a4, NULL, NULL,
-            &child);
+        long tid = ppc32_clone(ctx, a0, a1, a2, a3, a4, sys_clone_run,
+            NULL, &child);
 
         if (tid < 0L) {
             ret = tid;
@@ -768,9 +786,6 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
             ret = -EFAULT;
             break;
         }
-        sync_kid_record((uint32_t)tid,
-            (int)ppc32_run_guest_child(child));
-        ppc32_thread_exit(child);
         ret = tid;
         break;
     }

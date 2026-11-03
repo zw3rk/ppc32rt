@@ -718,6 +718,13 @@ int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
         return 0;
     }
     if (act.handler != PPC32_SIG_DFL && act.handler != PPC32_SIG_IGN) {
+        /* P32-R5-8: blocked signals enqueue as pending, never enter
+         * the handler while blocked; delivered on unmask/boundary. */
+        if ((ctx->sig_mask & sig_bit((int)sig)) != 0ULL) {
+            ctx->pending_signals |= sig_bit((int)sig);
+            *out_ret = 0L;
+            return 0;
+        }
         /* Handled: success return first (post-sc nip is what the frame
          * captures), then redirect into the handler; the tail must not
          * advance nip a second time. */
@@ -740,6 +747,42 @@ int ppc32_sig_kill(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t sig,
      * us exactly like the qemu-ppc oracle dies; ignore-defaults return). */
     *out_ret = (raise((int)sig) == 0) ? 0L : -(long)errno;
     return 0;
+}
+
+/* P32-R5-8: deliver first pending unblocked catchable signal (called
+ * after the syscall tail so the frame captures post-sc nip). */
+void ppc32_sig_pump_pending(ppc32_ctx_t *ctx)
+{
+    uint32_t s;
+    if (ctx == NULL) {
+        return;
+    }
+    for (s = 1U; s <= PPC32_NSIG; s++) {
+        uint64_t bit = sig_bit((int)s);
+        ppc32_sigact_t act;
+        if ((ctx->pending_signals & bit) == 0ULL) {
+            continue;
+        }
+        if ((ctx->sig_mask & bit) != 0ULL) {
+            continue;
+        }
+        if (ppc32_sigaction_get((int)s, &act) != 0) {
+            continue;
+        }
+        if (act.handler == PPC32_SIG_IGN) {
+            ctx->pending_signals &= ~bit;
+            continue;
+        }
+        if (act.handler == PPC32_SIG_DFL) {
+            ctx->pending_signals &= ~bit;
+            (void)raise((int)s);
+            return;
+        }
+        if (ppc32_sig_deliver_sync(ctx, (int)s, 0, 0U, 0U) == 0) {
+            return;
+        }
+        return;
+    }
 }
 
 int ppc32_sig_syscall(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,

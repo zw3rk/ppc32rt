@@ -47,6 +47,7 @@
 #include "os/syscall_nr.h"
 #include "ppc32rt.h"
 #include "rt32/ppc32.h"
+#include "vm/vm32.h"
 
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -414,6 +415,9 @@ static long dyn_getcwd(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t size)
     if (size == 0U || !ppc32_range_ok(buf_va, size)) {
         return -EFAULT;
     }
+    if (!ppc32_vm_range_prot_ok(ctx, buf_va, size, 2U)) {
+        return -EFAULT;
+    }
     if (getcwd(host, sizeof host) == NULL) {
         return -(long)errno;
     }
@@ -423,7 +427,12 @@ static long dyn_getcwd(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t size)
         if (len > (size_t)size) {
             return -ERANGE;
         }
-        memcpy(ppc32_guest_ptr(ctx, buf_va), host, len);
+        if (ppc32_vm_copyout_safe(ctx, buf_va, host, len) != 0) {
+            return -EFAULT;
+        }
+        ppc32_smc_store(ctx, buf_va, len, NULL);
+        vm32_store_invalidate_range(buf_va, (uint32_t)len);
+        vm_file_shared_cohere_store(ctx, buf_va, (uint32_t)len);
         /* Kernel-like length: bytes written including the NUL. */
         return (long)len;
     }

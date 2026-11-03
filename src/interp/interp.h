@@ -307,6 +307,13 @@ static inline uint32_t ld32r(const ppc32_ctx_t *ctx, uint32_t ea)
     return r;
 }
 
+/* P32-R5-2: faulted access check; FP update forms commit RA/FPR/nip
+ * only when the memory access succeeds (exit_reason stays NONE). */
+static inline bool interp_failed(const ppc32_ctx_t *ctx)
+{
+    return ctx->exit_reason != PPC32_EXIT_NONE;
+}
+
 static inline void st8(ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
 {
     void *hva = ppc32_access_checked(ctx, ea, 1U, true);

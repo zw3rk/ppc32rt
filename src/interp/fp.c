@@ -71,32 +71,41 @@ static void fp_commit(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint64_t r,
     fp_done(ctx, insn, r);
 }
 
-/* Shared classic load/store body (true single<->double conversion). */
+/* Shared classic load/store body: commit FPR/nip only on success. */
 static void fp_memop(ppc32_ctx_t *ctx, uint32_t ea, unsigned rt, int is_ld,
     int is_dbl)
 {
     if (!interp_mem_ok(ea, is_dbl ? 8U : 4U)) { fault(ctx, ea); return; }
     if (is_ld) {
-        ctx->fpr[rt & 31u] = is_dbl ? fp_ld64(ctx, ea) : fp_xtod(ld32(ctx,
-            ea));
+        uint64_t v = is_dbl ? fp_ld64(ctx, ea) : fp_xtod(ld32(ctx, ea));
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
+        ctx->fpr[rt & 31u] = v;
     } else if (is_dbl) {
         fp_st64(ctx, ea, ctx->fpr[rt & 31u]);
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
     } else {
         st32(ctx, ea, fp_dtos(ctx->fpr[rt & 31u]));
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
     }
     ctx->nip += 4u;
 }
 
-/* ---- classic loads/stores (true conversion for lfs/stfs) ------------ */
+/* ---- classic loads/stores (RA/nip commit only on success) ---------- */
 static void fp_lsD(ppc32_ctx_t *ctx, unsigned rt, unsigned ra, int32_t d,
     int is_ld, int is_dbl, int upd)
 {
     uint32_t ea = (ra == 0u ? 0u : ctx->gpr[ra]) + (uint32_t)d;
-    if (upd) {
-        if (ra == 0u) { ctx->exit_reason = PPC32_EXIT_UNDEF; return; }
+    if (upd && ra == 0u) { ctx->exit_reason = PPC32_EXIT_UNDEF; return; }
+    fp_memop(ctx, ea, rt, is_ld, is_dbl);
+    if (upd && ctx->exit_reason == PPC32_EXIT_NONE) {
         ctx->gpr[ra] = ea;
     }
-    fp_memop(ctx, ea, rt, is_ld, is_dbl);
 }
 
 static void fp_lsX(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int is_ld,
@@ -106,11 +115,11 @@ static void fp_lsX(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int is_ld,
         insn->xo == PPC32_FPUX_STFSUX || insn->xo == PPC32_FPUX_STFDUX;
     uint32_t ea = (insn->ra == 0u ? 0u : ctx->gpr[insn->ra]) +
         ctx->gpr[insn->rb];
-    if (upd) {
-        if (insn->ra == 0u) { ctx->exit_reason = PPC32_EXIT_UNDEF; return; }
+    if (upd && insn->ra == 0u) { ctx->exit_reason = PPC32_EXIT_UNDEF; return; }
+    fp_memop(ctx, ea, insn->rt, is_ld, is_dbl);
+    if (upd && ctx->exit_reason == PPC32_EXIT_NONE) {
         ctx->gpr[insn->ra] = ea;
     }
-    fp_memop(ctx, ea, insn->rt, is_ld, is_dbl);
 }
 
 /* Classic arithmetic: op 0 add, 1 sub, 2 mul, 3 div. */

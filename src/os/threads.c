@@ -34,9 +34,7 @@
 #endif
 
 /* ---- local guest-memory helpers (BE scalars, memcpy-based) ----
- * Private copies of the convert.c shapes so this file links alone;
- * semantics match ppc32_ld/st32be and ppc32_range_ok for in-window
- * thread words (tid addresses, futex words, TLS area heads). */
+ * Private convert.c-shape copies so this file links alone. */
 
 static bool thread_range_ok(const ppc32_ctx_t *ctx, uint32_t va, size_t len,
     uint32_t need_prot)
@@ -60,6 +58,7 @@ static void thread_st32be(ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
 
 typedef struct {
     bool         used;
+    bool         exited;
     ppc32_ctx_t *ctx;
     pthread_t    host;
     uint32_t     guest_tid;
@@ -89,6 +88,7 @@ static ppc32_thread_slot_t *thread_claim_locked(ppc32_ctx_t *ctx,
     for (i = 0U; i < PPC32_MAX_THREADS; i++) {
         if (!g_thread_table[i].used) {
             g_thread_table[i].used = true;
+            g_thread_table[i].exited = false;
             g_thread_table[i].ctx = ctx;
             g_thread_table[i].guest_tid = guest_tid;
             memset(&g_thread_table[i].host, 0, sizeof(pthread_t));
@@ -152,9 +152,8 @@ long ppc32_thread_init_main(ppc32_ctx_t *ctx)
     return 0;
 }
 
-/* Fork coordination (P32-R3-4): hold the table lock across the
- * snapshot in the parent; the child drops the inherited locked value
- * and rebuilds the table around the sole surviving thread. */
+/* Fork coordination (P32-R3-4): parent holds the lock across the
+ * snapshot; the child drops it and rebuilds around itself. */
 void ppc32_thread_fork_prepare(void)
 {
     thread_lock();
@@ -172,6 +171,7 @@ void ppc32_thread_fork_child(ppc32_ctx_t *ctx)
     atomic_store_explicit(&g_thread_lock, 0U, memory_order_release);
     for (i = 0U; i < PPC32_MAX_THREADS; i++) {
         g_thread_table[i].used = false;
+        g_thread_table[i].exited = false;
         g_thread_table[i].ctx = NULL;
         memset(&g_thread_table[i].host, 0, sizeof(pthread_t));
         g_thread_table[i].guest_tid = 0U;
@@ -331,9 +331,8 @@ long ppc32_futex(ppc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
     if (cmd == PPC32_FUTEX_REQUEUE || cmd == PPC32_FUTEX_CMP_REQUEUE) {
         up2 = (int32_t *)ppc32_guest_ptr(ctx, uaddr2);
     }
-    /* Guest memory is big-endian: the host futex compares raw
-     * little-endian words, so numeric register comparands must be
-     * byte-swapped to their in-memory image. Counts pass through. */
+    /* Guest is BE, host futex compares raw LE words: byte-swap the
+     * numeric comparands to their in-memory image. */
     if (cmd == PPC32_FUTEX_WAIT) {
         int32_t expect = (int32_t)ppc32_be32(val);
 
@@ -391,9 +390,8 @@ static void thread_copy_state(ppc32_ctx_t *dst, const ppc32_ctx_t *src)
     dst->acc = src->acc;
     memcpy(dst->fpr, src->fpr, sizeof(dst->fpr));
     dst->is_spe = src->is_spe;
-    /* Shared-window VM snapshot (CLONE_VM: same 4 GiB window; region
-     * bookkeeping is the shared table, copied while holding the table
-     * lock so a concurrent D19 mapping change cannot tear it). */
+    /* Shared-window VM snapshot (CLONE_VM): region table copied while
+     * holding the table lock so a D19 mapping change cannot tear it. */
     dst->guest_base = src->guest_base;
     dst->brk_base = src->brk_base;
     dst->brk_curr = src->brk_curr;
@@ -426,9 +424,8 @@ static void thread_copy_state(ppc32_ctx_t *dst, const ppc32_ctx_t *src)
     dst->engine = src->engine;
     dst->profile = src->profile;
     dst->sig_mask = src->sig_mask;
-    /* The child shares the address space (CLONE_VM): the window stays up
-     * (RC4: without this the child faults on its first step and the
-     * fault/deliver loop exhausts its stack). */
+    /* CLONE_VM shares the window (RC4: else the child faults on its
+     * first step and the fault/deliver loop exhausts its stack). */
     dst->vm_ready = src->vm_ready;
     /* Fresh per-thread state: caches, counters, signals, robust. */
     dst->res_valid = 0;
@@ -463,8 +460,8 @@ static void *thread_entry(void *arg)
     if (child == NULL) {
         return NULL;
     }
-    /* Slot + host handle were stored by ppc32_clone before this ran,
-     * so join is race-free; only the TID needs recording here. */
+    /* Clone published slot+handle under the table lock, so join is
+     * race-free; only the TID needs recording here. */
     child->host_tid = (int)host_gettid();
     if (run != NULL) {
         run(child, opaque);
@@ -507,10 +504,8 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
         !thread_range_ok(parent, parent_tid_va, 4U, 2U)) {
         return -EFAULT;
     }
-    /* A NULL set/clear pointer means "no record" (the host kernel
-     * tolerates it for this flag combination — oracle-proven: BusyBox
-     * spawn passes child_tid 0 with CHILD_SETTID|CHILD_CLEARTID — so
-     * only validate nonzero pointers instead of failing the clone). */
+    /* NULL set/clear pointers mean "no record" (oracle-proven: BusyBox
+     * passes child_tid 0 with SETTID|CLEARTID), so check nonzero only. */
     if ((flags & PPC32_CLONE_CHILD_SETTID) != 0U && child_tid_va != 0U &&
         !thread_range_ok(parent, child_tid_va, 4U, 2U)) {
         return -EFAULT;
@@ -579,25 +574,19 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
     {
         pthread_t host = 0;
 
+        /* Hold the table lock across create+publish: an instant child
+         * blocks in exit until its handle is recorded for join. */
+        thread_lock();
         rc = pthread_create(&host, NULL, thread_entry, start);
         if (rc != 0) {
-            free(start);
-            thread_lock();
             slot->used = false;
             slot->ctx = NULL;
             thread_unlock();
+            free(start);
             free(child);
             return -(long)rc;
         }
-        /* Stored before the child can exit, so join is race-free. */
-        thread_lock();
-        {
-            ppc32_thread_slot_t *again = thread_find_locked(child_tid);
-
-            if (again != NULL) {
-                again->host = host;
-            }
-        }
+        slot->host = host;
         thread_unlock();
     }
     return (long)(int32_t)child_tid;
@@ -606,6 +595,7 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
 long ppc32_thread_join(uint32_t guest_tid)
 {
     pthread_t host = 0;
+    ppc32_ctx_t *child = NULL;
     bool found = false;
 
     thread_lock();
@@ -614,6 +604,7 @@ long ppc32_thread_join(uint32_t guest_tid)
 
         if (slot != NULL) {
             host = slot->host;
+            child = slot->ctx;
             found = true;
         }
     }
@@ -627,6 +618,20 @@ long ppc32_thread_join(uint32_t guest_tid)
     if (pthread_join(host, NULL) != 0) {
         return -ESRCH;
     }
+    /* Reap the zombie exit left behind: drop the slot, free its ctx. */
+    thread_lock();
+    {
+        ppc32_thread_slot_t *slot = thread_find_locked(guest_tid);
+
+        if (slot != NULL && slot->ctx == child) {
+            slot->used = false;
+            slot->ctx = NULL;
+            slot->exited = false;
+            memset(&slot->host, 0, sizeof(pthread_t));
+        }
+    }
+    thread_unlock();
+    free(child);
     return 0;
 }
 
@@ -647,18 +652,24 @@ void ppc32_thread_exit(ppc32_ctx_t *child)
         (void)woken;
     }
     ppc32_reservation_invalidate(child);
+    /* Zombie, don't free: join reaps the slot+ctx. Host-less inline
+     * threads have no joiner, so release those inline slots now. */
     thread_lock();
     {
         ppc32_thread_slot_t *slot = thread_find_locked(child->guest_tid);
 
-        if (slot != NULL) {
+        if (slot != NULL && slot->host == 0) {
             slot->used = false;
             slot->ctx = NULL;
-            memset(&slot->host, 0, sizeof(pthread_t));
+            thread_unlock();
+            free(child);
+            return;
+        }
+        if (slot != NULL) {
+            slot->exited = true;
         }
     }
     thread_unlock();
-    free(child);
 }
 
 /* ---- self-test (acceptance: prints L4B-OK, exit 0) ---- */
@@ -708,8 +719,7 @@ int main(void)
     long rc;
     long tid;
 
-    /* Plain heap window: alignment suits BE word memcpy access and the
-     * host futex operates on it like on any shared mapping. */
+    /* Plain heap window for BE word access and host futex ops. */
     win = malloc(TEST_WIN_SIZE);
     if (win == NULL) {
         printf("L4B-FAIL malloc\n");
@@ -811,8 +821,7 @@ int main(void)
         return test_fail("count-after-clone", (long)ppc32_thread_count(),
             2);
     }
-    /* The first clone after init gets exactly main_tid + 1, which must
-     * also equal the TID returned by clone. */
+    /* First clone after init gets exactly main_tid + 1. */
     if (child_tid != (uint32_t)tid + 1U) {
         return test_fail("clone-tid-seq", (long)child_tid,
             (long)((uint32_t)tid + 1U));
@@ -831,6 +840,11 @@ int main(void)
     if (ppc32_thread_count() != 1U) {
         return test_fail("count-after-join", (long)ppc32_thread_count(),
             1);
+    }
+    /* Reaped slots stay reaped: a second join finds nothing. */
+    rc = ppc32_thread_join(child_tid);
+    if (rc != -ESRCH) {
+        return test_fail("join-double", rc, -ESRCH);
     }
 
     /* Futex: matching WAIT times out, mismatched WAIT is immediate,

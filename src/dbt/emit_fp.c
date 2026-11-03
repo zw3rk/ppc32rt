@@ -257,14 +257,14 @@ static int fp_ldst(a64_buf_t *b, const ppc32_insn_t *insn, bool is_x,
     } else {
         ei_ea_d(b, insn->ra, (uint32_t)insn->d);
     }
-    /* RC4: update-first matches interp fp_lsD/fp_lsX, then guard, access. */
-    if (is_update) {
-        ei_st(b, A64_ADDR, insn->ra);
-    }
+    /* P32-R5-2: guard, access, then RA update so a fault keeps RA/nip. */
     ei_guard_low(b, pc);
     fp_ldst_mem(b, is_store, dbl, insn->rt);
     if (b->overflow) {
         return PPC32_EMIT_FALLBACK;
+    }
+    if (is_update) {
+        ei_st(b, A64_ADDR, insn->ra);
     }
     return PPC32_EMIT_NEXT;
 }

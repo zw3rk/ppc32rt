@@ -46,6 +46,7 @@
 #include "vm/vm_file_int.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -71,6 +72,18 @@ typedef struct {
 
 static vm_file_staged_t g_staged[VM_FILE_STAGED_GROUPS];
 static _Atomic uint32_t g_stage_live = 0U;
+
+/* P32-R5-7: prefer a writable retained fd for write-through. */
+static bool stage_fd_writable(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+    int acc;
+    if (fl < 0 || fd < 0) {
+        return false;
+    }
+    acc = fl & O_ACCMODE;
+    return acc == O_WRONLY || acc == O_RDWR;
+}
 
 static size_t stage_round_host(size_t len)
 {
@@ -286,6 +299,14 @@ int vm_file_shared_acquire(int src_fd, uint64_t file_offset, size_t len,
         }
         g_staged[i].file_size = fsz;
         g_staged[i].mtime_ns = mtime;
+        if (!stage_fd_writable(g_staged[i].src_fd) &&
+            stage_fd_writable(src_fd)) {
+            int nfd = vm_dup_fd(src_fd);
+            if (nfd >= 0) {
+                (void)close(g_staged[i].src_fd);
+                g_staged[i].src_fd = nfd;
+            }
+        }
         *out_stage_fd = g_staged[i].stage_fd;
         return 0;
     }
@@ -512,8 +533,10 @@ static void stage_fanout_groups(uint64_t dev, uint64_t ino, uint64_t flo,
             g_staged[i].ino != ino) {
             continue;
         }
-        wfd = g_staged[i].src_fd;
-        break;
+        if (stage_fd_writable(g_staged[i].src_fd)) {
+            wfd = g_staged[i].src_fd;
+            break;
+        }
     }
     if (wfd < 0) {
         return;
