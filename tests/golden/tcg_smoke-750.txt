@@ -3,8 +3,8 @@ PASS [tcg]: signals SIGUSR1 x1
 PASS [tcg]: segfault si_signo + si_addr page offset
 PASS [tcg]: prot-none trap + restore
 PASS [tcg]: test-mmap sub-page permissions
-FAIL [tcg]: testthread (thread result mismatch)
+PASS [tcg]: testthread join exact + munmap-pthread
 PASS [tcg]: float_convs double->long goldens + accum interval
 PASS [tcg]: sha1 KAT abc=a9993e36...
-TCG_SMOKE RESULT: pass=6 fail=1 skip=0
-TCG_SMOKE FAIL
+TCG_SMOKE RESULT: pass=7 fail=0 skip=0
+TCG_SMOKE ALL_OK

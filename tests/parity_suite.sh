@@ -34,7 +34,8 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ppc32rt-parity.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT INT TERM
+trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; exit 143' INT TERM
 
 SYSROOT="$ROOT/tests/sysroot"
 GOLDEN="$ROOT/tests/golden"
@@ -145,7 +146,7 @@ if [ "$need_build" = "1" ]; then
             parity_row "$_g" "build" "docker" "GAP" "0" "no docker, guest missing"
         done
     else
-        if timeout --kill-after=30s 500s docker run --rm \
+        if ! timeout --kill-after=30s 500s docker run --rm \
             --name "ppc32rt-parity-build-$$" --memory 2g --cpus 2 \
             --platform linux/arm64 -v "$ROOT:/w" -v "$ROOT/../rt-series:/rt" \
             -w /w debian:trixie-slim bash -lc '
@@ -251,11 +252,9 @@ oracle_row() {
 }
 
 if [ -f "$B/ora-rc.txt" ]; then
-    for _g in p1_isa p2_libc p3_fp p4_threads h1_smc p5_dyn h4_cxx; do
+    for _g in p1_isa p2_libc p3_fp p4_threads h1_smc p5_dyn h4_cxx \
+        p3_torture tcg_smoke; do
         oracle_row "$_g" 750 0
-    done
-    for _g in p3_torture tcg_smoke; do
-        oracle_row "$_g" 750 1
     done
     for _g in p1_isa p3_fp p4_threads h1_smc; do
         oracle_row "$_g" e500v2 0
@@ -305,10 +304,7 @@ vs_golden() {
         spe) _prof="--profile spe" ;;
         *) _prof="--profile classic" ;;
     esac
-    case "$_guest" in
-        p3_torture|tcg_smoke) _want_rc=1 ;;
-        *) _want_rc=0 ;;
-    esac
+    _want_rc=0
     # shellcheck disable=SC2086
     for _e in $@; do
         # shellcheck disable=SC2086

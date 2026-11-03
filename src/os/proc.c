@@ -3,20 +3,8 @@
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
- * Implements fork(2), vfork(190), execve(11), wait4(114)/waitpid(7),
- * waitid, pipe2/pipe(42), dup2(63) per SPEC sections 1.1 and 2.3.
- * Return convention is kernel-style (negative errno or value); the
- * caller applies the E01 CR0.SO/r3 rule via ppc32_proc_return. The
- * lwarx/stwcx. reservation dies at every entry (SPEC 2.2), matching
- * the syscall layer. Guest O_CLOEXEC (02000000) matches the host
- * asm-generic bit, so pipe2 flags pass through on Linux.
  */
 
-/* Feature-test macros: strict POSIX on Linux (plus GNU for pipe2 and
- * waitid); on Apple the POSIX macro would hide the BSD wait4, so the
- * Darwin full level is used instead (wait4/pipe/dup2/fork stay
- * declared under strict -std=c11). */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
@@ -104,15 +92,8 @@ long ppc32_proc_getpid(void)
     return (long)getpid();
 }
 
-/* Coordinated fork protocol (P32-R3-4): the parent holds every
- * process-global runtime lock across the snapshot, releases them
- * after a parent return, and the child drops every inherited locked
- * value and rebuilds the thread table around the sole survivor.
- * Global order (outermost first): signal dispositions, thread table,
- * translation cache, VM, TLB, inode, LL/SC (cache sits before the VM;
- * the inode lock is only ever taken alone or under the VM lock, per
- * P32-R4-8). The fork path holds none of these on entry, so prepare
- * cannot self-deadlock. */
+/* Coordinated fork protocol (P32-R3-4): signal, thread, cache, VM,
+ * TLB, inode, LL/SC locks acquired in global order across fork(). */
 static void proc_fork_prepare(void)
 {
     ppc32_sig_fork_prepare();
@@ -643,6 +624,19 @@ long ppc32_proc_wait4(ppc32_ctx_t *ctx, uint32_t pid_va, uint32_t status_va,
         return -EFAULT;
     }
     memset(&ru, 0, sizeof ru);
+    if (pid > 0 && ppc32_thread_join((uint32_t)pid) == 0L) {
+        if (status_va != 0U) {
+            ppc32_st32be(ctx, status_va, 0U);
+        }
+        if (rup != NULL) {
+            long rc = proc_put_rusage(ctx, rusage_va, &ru);
+
+            if (rc != 0) {
+                return rc;
+            }
+        }
+        return (long)pid;
+    }
     r = wait4(pid, (status_va == 0U) ? NULL : &status,
         (int)options, rup);
     if (r < 0) {

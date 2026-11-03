@@ -119,7 +119,12 @@ static void reg_ctx_locked(ppc32_ctx_t *ctx, uint32_t cur)
     if (ctx == NULL) {
         return;
     }
-    ctx->ibtc_synced_epoch = cur;
+    if (ctx->ibtc_synced_epoch != cur) {
+        memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+        memset(ctx->ras, 0, sizeof(ctx->ras));
+        ctx->ras_top = 0U;
+        ctx->ibtc_synced_epoch = cur;
+    }
     for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
         if (s_reg_ctx[i] == ctx) {
             s_reg_epoch[i] = cur;
@@ -158,30 +163,25 @@ static void retire_block_locked(ppc32_block_t *e, uint32_t epoch)
 }
 
 /* Caller holds s_cache_lock. Frees only generations no thread can run:
- * single-threaded has no peer in chained code, otherwise every tracked
- * dispatcher must have synced past the retired node. */
+ * every tracked dispatcher must have synced past the retired node. */
 static void reclaim_retired_locked(uint32_t cur)
 {
     retired_node_t **pp = &s_retired;
-    bool single = (ppc32_thread_count() <= 1U);
     bool quiet = !s_reg_overflow;
 
     while (*pp != NULL) {
         retired_node_t *n = *pp;
         bool freeable = false;
 
-        if (n->epoch != cur) {
-            freeable = single;
-            if (!freeable && quiet) {
-                size_t i;
+        if (n->epoch != cur && quiet) {
+            size_t i;
 
-                freeable = true;
-                for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
-                    if (s_reg_ctx[i] != NULL &&
-                        s_reg_epoch[i] <= n->epoch) {
-                        freeable = false;
-                        break;
-                    }
+            freeable = true;
+            for (i = 0U; i < PPC32_CACHE_MAX_REG; i++) {
+                if (s_reg_ctx[i] != NULL &&
+                    s_reg_epoch[i] <= n->epoch) {
+                    freeable = false;
+                    break;
                 }
             }
         }
@@ -291,16 +291,16 @@ static void sever_links_to(ppc32_block_t *victim)
     for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
         ppc32_block_t *e = s_table[i];
 
-        if (e == NULL || e == victim) {
+        if (e == NULL) {
             continue;
         }
         for (s = 0U; s < 8U; s++) {
             if (e->slot_entry[s] == victim) {
-                e->slot_entry[s] = NULL;
+                __atomic_store_n(&e->slot_entry[s], NULL, __ATOMIC_RELEASE);
             }
         }
         if (e->ret_entry == victim) {
-            e->ret_entry = NULL;
+            __atomic_store_n(&e->ret_entry, NULL, __ATOMIC_RELEASE);
         }
     }
 }
@@ -321,14 +321,8 @@ static void sever_ctx_range(ppc32_ctx_t *ctx, uint32_t start, uint32_t end)
             s->entry = NULL;
         }
     }
-    for (i = 0U; i < PPC32_RAS_SIZE; i++) {
-        ppc32_ibtc_entry_t *s = &ctx->ras[i];
-
-        if (s->key >= start && s->key < end) {
-            s->host_code = NULL;
-            s->entry = NULL;
-        }
-    }
+    memset(ctx->ras, 0, sizeof(ctx->ras));
+    ctx->ras_top = 0U;
 }
 
 /* Only called for retired generations no thread can enter via the
@@ -540,9 +534,11 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
         ppc32_block_t *old;
         unsigned s;
         size_t i;
+        uint32_t prev_epoch;
         uint32_t cur;
 
         (void)pthread_mutex_lock(&s_cache_lock);
+        prev_epoch = cache_epoch_load();
         old = s_table[idx];
         if (old != NULL) {
             uint32_t old_pc = old->guest_pc;
@@ -562,13 +558,14 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
                         __ATOMIC_RELEASE);
                 }
             }
-            reclaim_retired_locked(cur);
             sever_ctx_range(ctx, old_pc, old_pc + 4U);
-        } else {
-            reclaim_retired_locked(cache_epoch_load());
+            if (ctx != NULL && ctx->ibtc_synced_epoch == prev_epoch) {
+                ctx->ibtc_synced_epoch = cur;
+            }
         }
         cur = cache_epoch_load();
         reg_ctx_locked(ctx, cur);
+        reclaim_retired_locked(cur);
         e->keyepoch = (uint64_t)pc | ((uint64_t)cur << 32U);
         e->host_code = code;
         e->entry = code;
@@ -635,6 +632,7 @@ static void invalidate_range_skip_locked(ppc32_ctx_t *ctx, uint32_t start,
     uint32_t end, ppc32_block_t *skip)
 {
     uint32_t pg;
+    uint32_t prev_epoch;
     uint32_t cur;
 
     if (start >= end) {
@@ -652,6 +650,7 @@ static void invalidate_range_skip_locked(ppc32_ctx_t *ctx, uint32_t start,
     }
     /* P32-R6-1: bump the generation on every invalidation so other
      * threads' IBTC/RAS sync observes it, even when nothing is evicted. */
+    prev_epoch = cache_epoch_load();
     cache_epoch_bump();
     cur = cache_epoch_load();
     /* NOTE: pages stay marked here even though the sweep below evicts
@@ -706,8 +705,13 @@ static void invalidate_range_skip_locked(ppc32_ctx_t *ctx, uint32_t start,
         }
     }
     sever_ctx_range(ctx, start, end);
-    reg_ctx_locked(ctx, cur);
-    reclaim_retired_locked(cur);
+    if (skip == NULL) {
+        if (ctx != NULL && ctx->ibtc_synced_epoch == prev_epoch) {
+            ctx->ibtc_synced_epoch = cur;
+        }
+        reg_ctx_locked(ctx, cur);
+        reclaim_retired_locked(cur);
+    }
     if (ctx != NULL) {
         ctx->icache_flushes++;
     }
@@ -742,11 +746,10 @@ void ppc32_cache_sync_ctx(ppc32_ctx_t *ctx)
     if (ctx->ibtc_synced_epoch == cur) {
         return;
     }
-    memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
-    memset(ctx->ras, 0, sizeof(ctx->ras));
-    ctx->ras_top = 0U;
     (void)pthread_mutex_lock(&s_cache_lock);
-    reg_ctx_locked(ctx, cache_epoch_load());
+    cur = cache_epoch_load();
+    reg_ctx_locked(ctx, cur);
+    reclaim_retired_locked(cur);
     (void)pthread_mutex_unlock(&s_cache_lock);
 }
 

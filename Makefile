@@ -11,10 +11,11 @@ BUILD_DIR := _build
 # Prefer the aarch64 musl cross compiler when it is on PATH (the nix cross
 # shell provides aarch64-unknown-linux-musl-gcc); otherwise fall back to the
 # shell's default cc (host syntax checks). An explicit CC always wins.
-CROSS_CC := $(shell command -v aarch64-unknown-linux-musl-gcc 2>/dev/null)
-ifeq ($(origin CC),default)
+A64_CC_CACHED := /nix/store/8jrawyn6l1payp9l8c1a3cqsz0bkjqv1-aarch64-unknown-linux-musl-gcc-wrapper-16.2.0/bin/aarch64-unknown-linux-musl-gcc
+CROSS_CC := $(shell command -v aarch64-unknown-linux-musl-gcc 2>/dev/null || ([ -x $(A64_CC_CACHED) ] && echo $(A64_CC_CACHED)))
+ifneq ($(origin CC),command line)
   ifneq ($(CROSS_CC),)
-    CC := aarch64-unknown-linux-musl-gcc
+    CC := $(CROSS_CC)
   else
     CC := cc
   endif

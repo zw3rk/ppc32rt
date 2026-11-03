@@ -749,6 +749,9 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
             ret = -EFAULT;
             break;
         }
+        if (ctx->difftest) {
+            (void)ppc32_thread_join((uint32_t)tid);
+        }
         ret = tid;
         break;
     }

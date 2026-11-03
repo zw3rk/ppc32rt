@@ -759,6 +759,7 @@ static int run_difftest(ppc32_ctx_t *ctx)
     memset(&ref, 0, sizeof(ref));
     ref.guest_base = ctx->guest_base;
     ref.vm_ready = true;
+    ref.difftest = ctx->difftest;
     ref.profile = ctx->profile;
     ref.host_info = ctx->host_info;
     ref.nip = ctx->elf_entry;
