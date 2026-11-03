@@ -178,17 +178,12 @@ long ppc32_proc_vfork(ppc32_ctx_t *ctx)
     return ppc32_proc_fork(ctx);
 }
 
-/* Scan guest text for a major-opcode-4 word (SPE APU, SPEC 2.2).
- * P32-R9-7: the whole executable segment is probed (not just the first
- * 65536 instructions) so late-SPE binaries classify correctly; a
- * PT_GNU_ATTRIBUTES SPE marker (ppc32_elf_info_t.gnu_power_spe) is
- * honored by the callers on top of this scan. */
+/* Scan guest text for SPE vs Classic FPU opcodes (SPEC 2.2, P32-R9-7). */
 void ppc32_proc_redetect_profile(ppc32_ctx_t *ctx, uint32_t text_start,
     uint32_t text_end)
 {
-    uint64_t len;
-    uint64_t n;
-    uint64_t i;
+    uint64_t len, n, i;
+    bool saw_spe = false;
 
     if (ctx == NULL) {
         return;
@@ -211,15 +206,19 @@ void ppc32_proc_redetect_profile(ppc32_ctx_t *ctx, uint32_t text_start,
     for (i = 0ULL; i < n; i++) {
         uint32_t w = ppc32_ld32be(ctx,
             (uint32_t)(text_start + (uint32_t)(i * 4ULL)));
+        uint32_t op = w >> 26U;
 
-        if ((w >> 26U) == 4U) {
-            ctx->profile = PPC32_PROFILE_SPE;
-            ctx->is_spe = 1U;
+        if ((op >= 48U && op <= 55U) || op == 59U || op == 63U) {
+            ctx->profile = PPC32_PROFILE_CLASSIC;
+            ctx->is_spe = 0U;
             return;
         }
+        if (op == 4U) {
+            saw_spe = true;
+        }
     }
-    ctx->profile = PPC32_PROFILE_CLASSIC;
-    ctx->is_spe = 0U;
+    ctx->profile = saw_spe ? PPC32_PROFILE_SPE : PPC32_PROFILE_CLASSIC;
+    ctx->is_spe = saw_spe ? 1U : 0U;
 }
 
 /* Free a partially built exec vector (count entries valid). */

@@ -145,6 +145,7 @@ static void retire_block_locked(ppc32_block_t *e, uint32_t epoch)
     if (e == NULL) {
         return;
     }
+    __atomic_store_n(&e->keyepoch, 0ULL, __ATOMIC_RELEASE);
     n = (retired_node_t *)malloc(sizeof(*n));
     if (n == NULL) {
         /* OOM: leak the mapping rather than unmapping live code. */
@@ -452,16 +453,9 @@ ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc)
     ppc32_block_t *e;
 
     (void)pthread_mutex_lock(&s_cache_lock);
-    reg_ctx_locked(ctx, cache_epoch_load());
     e = lookup_valid_locked(pc);
     if (e != NULL) {
         if (!snapshot_clean(ctx, e)) {
-            /* Guest bytes changed under this block (store via the
-             * interpreter, difftest restore, or any out-of-band
-             * write): evict eagerly and report a miss so the caller
-             * retranslates the fresh bytes. Chained entries cannot
-             * reach here stale: native stores hook ppc32_smc_store
-             * before any chained re-entry. */
             uint32_t rs = (uint32_t)e->pad0[1];
             uint32_t re = (uint32_t)e->pad0[2];
 
@@ -558,6 +552,16 @@ ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
             cache_epoch_bump();
             cur = cache_epoch_load();
             retire_block_locked(old, cur);
+            for (i = 0U; i < PPC32_DBT_HT_SIZE; i++) {
+                ppc32_block_t *o = s_table[i];
+
+                if (o != NULL && o->occupied &&
+                    o->pagever == s_page_ver[o->guest_pc >> 12U]) {
+                    __atomic_store_n(&o->keyepoch,
+                        (uint64_t)o->guest_pc | ((uint64_t)cur << 32U),
+                        __ATOMIC_RELEASE);
+                }
+            }
             reclaim_retired_locked(cur);
             sever_ctx_range(ctx, old_pc, old_pc + 4U);
         } else {
@@ -672,6 +676,10 @@ static void invalidate_range_skip_locked(ppc32_ctx_t *ctx, uint32_t start,
             sever_links_to(e);
             s_table[i] = NULL;
             retire_block_locked(e, cur);
+        } else if (e->pagever == s_page_ver[e->guest_pc >> 12U]) {
+            __atomic_store_n(&e->keyepoch,
+                (uint64_t)e->guest_pc | ((uint64_t)cur << 32U),
+                __ATOMIC_RELEASE);
         }
     }
     if (skip != NULL && (uint32_t)skip->pad0[1] < end &&
@@ -698,6 +706,7 @@ static void invalidate_range_skip_locked(ppc32_ctx_t *ctx, uint32_t start,
         }
     }
     sever_ctx_range(ctx, start, end);
+    reg_ctx_locked(ctx, cur);
     reclaim_retired_locked(cur);
     if (ctx != NULL) {
         ctx->icache_flushes++;
@@ -721,57 +730,24 @@ void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
 /* P32-R6-1: flush this ctx's IBTC/RAS when its entries predate the
  * current generation. Other threads' invalidations bump g_cache_epoch
  * without touching this ctx, so the dispatch loop calls this before
- * every lookup; entries filled by ibtc_fill carry the epoch sampled
- * under lock, and any mismatch retires the whole local cache. */
+ * every lookup. */
 void ppc32_cache_sync_ctx(ppc32_ctx_t *ctx)
 {
     uint32_t cur;
-    size_t i;
-    bool stale = false;
 
     if (ctx == NULL) {
         return;
     }
     cur = cache_epoch_load();
-    (void)pthread_mutex_lock(&s_cache_lock);
-    reg_ctx_locked(ctx, cur);
-    (void)pthread_mutex_unlock(&s_cache_lock);
-    for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
-        ppc32_ibtc_entry_t *s = &ctx->ibtc[i];
-
-        if (s->entry != NULL && s->epoch != cur) {
-            stale = true;
-            break;
-        }
-    }
-    if (!stale) {
-        for (i = 0U; i < PPC32_RAS_SIZE; i++) {
-            ppc32_ibtc_entry_t *s = &ctx->ras[i];
-
-            if (s->entry != NULL && s->epoch != cur) {
-                stale = true;
-                break;
-            }
-        }
-    }
-    if (!stale) {
+    if (ctx->ibtc_synced_epoch == cur) {
         return;
     }
-    for (i = 0U; i < PPC32_IBTC_SIZE; i++) {
-        ctx->ibtc[i].key = 0U;
-        ctx->ibtc[i].epoch = 0U;
-        ctx->ibtc[i].host_code = NULL;
-        ctx->ibtc[i].entry = NULL;
-        ctx->ibtc[i].pad = 0U;
-    }
-    for (i = 0U; i < PPC32_RAS_SIZE; i++) {
-        ctx->ras[i].key = 0U;
-        ctx->ras[i].epoch = 0U;
-        ctx->ras[i].host_code = NULL;
-        ctx->ras[i].entry = NULL;
-        ctx->ras[i].pad = 0U;
-    }
+    memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+    memset(ctx->ras, 0, sizeof(ctx->ras));
     ctx->ras_top = 0U;
+    (void)pthread_mutex_lock(&s_cache_lock);
+    reg_ctx_locked(ctx, cache_epoch_load());
+    (void)pthread_mutex_unlock(&s_cache_lock);
 }
 
 /* H1 SMC post-store hook (called from JIT-emitted code right after a
