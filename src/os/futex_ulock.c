@@ -126,7 +126,7 @@ long ppc32_futex_emul(int32_t *uaddr, uint32_t op, int32_t val,
         }
         if (__ulock_wait2((uint32_t)ULOCK_COMPARE_AND_WAIT,
                 (void *)uaddr, (uint64_t)(uint32_t)val, timeout_ns,
-                0ULL) != 0) {
+                0ULL) < 0) {
             return ul_errno();
         }
         return 0L;
@@ -138,17 +138,19 @@ long ppc32_futex_emul(int32_t *uaddr, uint32_t op, int32_t val,
         if (uaddr == NULL || count < 0) {
             return -UL_LINUX_EINVAL;
         }
-        if (count >= 2147483647LL) {
+        if (count == 0) {
+            return 0L;
+        }
+        if (count > 1LL) {
             wake_op |= (uint32_t)ULOCK_WAKE_ALL;
         }
-        if (__ulock_wake(wake_op, (void *)uaddr,
-                (uint64_t)(uint32_t)count) != 0) {
+        if (__ulock_wake(wake_op, (void *)uaddr, 0ULL) < 0) {
             if (errno == ENOENT) {
                 return 0L;
             }
             return ul_errno();
         }
-        return 0L;
+        return 1L;
     }
     if (cmd == PPC32_FUTEX_REQUEUE || cmd == PPC32_FUTEX_CMP_REQUEUE) {
         long woken;

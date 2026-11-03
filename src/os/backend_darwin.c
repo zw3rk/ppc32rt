@@ -543,7 +543,7 @@ int64_t rt_host_futex_wait(_Atomic uint32_t *pinned_host_uaddr,
         atomic_store_explicit(&ws->ulock_wait_addr, (uintptr_t)0,
             memory_order_seq_cst);
     }
-    if (r != 0) {
+    if (r < 0) {
         return (int64_t)-errno;
     }
     return 0;
@@ -564,7 +564,8 @@ int64_t rt_host_futex_wake(_Atomic uint32_t *pinned_host_uaddr,
     if (wake == NULL) {
         return 0;
     }
-    (void)wake(PPC32_ULF_WAKE_ALL, (void *)pinned_host_uaddr, 0ULL);
+    (void)wake(PPC32_UL_COMPARE_AND_WAIT | PPC32_ULF_WAKE_ALL,
+        (void *)pinned_host_uaddr, 0ULL);
     return (int64_t)count;
 #else
     (void)pinned_host_uaddr; (void)key; (void)count; (void)bitset;
