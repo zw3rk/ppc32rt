@@ -541,6 +541,10 @@ static int ei_bcxr(a64_buf_t *b, const ppc32_insn_t *in, uint32_t pc,
     if ((in->raw & 1U) != 0U) {
         ei_store_lr(b, next);
     }
+    /* P32-R8-1: LR/CTR may carry low bits (odd LR via mtspr); the oracle
+     * masks every indirect target (branch_to: nip = target & ~3). */
+    a64_emit_mov_imm32(b, EI_T2, 0xFFFFFFFCU);
+    a64_emit_and_reg_w(b, false, A64_TMP0, A64_TMP0, EI_T2, A64_SHIFT_LSL, 0U);
     a64_emit_exit_branch_reg(b, A64_TMP0);
     return PPC32_EMIT_END;
 }
