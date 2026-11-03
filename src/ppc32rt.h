@@ -27,10 +27,45 @@
 #define PPC32_REG_TP  2U  /* r2 = TLS thread pointer (E06; PPC64 r13 does not apply) */
 #define PPC32_REG_R13 13U /* r13 = small-data area (classic ABI) */
 
-/* SPR numbers used by mfspr/mtspr (Book I). */
+/* SPR numbers used by mfspr/mtspr (Book I) and mftb (Book II). */
 #define PPC32_SPR_XER 1U
 #define PPC32_SPR_LR  8U
 #define PPC32_SPR_CTR 9U
+#define PPC32_SPR_SPEFSCR 512U
+/* e500v2 SPEFSCR (P32-R7-13; EREF/SPEPEM Table 2-35, PSIM
+ * e500_registers.h): sticky status, current-op status, enables, and the
+ * 2-bit FRMC rounding field (00 nearest, 01 zero, 10 +inf, 11 -inf).
+ * MODE and the three reserved bits are not writable. */
+#define SPE_SOVH  0x80000000u
+#define SPE_OVH   0x40000000u
+#define SPE_FGH   0x20000000u
+#define SPE_FXH   0x10000000u
+#define SPE_FINVH 0x08000000u
+#define SPE_FDBZH 0x04000000u
+#define SPE_FUNFH 0x02000000u
+#define SPE_FOVFH 0x01000000u
+#define SPE_FINXS 0x00200000u
+#define SPE_FINVS 0x00100000u
+#define SPE_FDBZS 0x00080000u
+#define SPE_FUNFS 0x00040000u
+#define SPE_FOVFS 0x00020000u
+#define SPE_MODE  0x00010000u
+#define SPE_SOV   0x00008000u
+#define SPE_OV    0x00004000u
+#define SPE_FG    0x00002000u
+#define SPE_FX    0x00001000u
+#define SPE_FINV  0x00000800u
+#define SPE_FDBZ  0x00000400u
+#define SPE_FUNF  0x00000200u
+#define SPE_FOVF  0x00000100u
+#define SPE_FINXE 0x00000080u
+#define SPE_FINVE 0x00000040u
+#define SPE_FDBZE 0x00000020u
+#define SPE_FUNFE 0x00000010u
+#define SPE_FOVFE 0x00000008u
+#define SPE_FRMC  0x00000003u
+#define SPE_WRITABLE (0xffffffffu & ~(0x00800000u | 0x00400000u | \
+    0x00010000u | 0x00000080u))
 #define PPC32_SPR_PVR 287U
 /* PVR values reported per profile (match the qemu-ppc oracle CPUs). */
 #define PPC32_PVR_750    0x00080301U /* 750_v3.1 */

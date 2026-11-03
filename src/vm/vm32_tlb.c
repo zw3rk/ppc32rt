@@ -46,6 +46,10 @@ static vm32_tlb_entry_t g_tlb[VM32_TLB_SIZE];
 static uint8_t g_page_prot[VM32_PAGE_COUNT];
 static uint8_t g_page_state[VM32_PAGE_COUNT];
 static uint8_t g_page_flags[VM32_PAGE_COUNT];
+/* P32-R7-3: guest execute permission per 4 KiB page (1 = may fetch).
+ * Recorded from the prot EXEC bit alongside the R/W mapping; the host
+ * data mapping itself never carries PROT_EXEC (W^X). */
+static uint8_t g_page_exec[VM32_PAGE_COUNT];
 static _Atomic uint32_t g_tlb_lock = 0U;
 
 static void tlb_lock(void)
@@ -275,6 +279,7 @@ void vm32_tlb_invalidate_all(void)
     (void)memset(g_page_prot, 0, sizeof g_page_prot);
     (void)memset(g_page_state, 0, sizeof g_page_state);
     (void)memset(g_page_flags, 0, sizeof g_page_flags);
+    (void)memset(g_page_exec, 0, sizeof g_page_exec);
     tlb_unlock();
 }
 
@@ -368,12 +373,16 @@ void vm32_record_map(uint32_t start_gva, uint32_t end_gva, uint8_t prot,
     uint32_t vpn;
     uintptr_t base;
 
+    uint8_t exec;
+
     if (state > VM32_PAGE_SHARED) {
         state = (uint8_t)VM32_PAGE_ANON;
     }
     if (!clamp_range(start_gva, end_gva, &first, &last)) {
         return;
     }
+    /* P32-R7-3: EXEC is preserved separately before the R/W mask. */
+    exec = (uint8_t)(((uint32_t)prot & (uint32_t)PROT_EXEC) != 0U);
     prot = (uint8_t)((uint32_t)prot &
         ((uint32_t)PROT_READ | (uint32_t)PROT_WRITE));
     base = vm32_arena_base();
@@ -381,6 +390,7 @@ void vm32_record_map(uint32_t start_gva, uint32_t end_gva, uint8_t prot,
     for (vpn = first; vpn < last; vpn++) {
         g_page_prot[vpn] = prot;
         g_page_state[vpn] = state;
+        g_page_exec[vpn] = exec;
         tlb_refresh_slot_locked(vpn, base);
     }
     tlb_unlock();
@@ -393,16 +403,19 @@ void vm32_record_protect(uint32_t start_gva, uint32_t end_gva,
     uint32_t last;
     uint32_t vpn;
     uintptr_t base;
+    uint8_t exec;
 
     if (!clamp_range(start_gva, end_gva, &first, &last)) {
         return;
     }
+    exec = (uint8_t)(((uint32_t)prot & (uint32_t)PROT_EXEC) != 0U);
     prot = (uint8_t)((uint32_t)prot &
         ((uint32_t)PROT_READ | (uint32_t)PROT_WRITE));
     base = vm32_arena_base();
     tlb_lock();
     for (vpn = first; vpn < last; vpn++) {
         g_page_prot[vpn] = prot;
+        g_page_exec[vpn] = exec;
         tlb_refresh_slot_locked(vpn, base);
     }
     tlb_unlock();
@@ -427,6 +440,7 @@ void vm32_mark_eof_trap(uint32_t start_gva, uint32_t end_gva)
     for (vpn = first; vpn < last; vpn++) {
         g_page_prot[vpn] = 0U;
         g_page_state[vpn] = (uint8_t)VM32_PAGE_EOF_TRAP;
+        g_page_exec[vpn] = 0U;
         tlb_refresh_slot_locked(vpn, base);
     }
     tlb_unlock();
@@ -450,6 +464,21 @@ bool vm32_page_is_eof_trap(uint32_t gva)
     return trapped;
 }
 
+/* P32-R7-3: guest execute permission for one VA (page-granular). */
+bool vm32_page_is_exec(uint32_t gva)
+{
+    uint32_t vpn = gva >> 12U;
+    bool exec;
+
+    if (vpn >= VM32_PAGE_COUNT) {
+        return false;
+    }
+    tlb_lock();
+    exec = g_page_exec[vpn] != 0U;
+    tlb_unlock();
+    return exec;
+}
+
 void vm32_record_unmap(uint32_t start_gva, uint32_t end_gva)
 {
     uint32_t first;
@@ -465,6 +494,7 @@ void vm32_record_unmap(uint32_t start_gva, uint32_t end_gva)
     for (vpn = first; vpn < last; vpn++) {
         g_page_prot[vpn] = 0U;
         g_page_state[vpn] = (uint8_t)VM32_PAGE_UNMAPPED;
+        g_page_exec[vpn] = 0U;
         tlb_refresh_slot_locked(vpn, base);
     }
     tlb_unlock();

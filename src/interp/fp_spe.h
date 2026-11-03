@@ -9,111 +9,237 @@
 #ifndef PPC32_FP_SPE_H
 #define PPC32_FP_SPE_H
 
-/* SPE converts (qemu helpers/macros; nearest-always; silent). single
- * ct*: QNaN->0 else invalid->max; double ct*: any-NaN->0. Fractional
- * x2^32. Scalar cf* yield 32-bit singles, efdcf* 64-bit doubles,
- * efscfd narrows a double to a single in lo, efdcfs widens a single
- * to a double. op: 0 ctsi, 1 ctui, 2 ctsiz, 3 ctuiz, 4 ctsf, 5 ctuf,
+/* SPE converts (qemu helpers/macros). single ct*: QNaN->0 else
+ * invalid->max; double ct*: any-NaN->0. P32-R7-11: signed fractions
+ * scale by 2^31, unsigned by 2^32. P32-R7-13: FRMC rounding applies
+ * (non-z forms round per FRMC, z forms truncate) and sticky status
+ * (FINV on NaN/range failure, FINXS on inexact) is recorded.
+ * Scalar cf* yield 32-bit singles, efdcf* 64-bit doubles, efscfd
+ * narrows a double to a single in lo, efdcfs widens a single to a
+ * double. op: 0 ctsi, 1 ctui, 2 ctsiz, 3 ctuiz, 4 ctsf, 5 ctuf,
  * 6 cfsi, 7 cfui, 8 cfsf, 9 cfuf, 10 cfd/cfs. Callers write lo-only
  * for 32-bit-out (hi preserved via split storage). */
-static inline uint64_t fp_spe_cvt(uint64_t in, int op, int is_dbl_in)
+static inline uint64_t fp_spe_cvt(ppc32_ctx_t *ctx, uint64_t in, int op,
+    int is_dbl_in)
 {
+    int old = fegetround();
+
     if (!is_dbl_in) {
         uint32_t v = (uint32_t)in;
         float f = fp_f32(v);
+        uint64_t r;
 
         if (op <= 5) {
-            if (fp_snan(v) && ((v >> 22) & 1u) != 0u) {
-                return 0u; /* single QNaN input converts to 0 */
-            }
-            if (op == 0) {
-                return (uint64_t)(uint32_t)fp_f2i(f, 0);
-            }
-            if (op == 1) {
-                return (uint64_t)(uint32_t)fp_f2u(f, 0);
-            }
-            if (op == 2) {
-                return (uint64_t)(uint32_t)fp_f2i(f, 1);
-            }
-            if (op == 3) {
-                return (uint64_t)(uint32_t)fp_f2u(f, 1);
+            int z = (op == 2 || op == 3);
+            int is_signed = (op == 0 || op == 2 || op == 4);
+            float s = f;
+            float rr;
+
+            if (fp_snan(v)) {
+                spe_raise(ctx, SPE_FINV | SPE_FINVS);
+                if (((v >> 22) & 1u) != 0u) {
+                    fesetround(old);
+                    return 0u; /* single QNaN input converts to 0 */
+                }
             }
             if (op == 4) {
-                return (uint64_t)(uint32_t)fp_f2i(f * 4294967296.0f, 0);
+                s = f * 2147483648.0f;
+            } else if (op == 5) {
+                s = f * 4294967296.0f;
             }
-            return (uint64_t)(uint32_t)fp_f2u(f * 4294967296.0f, 0);
+            if (is_signed) {
+                if (s >= 2147483648.0f || s < -2147483648.0f) {
+                    spe_raise(ctx, SPE_FINV | SPE_FINVS);
+                }
+            } else if (s >= 4294967296.0f || s < 0.0f) {
+                spe_raise(ctx, SPE_FINV | SPE_FINVS);
+            }
+            spe_setrn(ctx);
+            rr = z ? truncf(s) : rintf(s);
+            if (rr != s && !fp_snan(v)) {
+                spe_raise(ctx, SPE_FINXS);
+            }
+            if (op == 0 || op == 2 || op == 4) {
+                r = (uint64_t)(uint32_t)fp_f2i(s, z);
+            } else {
+                r = (uint64_t)(uint32_t)fp_f2u(s, z);
+            }
+            fesetround(old);
+            return r;
         }
         if (op <= 9) {
+            float t;
+
+            spe_setrn(ctx);
+            feclearexcept(FE_ALL_EXCEPT);
             if (op == 6) {
-                return fp_u32((float)(int32_t)v);
+                t = (float)(int32_t)v;
+            } else if (op == 7) {
+                t = (float)v;
+            } else if (op == 8) {
+                t = (float)(int32_t)v / 2147483648.0f;
+            } else {
+                t = (float)v / 4294967296.0f;
             }
-            if (op == 7) {
-                return fp_u32((float)v);
-            }
-            if (op == 8) {
-                return fp_u32((float)(int32_t)v / 4294967296.0f);
-            }
-            return fp_u32((float)v / 4294967296.0f);
+            spe_flags(ctx);
+            r = fp_u32(t);
+            fesetround(old);
+            return r;
         }
         if (fp_snan(v) && ((v >> 22) & 1u) == 0u) {
+            spe_raise(ctx, SPE_FINV | SPE_FINVS);
             v |= 0x400000u;
         }
+        fesetround(old);
         return fp_xtod(v);
     }
     {
         double d = fp_f64(in);
+        uint64_t r;
 
         if (op <= 5) {
-            if (fp_isnan(in)) return 0u;
-            if (op == 0) {
-                return (uint64_t)(uint32_t)fp_d2i(d, 0);
-            }
-            if (op == 1) {
-                return (uint64_t)(uint32_t)fp_d2u(d, 0);
-            }
-            if (op == 2) {
-                return (uint64_t)(uint32_t)fp_d2i(d, 1);
-            }
-            if (op == 3) {
-                return (uint64_t)(uint32_t)fp_d2u(d, 1);
+            int z = (op == 2 || op == 3);
+            int is_signed = (op == 0 || op == 2 || op == 4);
+            double s = d;
+            double rr;
+
+            if (fp_isnan(in)) {
+                spe_raise(ctx, SPE_FINV | SPE_FINVS);
+                fesetround(old);
+                return 0u;
             }
             if (op == 4) {
-                return (uint64_t)(uint32_t)fp_d2i(d * 4294967296.0, 0);
+                s = d * 2147483648.0;
+            } else if (op == 5) {
+                s = d * 4294967296.0;
             }
-            return (uint64_t)(uint32_t)fp_d2u(d * 4294967296.0, 0);
+            if (is_signed) {
+                if (s >= 2147483648.0 || s < -2147483648.0) {
+                    spe_raise(ctx, SPE_FINV | SPE_FINVS);
+                }
+            } else if (s >= 4294967296.0 || s < 0.0) {
+                spe_raise(ctx, SPE_FINV | SPE_FINVS);
+            }
+            spe_setrn(ctx);
+            rr = z ? trunc(s) : rint(s);
+            if (rr != s) {
+                spe_raise(ctx, SPE_FINXS);
+            }
+            if (is_signed) {
+                r = (uint64_t)(uint32_t)fp_d2i(s, z);
+            } else {
+                r = (uint64_t)(uint32_t)fp_d2u(s, z);
+            }
+            fesetround(old);
+            return r;
         }
         if (op <= 9) {
+            double t;
+
+            spe_setrn(ctx);
+            feclearexcept(FE_ALL_EXCEPT);
             if (op == 6) {
-                return fp_u64((double)(int32_t)(uint32_t)in);
+                t = (double)(int32_t)(uint32_t)in;
+            } else if (op == 7) {
+                t = (double)(uint32_t)in;
+            } else if (op == 8) {
+                t = (double)(int32_t)(uint32_t)in / 2147483648.0;
+            } else {
+                t = (double)(uint32_t)in / 4294967296.0;
             }
-            if (op == 7) {
-                return fp_u64((double)(uint32_t)in);
-            }
-            if (op == 8) {
-                return fp_u64((double)(int32_t)(uint32_t)in / 4294967296.0);
-            }
-            return fp_u64((double)(uint32_t)in / 4294967296.0);
+            spe_flags(ctx);
+            r = fp_u64(t);
+            fesetround(old);
+            return r;
         }
         {
             uint32_t w;
 
             if (fp_isnan(in)) {
+                if ((in & 0x8000000000000ull) == 0u) {
+                    spe_raise(ctx, SPE_FINV | SPE_FINVS);
+                }
                 w = (uint32_t)(((in >> 29) & 0x7fffffu) | 0x7f800000u |
                     ((in >> 63) << 31) | 0x400000u);
+                fesetround(old);
             } else {
-                w = fp_u32((float)d);
+                float t;
+
+                spe_setrn(ctx);
+                feclearexcept(FE_ALL_EXCEPT);
+                t = (float)d;
+                spe_flags(ctx);
+                w = fp_u32(t);
+                fesetround(old);
             }
             return (uint64_t)w;
         }
     }
 }
 
+/* Saturating signed 32-bit lane add (P32-R7-10 `sat` forms; P32-R7-13
+ * records lane overflow in SPEFSCR). */
+static inline uint32_t fp_mac_sat_add(ppc32_ctx_t *ctx, uint32_t x,
+    uint32_t y, int high)
+{
+    int64_t sum = (int64_t)(int32_t)x + (int64_t)(int32_t)y;
+
+    if (sum > 2147483647ll) {
+        spe_raise(ctx, high ? (SPE_SOVH | SPE_OVH) : (SPE_SOV | SPE_OV));
+        return 0x7fffffffu;
+    }
+    if (sum < -2147483648ll) {
+        spe_raise(ctx, high ? (SPE_SOVH | SPE_OVH) : (SPE_SOV | SPE_OV));
+        return 0x80000000u;
+    }
+    return (uint32_t)(int32_t)sum;
+}
+
+/* One whole-word MAC lane (P32-R7-10): the lane's own 32x32 product is
+ * formed (never the neighbor lane's); fractional products scale by
+ * >>31 with the -1*-1 special case, integer products select the high
+ * (MWH) or low (MWL) 32 bits. Saturation records lane overflow. */
+static inline uint32_t fp_mac_lane(ppc32_ctx_t *ctx, uint64_t prod, int f,
+    int sat, int high)
+{
+    uint32_t ov = high ? (SPE_SOVH | SPE_OVH) : (SPE_SOV | SPE_OV);
+
+    if (f) {
+        if (prod == 0x4000000000000000ull) {
+            if (sat) {
+                spe_raise(ctx, ov);
+                return 0x7fffffffu;
+            }
+            return 0x80000000u;
+        }
+        {
+            int64_t t = (int64_t)prod >> 31;
+
+            if (sat) {
+                if (t > 2147483647ll) {
+                    spe_raise(ctx, ov);
+                    return 0x7fffffffu;
+                }
+                if (t < -2147483648ll) {
+                    spe_raise(ctx, ov);
+                    return 0x80000000u;
+                }
+            }
+            return (uint32_t)(int32_t)t;
+        }
+    }
+    return high ? (uint32_t)(prod >> 32) : (uint32_t)prod;
+}
+
 /* SPE MAC (EREF-best-effort; qemu-ppc SIGILLs all MAC, unverifiable
- * via oracle. Whole-word: LOW words 32x32->64; even/odd: halfword
- * pairs. s=signed, f=fractional, a=accum-rD-lo, c=accum-via-ACC,
- * t=saturate, h=high-32 (else low-32). Fractional high = prod>>31;
- * -1*-1 wraps or saturates. Whole-word zeroes rD.hi; halfword is
- * full 64-bit. evmra (rD=rA, ACC=rA) matches qemu. */
+ * via oracle. Whole-word ops work per 32-bit lane (high word halves
+ * and low word halves independently); s=signed, f=fractional,
+ * acc=accumulate into rD lanes (and ACC), acp=accumulate into ACC
+ * with rD=ACC, sat=saturate, high=high-32 (else low-32),
+ * half=guarded-halfword, odd=odd halves (else even). Guarded ops
+ * sign/zero-extend the selected halfword products into one 64-bit
+ * sum accumulated into ACC (rD=ACC). evmra (rD=rA, ACC=rA) matches
+ * qemu. */
 static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
     uint64_t d, int s, int f, int acc, int acp, int sat, int high, int half,
     int odd)
@@ -123,61 +249,76 @@ static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
         uint32_t a1 = (uint32_t)((a >> (odd ? 0u : 16u)) & 0xffffu);
         uint32_t b0 = (uint32_t)((b >> (odd ? 32u : 48u)) & 0xffffu);
         uint32_t b1 = (uint32_t)((b >> (odd ? 0u : 16u)) & 0xffffu);
-        uint32_t p0 = s ? (uint32_t)((int32_t)(int16_t)a0 *
-            (int32_t)(int16_t)b0) : a0 * b0;
-        uint32_t p1 = s ? (uint32_t)((int32_t)(int16_t)a1 *
-            (int32_t)(int16_t)b1) : a1 * b1;
-        uint64_t cat = ((uint64_t)p0 << 32) | p1;
+        uint64_t sum;
 
-        if (acp) {
-            cat += ctx->acc;
-            ctx->acc = cat;
-            return cat;
+        if (s) {
+            int64_t p0 = (int64_t)(int32_t)(int16_t)a0 *
+                (int64_t)(int32_t)(int16_t)b0;
+            int64_t p1 = (int64_t)(int32_t)(int16_t)a1 *
+                (int64_t)(int32_t)(int16_t)b1;
+
+            sum = (uint64_t)(p0 + p1);
+        } else {
+            sum = (uint64_t)(a0 * b0) + (uint64_t)(a1 * b1);
         }
-        return ((uint64_t)(p0 + (uint32_t)(d >> 32)) << 32) |
-            (uint64_t)(p1 + (uint32_t)d);
+        if (acp) {
+            ctx->acc += sum;
+            return ctx->acc;
+        }
+        {
+            uint32_t p0 = s ? (uint32_t)((int32_t)(int16_t)a0 *
+                (int32_t)(int16_t)b0) : a0 * b0;
+            uint32_t p1 = s ? (uint32_t)((int32_t)(int16_t)a1 *
+                (int32_t)(int16_t)b1) : a1 * b1;
+
+            return ((uint64_t)(p0 + (uint32_t)(d >> 32)) << 32) |
+                (uint64_t)(p1 + (uint32_t)d);
+        }
     }
     {
-        uint64_t prod = s ? (uint64_t)((int64_t)(int32_t)(uint32_t)a *
-            (int64_t)(int32_t)(uint32_t)b) : (uint64_t)(uint32_t)a *
-            (uint64_t)(uint32_t)b;
-        uint32_t sel;
+        uint32_t ah = (uint32_t)(a >> 32);
+        uint32_t al = (uint32_t)a;
+        uint32_t bh = (uint32_t)(b >> 32);
+        uint32_t bl = (uint32_t)b;
+        uint64_t ph = s ? (uint64_t)((int64_t)(int32_t)ah *
+            (int64_t)(int32_t)bh) : (uint64_t)ah * (uint64_t)bh;
+        uint64_t pl = s ? (uint64_t)((int64_t)(int32_t)al *
+            (int64_t)(int32_t)bl) : (uint64_t)al * (uint64_t)bl;
+        uint32_t selh = fp_mac_lane(ctx, ph, f, sat, high);
+        uint32_t sell = fp_mac_lane(ctx, pl, f, sat, high);
+        uint64_t res = ((uint64_t)selh << 32) | sell;
 
-        if (f) {
-            if (prod == 0x4000000000000000ull) {
-                sel = sat ? 0x7fffffffu : 0x80000000u;
-            } else {
-                sel = (uint32_t)((prod >> 31) & 0xffffffffu);
-            }
-        } else {
-            sel = high ? (uint32_t)(prod >> 32) : (uint32_t)prod;
-        }
         if (acp) {
-            uint64_t old = ctx->acc;
+            if (sat) {
+                uint64_t sh = (uint64_t)(uint32_t)(ctx->acc >> 32) + selh;
+                uint64_t sl = (uint64_t)(uint32_t)ctx->acc + sell;
 
-            ctx->acc += prod;
-            if (sat && ctx->acc < old) {
-                return 0xffffffffu;
+                if (sh > 0xffffffffull) {
+                    spe_raise(ctx, SPE_SOVH | SPE_OVH);
+                }
+                if (sl > 0xffffffffull) {
+                    spe_raise(ctx, SPE_SOV | SPE_OV);
+                }
+                ctx->acc = ((sh > 0xffffffffull ? 0xffffffffull : sh)
+                    << 32) | (sl > 0xffffffffull ? 0xffffffffu :
+                    (uint32_t)sl);
+            } else {
+                ctx->acc += res;
             }
-            return (uint64_t)(high ? (uint32_t)(ctx->acc >> 32) :
-                (uint32_t)ctx->acc);
+            return ctx->acc;
         }
         if (acc) {
-            if (sat) {
-                int64_t sum = (int64_t)(int32_t)sel +
-                    (int64_t)(int32_t)(uint32_t)d;
+            uint32_t dh = (uint32_t)(d >> 32);
+            uint32_t dl = (uint32_t)d;
+            uint32_t rh = sat ? fp_mac_sat_add(ctx, dh, selh, 1) :
+                dh + selh;
+            uint32_t rl = sat ? fp_mac_sat_add(ctx, dl, sell, 0) :
+                dl + sell;
 
-                if (sum > 2147483647ll) {
-                    return 0x7fffffffu;
-                }
-                if (sum < -2147483648ll) {
-                    return 0x80000000u;
-                }
-                return (uint64_t)(uint32_t)(int32_t)sum;
-            }
-            sel += (uint32_t)d;
+            ctx->acc += res;
+            return ((uint64_t)rh << 32) | rl;
         }
-        return (uint64_t)sel;
+        return res;
     }
 }
 

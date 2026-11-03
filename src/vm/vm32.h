@@ -202,9 +202,22 @@ void vm32_reservation_bump(uint32_t gva_aligned);
 
 /* Invalidate every 64-byte LL/SC bucket spanned by [ea, ea + len)
  * (src/interp/llsc.c): a wide store must kill middle-bucket
- * reservations too, not just the first and last lines. */
+ * reservations too, not just the first and last lines. The _locked
+ * variant assumes the caller holds the LL lock. */
 void vm32_store_invalidate_range(uint32_t ea, uint32_t len);
+void vm32_store_invalidate_range_locked(uint32_t ea, uint32_t len);
 void vm32_ll_unlock_if_held_by_self(void);
+
+/* LL/SC table lock (P32-R7-4): the interpreter store path holds this
+ * across its guest write + invalidation so the pair is indivisible
+ * against stwcx. validation/write. Lock order is VM -> LL. */
+void vm32_ll_lock(void);
+void vm32_ll_unlock(void);
+
+/* Guest execute permission (P32-R7-3): tracked per 4 KiB page from the
+ * recorded prot's EXEC bit, separately from the host data mapping
+ * (which never carries PROT_EXEC). Instruction fetch requires it. */
+bool vm32_page_is_exec(uint32_t gva);
 
 /* Fork coordination (P32-R3-4): the parent holds the LL/SC reservation
  * lock across the snapshot; the child drops the inherited locked value

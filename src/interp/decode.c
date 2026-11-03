@@ -484,6 +484,11 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         out->op = (uint32_t)PPC32_OP_MFSPR;
         out->ui = (rb << 5u) | ((raw >> 16u) & 31u);
         return 0;
+    case 371u: /* mftb (P32-R7-24): same XFX TBR field as mfspr; the
+        * interpreter serves TB/TBU (268/269) from the guest clock */
+        out->op = (uint32_t)PPC32_OP_MFSPR;
+        out->ui = (rb << 5u) | ((raw >> 16u) & 31u);
+        return 0;
     case 343u:
         out->op = (uint32_t)PPC32_OP_LHAX;
         return 0;

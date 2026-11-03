@@ -56,6 +56,23 @@ void vm32_ll_unlock_if_held_by_self(void)
     }
 }
 
+/* P32-R7-4: ordinary (invalidating) stores serialize against the whole
+ * SC validation/write. The interpreter's st* path holds this lock
+ * across its guest write + invalidation (see store_commit in
+ * interp.h); lock-free atomic bumps alone cannot close the
+ * validate-then-CAS race. Lock order is VM -> LL everywhere (the SC
+ * path takes LL under the VM lock); the shared-file fan-out takes the
+ * VM lock only after LL is released, so no inversion is possible. */
+void vm32_ll_lock(void)
+{
+    ll_lock_acquire();
+}
+
+void vm32_ll_unlock(void)
+{
+    ll_lock_release();
+}
+
 /* Fork coordination (P32-R3-4): hold the reservation lock across the
  * snapshot in the parent; the child drops the inherited locked value
  * and clears the copied thread-local held flag. */
@@ -141,15 +158,19 @@ bool vm32_sc_attempt(ppc32_ctx_t *ctx, uint32_t gva_aligned, uint32_t val)
 /* Store hook: bump the line epoch so a peer stwcx. on the line fails. */
 void vm32_reservation_bump(uint32_t gva_aligned)
 {
+    ll_lock_acquire();
     __atomic_fetch_add(&g_ll_table[((gva_aligned & ~3U) >> 6U) & 1023U].epoch, 1ULL,
         __ATOMIC_SEQ_CST);
+    ll_lock_release();
 }
 
 /* Invalidate every 64-byte LL/SC bucket spanned by [ea, ea + len): a
  * wide store must kill middle-bucket reservations too, not just the
  * first and last lines. 32-bit EA wrap is honored by unsigned
- * arithmetic. Runs without the table lock (fetch_add is atomic). */
-void vm32_store_invalidate_range(uint32_t ea, uint32_t len)
+ * arithmetic. The _locked variant assumes the caller holds the LL
+ * lock (the interpreter store path, which keeps its guest write and
+ * invalidation indivisible); the public entry takes the lock. */
+void vm32_store_invalidate_range_locked(uint32_t ea, uint32_t len)
 {
     uint64_t end;
     uint32_t first;
@@ -174,4 +195,11 @@ void vm32_store_invalidate_range(uint32_t ea, uint32_t len)
         }
         line++;
     }
+}
+
+void vm32_store_invalidate_range(uint32_t ea, uint32_t len)
+{
+    ll_lock_acquire();
+    vm32_store_invalidate_range_locked(ea, len);
+    ll_lock_release();
 }

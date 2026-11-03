@@ -42,6 +42,11 @@ void interp_step(ppc32_ctx_t *ctx)
     }
     if (!interp_mem_ok(ctx->nip, 4U)) { fault(ctx, ctx->nip); return; }
     raw = fetch_raw(ctx);
+    /* P32-R7-2: a faulting fetch records FAULT; never decode the
+     * placeholder word into a spurious UNDEF. */
+    if (ctx->exit_reason != PPC32_EXIT_NONE) {
+        return;
+    }
     (void)ppc_decode(raw, &insn);
 
     switch (insn.op) {
@@ -569,13 +574,26 @@ void interp_step(ppc32_ctx_t *ctx)
             break;
         }
         if (!interp_mem_ok(ea, (32U - rt) * 4U)) { fault(ctx, ea); break; }
+        /* P32-R7-1: stop at the first failed element; earlier
+         * successful elements stay committed, NIP stays faulting. */
         for (idx = rt; idx < 32U; idx++) {
             if (insn.op == PPC32_OP_LMW) {
-                ctx->gpr[idx] = ld32(ctx, ea);
+                uint32_t v = ld32(ctx, ea);
+
+                if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                    break;
+                }
+                ctx->gpr[idx] = v;
             } else {
                 st32(ctx, ea, ctx->gpr[idx]);
+                if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                    break;
+                }
             }
             ea += 4U;
+        }
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            break;
         }
         ctx->nip += 4U;
         break;
@@ -596,17 +614,24 @@ void interp_step(ppc32_ctx_t *ctx)
             for (i = 0U; i < n; i++) {
                 uint32_t reg = (insn.rt + i / 4U) & 31U;
                 uint32_t shift = (3U - (i % 4U)) * 8U;
+                uint32_t byte;
 
                 if (!have || reg != cur_reg) {
                     if (have) {
                         ctx->gpr[cur_reg] = cur;
                     }
-                    cur = ctx->gpr[reg];
+                    /* P32-R7-16: unfilled bytes clear. */
+                    cur = 0U;
                     cur_reg = reg;
                     have = true;
                 }
-                cur = (cur & ~(0xFFU << shift)) |
-                    ((uint32_t)ld8(ctx, ea + i) << shift);
+                byte = ld8(ctx, ea + i);
+                /* P32-R7-1: stop at the first failed byte. */
+                if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                    have = false;
+                    break;
+                }
+                cur = (cur & ~(0xFFU << shift)) | (byte << shift);
             }
             if (have) {
                 ctx->gpr[cur_reg] = cur;
@@ -618,7 +643,71 @@ void interp_step(ppc32_ctx_t *ctx)
 
                 st8(ctx, ea + i,
                     (uint8_t)((ctx->gpr[reg] >> shift) & 0xFFU));
+                if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                    break;
+                }
             }
+        }
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            break;
+        }
+        ctx->nip += 4U;
+        break;
+    }
+    /* P32-R7-17: indexed string ops (byte count from XER[57:63], EA
+     * from RA/RB, registers wrap past r31, partial final words clear,
+     * faults stop without advancing NIP). A zero count transfers
+     * nothing but still completes. */
+    case PPC32_OP_LSWX:
+    case PPC32_OP_STSWX: {
+        uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) +
+            ctx->gpr[insn.rb];
+        uint32_t n = ctx->xer & 0x7FU;
+        uint32_t i;
+
+        if (!interp_mem_ok(ea, n)) { fault(ctx, ea); break; }
+        if (insn.op == PPC32_OP_LSWX) {
+            uint32_t cur = 0U;
+            uint32_t cur_reg = 0U;
+            bool have = false;
+
+            for (i = 0U; i < n; i++) {
+                uint32_t reg = (insn.rt + i / 4U) & 31U;
+                uint32_t shift = (3U - (i % 4U)) * 8U;
+                uint32_t byte;
+
+                if (!have || reg != cur_reg) {
+                    if (have) {
+                        ctx->gpr[cur_reg] = cur;
+                    }
+                    cur = 0U;
+                    cur_reg = reg;
+                    have = true;
+                }
+                byte = ld8(ctx, ea + i);
+                if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                    have = false;
+                    break;
+                }
+                cur = (cur & ~(0xFFU << shift)) | (byte << shift);
+            }
+            if (have) {
+                ctx->gpr[cur_reg] = cur;
+            }
+        } else {
+            for (i = 0U; i < n; i++) {
+                uint32_t reg = (insn.rs + i / 4U) & 31U;
+                uint32_t shift = (3U - (i % 4U)) * 8U;
+
+                st8(ctx, ea + i,
+                    (uint8_t)((ctx->gpr[reg] >> shift) & 0xFFU));
+                if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                    break;
+                }
+            }
+        }
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            break;
         }
         ctx->nip += 4U;
         break;
@@ -630,15 +719,19 @@ void interp_step(ppc32_ctx_t *ctx)
     case PPC32_OP_STHBRX: {
         uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) +
             ctx->gpr[insn.rb];
+        uint32_t loaded = 0U;
+        bool is_load = false;
 
         switch (insn.op) {
         case PPC32_OP_LWBRX:
             if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
-            ctx->gpr[insn.rt] = ld32r(ctx, ea);
+            loaded = ld32r(ctx, ea);
+            is_load = true;
             break;
         case PPC32_OP_LHBRX:
             if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); break; }
-            ctx->gpr[insn.rt] = ld16r(ctx, ea);
+            loaded = ld16r(ctx, ea);
+            is_load = true;
             break;
         case PPC32_OP_STWBRX:
             if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
@@ -648,6 +741,13 @@ void interp_step(ppc32_ctx_t *ctx)
             if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); break; }
             st16r(ctx, ea, (uint16_t)ctx->gpr[insn.rs]);
             break;
+        }
+        /* P32-R7-1: failed accesses commit nothing and hold NIP. */
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            break;
+        }
+        if (is_load) {
+            ctx->gpr[insn.rt] = loaded;
         }
         ctx->nip += 4U;
         break;
@@ -728,6 +828,13 @@ void interp_step(ppc32_ctx_t *ctx)
         if (!interp_mem_ok(ea, 32U)) { fault(ctx, ea); break; }
         for (i = 0U; i < 32U; i++) {
             st8(ctx, base + i, 0U);
+            /* P32-R7-1: stop at the first failed byte. */
+            if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                break;
+            }
+        }
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            break;
         }
         ctx->nip += 4U;
         break;

@@ -36,38 +36,73 @@ static uint32_t fp_end(int old)
     return st;
 }
 
-/* Invalid-input QNaN result (FR|FI cleared, VX|vx raised). */
+/* FPSCR exception-enable queries (enable bits 7..3 = VE,OE,UE,ZE,XE). */
+static int fp_ve_enabled(const ppc32_ctx_t *ctx)
+{
+    return (int)((ctx->fpscr >> 7) & 1u);
+}
+
+static int fp_ze_enabled(const ppc32_ctx_t *ctx)
+{
+    return (int)((ctx->fpscr >> 4) & 1u);
+}
+
+/* Invalid-input QNaN result (FR|FI cleared, VX|vx raised). P32-R7-7: with
+ * VE set the exception is recorded (VX/FX/FEX via fp_touch, Rc->CR1) but
+ * the destination, FPRF, FR, and FI are left untouched. */
 static void fp_invalid(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
     uint32_t vx, int single)
 {
     uint64_t q = single ? fp_xtod(0x7fc00000u) : 0x7ff8000000000000ull;
+    if (fp_ve_enabled(ctx)) {
+        fp_raise(ctx, vx | F_VX_M);
+        if (insn->rc) fp_cr1(ctx);
+        ctx->nip += 4u;
+        return;
+    }
     ctx->fpscr &= ~(F_FR_M | F_FI_M);
-    fp_flags_arith(ctx, q, 0, 0);
+    fp_flags_arith(ctx, q, 0, 0, single);
     fp_raise(ctx, vx | F_VX_M);
     fp_done(ctx, insn, q);
 }
 
-/* Store quieted NaN; SNaN clears FR and raises VXSNAN|VX. */
+/* Store quieted NaN; SNaN clears FR and raises VXSNAN|VX. P32-R7-7: an
+ * enabled SNaN invalid operation suppresses the destination update. */
 static void fp_nanres(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint64_t n,
     int snan, int single)
 {
     uint64_t q = single ? fp_xtod(fp_qnan32(n)) : n;
+    if (snan && fp_ve_enabled(ctx)) {
+        fp_raise(ctx, F_VXSNAN_M | F_VX_M);
+        if (insn->rc) fp_cr1(ctx);
+        ctx->nip += 4u;
+        return;
+    }
     ctx->fpscr &= ~F_FI_M;
     if (snan) {
         ctx->fpscr &= ~F_FR_M;
         fp_raise(ctx, F_VXSNAN_M | F_VX_M);
     }
-    fp_flags_arith(ctx, q, 0, 0);
+    fp_flags_arith(ctx, q, 0, 0, single);
     fp_done(ctx, insn, q);
+}
+
+/* Enabled zero-divide recording (P32-R7-7): ZX/FX/FEX are raised and
+ * Rc->CR1 applied, but the infinity result is NOT committed. */
+static void fp_zero_divide(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
+{
+    fp_raise(ctx, F_ZX_M);
+    if (insn->rc) fp_cr1(ctx);
+    ctx->nip += 4u;
 }
 
 /* Commit rounded result: INEXACT, sticky bits, restore, store. */
 static void fp_commit(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint64_t r,
-    int old)
+    int old, int single)
 {
     int inexact = fetestexcept(FE_INEXACT) != 0;
     uint32_t st = fp_end(old);
-    fp_flags_arith(ctx, r, inexact, st);
+    fp_flags_arith(ctx, r, inexact, st, single);
     fp_done(ctx, insn, r);
 }
 
@@ -145,10 +180,20 @@ static void fp_arith(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int op,
         int old = fp_begin(ctx);
         float fa = (float)fp_f64(da);
         float fb = (float)fp_f64(db);
-        sub = fp_inv2s(op, fp_u32(fa), fp_u32(fb));
+        uint32_t sa = fp_u32(fa);
+        uint32_t sb = fp_u32(fb);
+        sub = fp_inv2s(op, sa, sb);
         if (sub != 0u) {
             fesetround(old);
             fp_invalid(ctx, insn, sub, 1);
+            return;
+        }
+        /* P32-R7-7: finite-nonzero/single-zero division raises ZX; with
+         * ZE set the infinity result is suppressed. */
+        if (op == 3 && fp_szero(sb) && !fp_szero(sa) && !fp_sinf(sa) &&
+            fp_ze_enabled(ctx)) {
+            fesetround(old);
+            fp_zero_divide(ctx, insn);
             return;
         }
         if (op == 0) {
@@ -160,12 +205,17 @@ static void fp_arith(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int op,
         } else {
             r = fp_xtod(fp_u32(fa / fb));
         }
-        fp_commit(ctx, insn, r, old);
+        fp_commit(ctx, insn, r, old, 1);
         return;
     }
     sub = fp_inv2(op, da, db);
     if (sub != 0u) {
         fp_invalid(ctx, insn, sub, 0);
+        return;
+    }
+    if (op == 3 && fp_iszero(db) && !fp_iszero(da) && !fp_isinf(da) &&
+        fp_ze_enabled(ctx)) {
+        fp_zero_divide(ctx, insn);
         return;
     }
     {
@@ -181,7 +231,7 @@ static void fp_arith(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int op,
             fr = fp_f64(da) / fp_f64(db);
         }
         r = fp_u64(fr);
-        fp_commit(ctx, insn, r, old);
+        fp_commit(ctx, insn, r, old, 0);
     }
 }
 
@@ -198,6 +248,23 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
     int nn = 0;
     int snan = 0;
     int i;
+    /* P32-R7-21: a 0*inf multiplication raises VXIMZ even when the
+     * addend is NaN, so this check precedes NaN propagation. */
+    if (single) {
+        float fa0 = (float)fp_f64(pa);
+        float fc0 = (float)fp_f64(pc);
+        uint32_t ssa = fp_u32(fa0);
+        uint32_t ssc = fp_u32(fc0);
+        if ((fp_szero(ssa) && fp_sinf(ssc)) ||
+            (fp_szero(ssc) && fp_sinf(ssa))) {
+            fp_invalid(ctx, insn, F_VXIMZ_M, 1);
+            return;
+        }
+    } else if ((fp_iszero(pa) && fp_isinf(pc)) ||
+        (fp_iszero(pc) && fp_isinf(pa))) {
+        fp_invalid(ctx, insn, F_VXIMZ_M, 0);
+        return;
+    }
     ops[0] = pa;
     ops[1] = pc;
     ops[2] = pb;
@@ -219,10 +286,6 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
         fp_nanres(ctx, insn, n, snan, single);
         return;
     }
-    if ((fp_iszero(pa) && fp_isinf(pc)) || (fp_iszero(pc) && fp_isinf(pa))) {
-        fp_invalid(ctx, insn, F_VXIMZ_M, single);
-        return;
-    }
     if (!single && (fp_isinf(pa) || fp_isinf(pc)) && fp_isinf(pb)) {
         int ps = (int)(((pa ^ pc) >> 63) & 1u);
         int cs = (int)((pb >> 63) & 1u);
@@ -241,11 +304,6 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
         uint32_t sb = fp_u32(fb);
         uint32_t sc = fp_u32(fc);
         float fr;
-        if ((fp_szero(sa) && fp_sinf(sc)) || (fp_szero(sc) && fp_sinf(sa))) {
-            fesetround(old);
-            fp_invalid(ctx, insn, F_VXIMZ_M, 1);
-            return;
-        }
         if ((fp_sinf(sa) || fp_sinf(sc)) && fp_sinf(sb)) {
             int ps = (int)(((sa ^ sc) >> 31) & 1u);
             int cs = (int)((sb >> 31) & 1u);
@@ -261,7 +319,7 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
             fr = -fr;
         }
         r = fp_xtod(fp_u32(fr));
-        fp_commit(ctx, insn, r, old);
+        fp_commit(ctx, insn, r, old, 1);
         return;
     }
     {
@@ -273,7 +331,7 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
             fr = -fr;
         }
         r = fp_u64(fr);
-        fp_commit(ctx, insn, r, old);
+        fp_commit(ctx, insn, r, old, 0);
     }
 }
 
@@ -299,7 +357,7 @@ static void fp_sqrt(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int single)
         } else {
             r = fp_u64(sqrt(fp_f64(a)));
         }
-        fp_commit(ctx, insn, r, old);
+        fp_commit(ctx, insn, r, old, single);
     }
 }
 
@@ -335,7 +393,9 @@ static void fp_fcmp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int cmpu)
         ret = 0x02u;
     }
     ctx->cr = (ctx->cr & ~(0xfu << shift)) | (ret << shift);
-    ctx->fpscr = (ctx->fpscr & ~(0x1fu << 12)) | (ret << 12);
+    /* P32-R7-23: comparisons update only the four FPCC bits (13..16);
+     * FPSCR[C] (bit 12) is preserved, never forced. */
+    ctx->fpscr = (ctx->fpscr & ~(0xfu << 13)) | (ret << 13);
     if (ret == 0x01u) {
         int snan = (fp_isnan(a) && (a & 0x8000000000000ull) == 0u) ||
             (fp_isnan(b) && (b & 0x8000000000000ull) == 0u);
@@ -356,25 +416,38 @@ static void fp_fcmp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int cmpu)
 /* fctiw[z]; oracle-grounded saturation (qemu-750/7450): positive
  * overflow (incl. +inf) -> 0x7FFFFFFF, NaN/-inf/negative overflow ->
  * 0x80000000; VXCVI + FPCC=0x11 on invalid. */
+/* Invalid fctiw result: VXCVI (+VXSNAN for sNaN) with the saturated
+ * word (positive overflow -> 0x7FFFFFFF else 0x80000000), FPRF=0x11. */
+static void fp_fctiw_invalid(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
+    int snan, int positive)
+{
+    uint64_t sat = positive ? 0x000000007fffffffu : 0x0000000080000000ull;
+
+    ctx->fpscr &= ~(F_FR_M | F_FI_M);
+    fp_raise(ctx, F_VXCVI_M | F_VX_M);
+    if (snan) {
+        fp_raise(ctx, F_VXSNAN_M | F_VX_M);
+    }
+    ctx->fpscr = (ctx->fpscr & ~(0x1fu << 12)) | (0x11u << 12);
+    fp_done(ctx, insn, sat);
+}
+
 static void fp_fctiw(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int toz)
 {
     uint64_t a = ctx->fpr[insn->rb & 31u];
     double v = fp_f64(a);
-    if (fp_isnan(a) || !isfinite(v) || v > 2147483647.0 ||
-        v < -2147483648.0) {
-        int snan = fp_isnan(a) && (a & 0x8000000000000ull) == 0u;
-        /* NaN fails the > test, so only true positive overflow
-         * (incl. +inf) saturates high. */
-        uint64_t sat =
-            (v == v && v > 2147483647.0) ? 0x000000007fffffffu :
-            0x0000000080000000ull;
-        ctx->fpscr &= ~(F_FR_M | F_FI_M);
-        fp_raise(ctx, F_VXCVI_M | F_VX_M);
-        if (snan) {
-            fp_raise(ctx, F_VXSNAN_M | F_VX_M);
-        }
-        ctx->fpscr = (ctx->fpscr & ~(0x1fu << 12)) | (0x11u << 12);
-        fp_done(ctx, insn, sat);
+    /* P32-R7-20: NaNs and infinities are invalid up front; finite inputs
+     * are rounded under the selected mode first and only then checked
+     * for representability, so truncations like 2147483647.25 stay
+     * valid while rounded-away values (e.g. nearest-even 2147483647.5)
+     * take the invalid path. */
+    if (fp_isnan(a)) {
+        int snan = (a & 0x8000000000000ull) == 0u;
+        fp_fctiw_invalid(ctx, insn, snan, !signbit(v));
+        return;
+    }
+    if (!isfinite(v)) {
+        fp_fctiw_invalid(ctx, insn, 0, v > 0.0);
         return;
     }
     {
@@ -387,17 +460,22 @@ static void fp_fctiw(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int toz)
             feclearexcept(FE_ALL_EXCEPT);
         }
         rr = toz ? trunc(v) : rint(v);
+        if (rr >= 2147483648.0 || rr < -2147483648.0) {
+            fesetround(old);
+            fp_fctiw_invalid(ctx, insn, 0, rr > 0.0);
+            return;
+        }
         inexact = rr != v;
-        /* Rounding can carry an in-range value into 2^31 (nearest-even
-         * of 2147483647.5): saturate like the oracle. */
-        iv = (rr > 2147483647.0) ? 2147483647 : (int32_t)rr;
+        iv = (int32_t)rr;
         fesetround(old);
         ctx->fpr[insn->rt & 31u] = ((uint64_t)(uint32_t)iv) |
             ((uint64_t)(iv < 0 ? 0xffffffffu : 0u) << 32);
-        ctx->fpscr &= ~F_FI_M;
+        /* P32-R7-19: FR is computed alongside FI and cleared when the
+         * conversion is exact. */
+        ctx->fpscr &= ~(F_FI_M | F_FR_M);
         if (inexact) {
             fp_raise(ctx, F_XX_M);
-            ctx->fpscr |= F_FI_M;
+            ctx->fpscr |= F_FI_M | F_FR_M;
         }
         if (insn->rc) fp_cr1(ctx);
         ctx->nip += 4u;
@@ -418,7 +496,7 @@ static void fp_frsp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         int old = fp_begin(ctx);
         float fr = (float)fp_f64(a);
         r = fp_xtod(fp_u32(fr));
-        fp_commit(ctx, insn, r, old);
+        fp_commit(ctx, insn, r, old, 1);
     }
 }
 
@@ -446,25 +524,17 @@ static void fp_mffs(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 /* mtfsf (FM bit i -> nibble i; FEX/VX recomputed; Rc->CR1). */
 static void fp_mtfsf(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 {
-    static const uint8_t vxsub[9] = { 24u, 23u, 22u, 21u, 20u, 19u, 10u,
-        9u, 8u };
     uint32_t fm = (insn->raw >> 17) & 0xffu;
     uint32_t mask = 0u;
     uint32_t src = (uint32_t)ctx->fpr[insn->rb & 31u];
-    uint32_t g;
-    uint32_t vx = 0u;
+    uint32_t old = ctx->fpscr;
     int i;
     for (i = 0; i < 8; i++) if ((fm >> i) & 1u) mask |= 0xfu << (4 * i);
-    g = (ctx->fpscr & ~mask) | (src & mask);
-    g &= ~(F_FEX_M | F_VX_M);
-    for (i = 0; i < 9; i++) if ((g & (1u << vxsub[i])) != 0u) vx |= 1u << vxsub[i];
-    if (vx != 0u) {
-        g |= F_VX_M;
-    }
-    if ((((g >> 25) & 0x1fu) & ((g >> 3) & 0x1fu)) != 0u) {
-        g |= F_FEX_M;
-    }
-    ctx->fpscr = g;
+    /* P32-R7-18: the masked move lands first; fp_touch then raises
+     * VX/FX/FEX for newly-set exception bits without reasserting
+     * software-cleared summaries. */
+    ctx->fpscr = (ctx->fpscr & ~mask) | (src & mask);
+    fp_touch(ctx, old);
     if (insn->rc) fp_cr1(ctx);
     ctx->nip += 4u;
 }
@@ -475,12 +545,16 @@ static void fp_mtfsf(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 static void fp_mtfsb(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int set)
 {
     uint32_t bit = 0x80000000U >> (insn->rt & 31u);
+    uint32_t old = ctx->fpscr;
 
     if (set != 0) {
         ctx->fpscr |= bit;
     } else {
         ctx->fpscr &= ~bit;
     }
+    /* P32-R7-18: setting an exception bit raises its VX/FX/FEX
+     * summaries; clearing never reasserts a cleared summary. */
+    fp_touch(ctx, old);
     if (insn->rc != 0U) {
         fp_cr1(ctx);
     }
@@ -494,8 +568,10 @@ static void fp_mtfsfi(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     uint32_t bf = (insn->raw >> 23) & 7u;
     uint32_t u = (insn->raw >> 12) & 15u;
     uint32_t sh = 4u * (7u - bf);
+    uint32_t old = ctx->fpscr;
 
     ctx->fpscr = (ctx->fpscr & ~(0xfu << sh)) | ((u & 0xfu) << sh);
+    fp_touch(ctx, old);
     if (insn->rc) fp_cr1(ctx);
     ctx->nip += 4u;
 }
@@ -546,9 +622,24 @@ static void fp_classic_x(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 
 /* e500v2 SPE lives in fp_spe.c (fp_spe). */
 
-/* Top-level dispatch (D-forms keep RC2 behavior; XO tables in fp.h). */
+/* Top-level dispatch (D-forms keep RC2 behavior; XO tables in fp.h).
+ * P32-R7-15: the Classic/SPE profile gates admission before any side
+ * effect — Classic rejects major-opcode-4 SPE words, SPE rejects the
+ * classic FPU families. */
 void ppc32_fp_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 {
+    int is_spe = (ctx->is_spe != 0U) ||
+        (ctx->profile == PPC32_PROFILE_SPE);
+
+    if (insn->op == PPC32_OP_SPE) {
+        if (!is_spe) {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+            return;
+        }
+    } else if (is_spe) {
+        ctx->exit_reason = PPC32_EXIT_UNDEF;
+        return;
+    }
     switch (insn->op) {
     case PPC32_OP_LFS: fp_lsD(ctx, insn->rt, insn->ra, insn->d, 1, 0, 0); break;
     case PPC32_OP_LFSU: fp_lsD(ctx, insn->rt, insn->ra, insn->d, 1, 0, 1); break;

@@ -85,8 +85,10 @@ static void ctx_init_test(ppc32_ctx_t *ctx, uint8_t *base)
     ctx->regions[0].prot = PROT_READ | PROT_WRITE | PROT_EXEC;
     vm32_tlb_invalidate_all();
     vm32_shadow_window((uint64_t)(uintptr_t)base);
-    vm32_record_map(0x100000U, 0x180000U, PROT_READ | PROT_WRITE,
-        VM32_PAGE_ANON);
+    /* P32-R7-3: the code window carries guest EXEC so instruction
+     * fetch passes the NX check. */
+    vm32_record_map(0x100000U, 0x180000U,
+        PROT_READ | PROT_WRITE | PROT_EXEC, VM32_PAGE_ANON);
 }
 
 static void write_be32(uint8_t *base, uint32_t ea, uint32_t word)

@@ -26,41 +26,73 @@ static void fp_spe_ldst(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         ea = (insn->ra == 0u ? 0u : ctx->gpr[insn->ra]) +
             ((uint32_t)insn->rb << sh);
     }
-    if (!interp_mem_ok(ea, 8U)) { fault(ctx, ea); return; }
+    /* P32-R7-14: halfword-vector and word-single forms transfer four
+     * bytes, double forms eight; validate the actual width. */
     switch (xo) {
     case PPC32_SPE_EVLDD: case PPC32_SPE_EVLDDX:
-    case PPC32_SPE_EVLDW: case PPC32_SPE_EVLDWX:
-        fp_gpr64_set(ctx, insn->rt, fp_ld64(ctx, ea));
+    case PPC32_SPE_EVLDW: case PPC32_SPE_EVLDWX: {
+        uint64_t v;
+
+        if (!interp_mem_ok(ea, 8U)) { fault(ctx, ea); return; }
+        v = fp_ld64(ctx, ea);
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
+        fp_gpr64_set(ctx, insn->rt, v);
         break;
+    }
     case PPC32_SPE_EVSTDD: case PPC32_SPE_EVSTDDX:
     case PPC32_SPE_EVSTDW: case PPC32_SPE_EVSTDWX:
+        if (!interp_mem_ok(ea, 8U)) { fault(ctx, ea); return; }
         fp_st64(ctx, ea, fp_gpr64(ctx, insn->rt));
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
         break;
     case PPC32_SPE_EVLWHE:
     case PPC32_SPE_EVLWHEX:
-        fp_gpr64_set(ctx, insn->rt, ((uint64_t)(ld32(ctx, ea) & 0xffff0000u)
-            << 32) | (uint64_t)(ld32(ctx, ea + 2u) & 0xffff0000u));
-        break;
     case PPC32_SPE_EVLWHOU:
     case PPC32_SPE_EVLWHOUX:
-        fp_gpr64_set(ctx, insn->rt, ((uint64_t)(ld32(ctx, ea) >> 16)
-            << 32) | (uint64_t)(ld32(ctx, ea + 2u) >> 16));
-        break;
     case PPC32_SPE_EVLWHOS:
     case PPC32_SPE_EVLWHOSX: {
-        int32_t h0 = (int32_t)(int16_t)(uint16_t)(ld32(ctx, ea) >> 16);
-        int32_t h1 = (int32_t)(int16_t)(uint16_t)(ld32(ctx, ea + 2u) >> 16);
-        fp_gpr64_set(ctx, insn->rt, ((uint64_t)(uint32_t)h0 << 32) |
-            (uint64_t)(uint32_t)h1);
+        uint32_t w;
+        uint64_t v;
+
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        w = ld32(ctx, ea);
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
+        /* Both halfwords come from the single 4-byte operand word;
+         * no byte past ea+3 is ever touched. */
+        if (xo == PPC32_SPE_EVLWHE || xo == PPC32_SPE_EVLWHEX) {
+            v = ((uint64_t)(w & 0xffff0000u) << 32) |
+                (uint64_t)((w & 0x0000ffffu) << 16);
+        } else if (xo == PPC32_SPE_EVLWHOU || xo == PPC32_SPE_EVLWHOUX) {
+            v = ((uint64_t)(w >> 16) << 32) | (uint64_t)(w & 0xffffu);
+        } else {
+            int32_t h0 = (int32_t)(int16_t)(uint16_t)(w >> 16);
+            int32_t h1 = (int32_t)(int16_t)(uint16_t)w;
+            v = ((uint64_t)(uint32_t)h0 << 32) | (uint64_t)(uint32_t)h1;
+        }
+        fp_gpr64_set(ctx, insn->rt, v);
         break;
     }
     case PPC32_SPE_EVSTWWE:
     case PPC32_SPE_EVSTWWEX:
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
         st32(ctx, ea, ctx->gpr_hi[insn->rt & 31u]);
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
         break;
     case PPC32_SPE_EVSTWWO:
     case PPC32_SPE_EVSTWWOX:
+        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
         st32(ctx, ea, ctx->gpr[insn->rt & 31u]);
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            return;
+        }
         break;
     default:
         ctx->exit_reason = PPC32_EXIT_UNDEF;
@@ -195,17 +227,13 @@ static void fp_spe_fcmp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         return;
     }
     if (vec) {
+        /* P32-R7-8: lane results merge into exactly one CR nibble. */
         m = fp_fcmp_merge(fp_spe_fcmp1(a >> 32, b >> 32, (int)t, 0),
             fp_spe_fcmp1(a, b, (int)t, 0));
     } else {
         m = fp_spe_fcmp1(a, b, (int)t, dbl);
     }
-    if (m > 15u) {
-        fp_set_crf_bleed(ctx, bf, m);
-    } else {
-        ctx->cr = (ctx->cr & ~(0xfu << (4u * (7u - bf)))) |
-            (m << (4u * (7u - bf)));
-    }
+    fp_set_crf_bleed(ctx, bf, m);
     ctx->nip += 4u;
 }
 
@@ -222,20 +250,27 @@ static void fp_spe_arith(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     if (!is_abs) {
         int op = off == 0u ? 0 : off == 1u ? 1 : off == 8u ? 2 : 3;
         if (base == 640u) {
-            fp_gpr64_set(ctx, insn->rt, ((uint64_t)fp_efs_arith(
+            fp_gpr64_set(ctx, insn->rt, ((uint64_t)fp_efs_arith(ctx,
                 (uint32_t)(a >> 32), (uint32_t)(b >> 32), op) << 32) |
-                (uint64_t)fp_efs_arith((uint32_t)a, (uint32_t)b, op));
+                (uint64_t)fp_efs_arith(ctx, (uint32_t)a, (uint32_t)b,
+                op));
         } else if (base == 704u) {
-            ctx->gpr[insn->rt & 31u] = fp_efs_arith((uint32_t)a,
+            ctx->gpr[insn->rt & 31u] = fp_efs_arith(ctx, (uint32_t)a,
                 (uint32_t)b, op);
         } else {
-            fp_gpr64_set(ctx, insn->rt, fp_efd_arith(a, b, op));
+            fp_gpr64_set(ctx, insn->rt, fp_efd_arith(ctx, a, b, op));
         }
     } else if (base == 704u) {
         uint32_t w = (uint32_t)a;
         uint32_t m = off == 4u ? 0x7fffffffu : 0x80000000u;
         ctx->gpr[insn->rt & 31u] = off == 4u ? w & m : off == 5u ?
             w | m : w ^ m;
+    } else if (base == 640u) {
+        /* P32-R7-9: vector-single sign ops touch both lanes. */
+        uint64_t m = off == 4u ? 0x7fffffff7fffffffull :
+            0x8000000080000000ull;
+        fp_gpr64_set(ctx, insn->rt, off == 4u ? a & m : off == 5u ?
+            a | m : a ^ m);
     } else {
         uint64_t m = off == 4u ? 0x7fffffffffffffffull :
             0x8000000000000000ull;
@@ -254,38 +289,39 @@ static void fp_spe_conv(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     int full = 0;
     uint32_t x = insn->xo;
     if (x == PPC32_SPE_EFSCFD) {
-        r = fp_spe_cvt(b, 10, 1);
+        r = fp_spe_cvt(ctx, b, 10, 1);
     } else if (x == PPC32_SPE_EFDCFS) {
-        r = fp_spe_cvt(b, 10, 0);
+        r = fp_spe_cvt(ctx, b, 10, 0);
         full = 1;
     } else if (x >= 656u && x <= 666u) {
-        int vo[] = { 7, 6, 8, 9, 1, 0, 5, 4, 3, -1, 2 };
+        /* P32-R7-11: 658 is CFUF (op 9), 659 is CFSF (op 8). */
+        int vo[] = { 7, 6, 9, 8, 1, 0, 5, 4, 3, -1, 2 };
         int op = vo[x - 656u];
         if (op < 0) {
             ctx->exit_reason = PPC32_EXIT_UNDEF;
             return;
         }
-        r = ((uint64_t)(uint32_t)fp_spe_cvt(b >> 32, op, 0) << 32) |
-            (uint64_t)(uint32_t)fp_spe_cvt(b, op, 0);
+        r = ((uint64_t)(uint32_t)fp_spe_cvt(ctx, b >> 32, op, 0) << 32) |
+            (uint64_t)(uint32_t)fp_spe_cvt(ctx, b, op, 0);
         full = 1;
     } else if (x >= 719u && x <= 730u) {
-        int so[] = { 10, 7, 6, 8, 9, 1, 0, 5, 4, 3, -1, 2 };
+        int so[] = { 10, 7, 6, 9, 8, 1, 0, 5, 4, 3, -1, 2 };
         int op = so[x - 719u];
         if (op < 0) {
             ctx->exit_reason = PPC32_EXIT_UNDEF;
             return;
         }
-        r = fp_spe_cvt(b, op, 0);
+        r = fp_spe_cvt(ctx, b, op, 0);
     } else if (x == 751u) {
-        r = fp_spe_cvt(b, 10, 1);
+        r = fp_spe_cvt(ctx, b, 10, 1);
     } else if (x >= 752u && x <= 762u) {
-        int dlo[] = { 7, 6, 8, 9, 1, 0, 5, 4, 3, -1, 2 };
+        int dlo[] = { 7, 6, 9, 8, 1, 0, 5, 4, 3, -1, 2 };
         int op = dlo[x - 752u];
         if (op < 0) {
             ctx->exit_reason = PPC32_EXIT_UNDEF;
             return;
         }
-        r = fp_spe_cvt(b, op, 1);
+        r = fp_spe_cvt(ctx, b, op, 1);
         full = 1;
     } else {
         ctx->exit_reason = PPC32_EXIT_UNDEF;

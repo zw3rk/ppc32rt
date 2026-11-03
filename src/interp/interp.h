@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include "ppc32rt.h"
 #include "interp/decode.h"
@@ -171,20 +172,22 @@ static inline void res_invalidate(ppc32_ctx_t *ctx)
 /* Ordinary guest stores invalidate LL/SC reservations (E06): every
  * shared 64-byte line bucket spanned by [ea, ea + len) bumps, so a
  * wide store cannot leave a middle-bucket reservation live, plus the
- * thread epoch for the DBT-side fast check. The same store fans out
- * to overlapping staged shared-file aliases (P32-R4-3 coherence).
- * len is the access width (>= 1); 32-bit EA wrap is honored by
- * unsigned arithmetic. Loads never bump. */
-static inline void vm32_store_inval(uint32_t ea, uint32_t len)
+ * thread epoch for the DBT-side fast check. P32-R7-4: the guest write,
+ * line invalidation, and epoch bump are one LL-locked transaction
+ * (store_commit), serialized against the whole stwcx. validation/write;
+ * the staged shared-file fan-out (P32-R4-3, takes the VM lock) runs
+ * after release and never nests under LL. len is the access width
+ * (>= 1); 32-bit EA wrap is honored by unsigned arithmetic. Loads
+ * never bump. */
+static inline void store_commit(ppc32_ctx_t *ctx, uint32_t ea,
+    void *hva, const void *src, uint32_t len)
 {
-    vm32_store_invalidate_range(ea, len);
-}
-
-static inline void store_bump(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len)
-{
-    vm32_store_inval(ea, len);
-    vm_file_shared_cohere_store(ctx, ea, len);
+    vm32_ll_lock();
+    memcpy(hva, src, len);
+    vm32_store_invalidate_range_locked(ea, len);
     ctx->reservation_epoch++;
+    vm32_ll_unlock();
+    vm_file_shared_cohere_store(ctx, ea, len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -314,8 +317,7 @@ static inline void st8(ppc32_ctx_t *ctx, uint32_t ea, uint8_t v)
     if (hva == NULL) {
         return;
     }
-    memcpy(hva, &v, 1);
-    store_bump(ctx, ea, 1U);
+    store_commit(ctx, ea, hva, &v, 1U);
 }
 
 static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
@@ -326,8 +328,7 @@ static inline void st16(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
     if (hva == NULL) {
         return;
     }
-    memcpy(hva, &r, sizeof(r));
-    store_bump(ctx, ea, 2U);
+    store_commit(ctx, ea, hva, &r, 2U);
 }
 
 static inline void st16r(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
@@ -337,8 +338,7 @@ static inline void st16r(ppc32_ctx_t *ctx, uint32_t ea, uint16_t v)
     if (hva == NULL) {
         return;
     }
-    memcpy(hva, &v, sizeof(v));
-    store_bump(ctx, ea, 2U);
+    store_commit(ctx, ea, hva, &v, 2U);
 }
 
 static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
@@ -349,8 +349,7 @@ static inline void st32(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
     if (hva == NULL) {
         return;
     }
-    memcpy(hva, &r, sizeof(r));
-    store_bump(ctx, ea, 4U);
+    store_commit(ctx, ea, hva, &r, 4U);
 }
 
 static inline void st32r(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
@@ -360,12 +359,20 @@ static inline void st32r(ppc32_ctx_t *ctx, uint32_t ea, uint32_t v)
     if (hva == NULL) {
         return;
     }
-    memcpy(hva, &v, sizeof(v));
-    store_bump(ctx, ea, 4U);
+    store_commit(ctx, ea, hva, &v, 4U);
 }
 
+/* P32-R7-3: instruction fetch requires guest execute permission on
+ * every byte of the word, tracked separately from the host data
+ * mapping (which never carries PROT_EXEC). A readable-but-NX word
+ * faults instead of decoding. */
 static inline uint32_t fetch_raw(const ppc32_ctx_t *ctx)
 {
+    if (!vm32_page_is_exec(ctx->nip) ||
+        !vm32_page_is_exec(ctx->nip + 3U)) {
+        fault((ppc32_ctx_t *)ctx, ctx->nip);
+        return 0U;
+    }
     return ld32(ctx, ctx->nip);
 }
 
@@ -471,19 +478,51 @@ static inline bool interp_mem_ok(uint32_t ea, uint32_t len)
     return true;
 }
 
+/* D-form loads/stores (LBZ[U]/LHZ[U]/LHA[U]/LWZ[U]/
+ * STB[U]/STH[U]/STW[U]): the access runs first into scratch and the
+ * destination/base/NIP commit only after success (P32-R7-1), so a
+ * faulting EA leaves registers and NIP untouched for the oracle frame.
+ * P32-R7-25: update forms require RA!=0, and update loads additionally
+ * require RA!=RT; violations are UNDEF before any memory access. */
 static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
     const ppc32_insn_t *insn)
 {
     uint32_t ea;
+    bool update = false;
+    bool is_load = false;
+    uint32_t loaded = 0U;
 
-    if (insn->ra == 0U) {
-        if (insn->op == PPC32_OP_LBZU || insn->op == PPC32_OP_LHZU ||
-            insn->op == PPC32_OP_LHAU || insn->op == PPC32_OP_LWZU ||
-            insn->op == PPC32_OP_STBU || insn->op == PPC32_OP_STHU ||
-            insn->op == PPC32_OP_STWU) {
+    switch (insn->op) {
+    case PPC32_OP_LBZU:
+    case PPC32_OP_LHZU:
+    case PPC32_OP_LHAU:
+    case PPC32_OP_LWZU:
+        if (insn->ra == 0U || insn->ra == insn->rt) {
             ctx->exit_reason = PPC32_EXIT_UNDEF;
             return;
         }
+        update = true;
+        is_load = true;
+        break;
+    case PPC32_OP_LBZ:
+    case PPC32_OP_LHZ:
+    case PPC32_OP_LHA:
+    case PPC32_OP_LWZ:
+        is_load = true;
+        break;
+    case PPC32_OP_STBU:
+    case PPC32_OP_STHU:
+    case PPC32_OP_STWU:
+        if (insn->ra == 0U) {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+            return;
+        }
+        update = true;
+        break;
+    default:
+        break;
+    }
+    if (insn->ra == 0U) {
         ea = (uint32_t)insn->d;
     } else {
         ea = ctx->gpr[insn->ra] + (uint32_t)insn->d;
@@ -492,23 +531,22 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
     case PPC32_OP_LBZ:
     case PPC32_OP_LBZU:
         if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] = ld8(ctx, ea);
+        loaded = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZ:
     case PPC32_OP_LHZU:
         if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] = ld16(ctx, ea);
+        loaded = ld16(ctx, ea);
         break;
     case PPC32_OP_LHA:
     case PPC32_OP_LHAU:
         if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] =
-            (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
+        loaded = (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZ:
     case PPC32_OP_LWZU:
         if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
-        ctx->gpr[insn->rt] = ld32(ctx, ea);
+        loaded = ld32(ctx, ea);
         break;
     case PPC32_OP_STB:
     case PPC32_OP_STBU:
@@ -525,22 +563,14 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
         st32(ctx, ea, ctx->gpr[insn->rs]);
         break;
     }
-    if (insn->ra != 0U) {
-        switch (insn->op) {
-        case PPC32_OP_LBZU:
-        case PPC32_OP_LHZU:
-        case PPC32_OP_LHAU:
-        case PPC32_OP_LWZU:
-            ctx->gpr[insn->ra] = ea;
-            break;
-        case PPC32_OP_STBU:
-        case PPC32_OP_STHU:
-        case PPC32_OP_STWU:
-            ctx->gpr[insn->ra] = ea;
-            break;
-        default:
-            break;
-        }
+    if (ctx->exit_reason != PPC32_EXIT_NONE) {
+        return;
+    }
+    if (update) {
+        ctx->gpr[insn->ra] = ea;
+    }
+    if (is_load) {
+        ctx->gpr[insn->rt] = loaded;
     }
     ctx->nip += 4U;
 }
@@ -565,7 +595,8 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
     case PPC32_OP_LHZUX:
     case PPC32_OP_LHAUX:
     case PPC32_OP_LWZUX:
-        if (insn->ra == 0U) {
+        /* P32-R7-25: update loads require RA!=0 and RA!=RT. */
+        if (insn->ra == 0U || insn->ra == insn->rt) {
             ctx->exit_reason = PPC32_EXIT_UNDEF;
             return;
         }
@@ -574,7 +605,13 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
     case PPC32_OP_STBUX:
     case PPC32_OP_STHUX:
     case PPC32_OP_STWUX:
-        update = insn->ra != 0U;
+        /* P32-R7-25: RA==0 is an invalid update form (was a silent
+         * no-writeback). */
+        if (insn->ra == 0U) {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+            return;
+        }
+        update = true;
         break;
     default:
         break;
@@ -619,6 +656,11 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         st32(ctx, ea, ctx->gpr[insn->rs]);
         break;
     }
+    /* P32-R7-1: a failed access commits neither base nor destination
+     * and leaves NIP at the faulting instruction. */
+    if (ctx->exit_reason != PPC32_EXIT_NONE) {
+        return;
+    }
     if (update) {
         ctx->gpr[insn->ra] = ea;
     }
@@ -626,6 +668,18 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         ctx->gpr[insn->rt] = loaded;
     }
     ctx->nip += 4U;
+}
+
+/* P32-R7-24: coherent guest time-base. TB/TBU expose one 64-bit
+ * microsecond (1 MHz) counter sampled from the host monotonic clock;
+ * each mftb/mfspr read samples once so TBU:TB never tears. */
+static inline uint64_t ppc32_tb_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL +
+        (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
 static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
@@ -704,8 +758,16 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
             case PPC32_SPR_XER: ctx->gpr[insn->rt] = ctx->xer; break;
             case PPC32_SPR_LR:  ctx->gpr[insn->rt] = ctx->lr; break;
             case PPC32_SPR_CTR: ctx->gpr[insn->rt] = ctx->ctr; break;
-            case 268U:
-            case 269U:          ctx->gpr[insn->rt] = 0U; break;
+            case PPC32_SPR_TB:
+                ctx->gpr[insn->rt] = (uint32_t)ppc32_tb_now();
+                break;
+            case PPC32_SPR_TBU:
+                ctx->gpr[insn->rt] = (uint32_t)(ppc32_tb_now() >> 32);
+                break;
+            case PPC32_SPR_SPEFSCR:
+                /* P32-R7-13: SPEFSCR is user-accessible. */
+                ctx->gpr[insn->rt] = ctx->spefscr;
+                break;
             case PPC32_SPR_PVR:
                 ctx->gpr[insn->rt] = (ctx->profile == PPC32_PROFILE_SPE) ?
                     PPC32_PVR_E500V2 : PPC32_PVR_750;
@@ -717,6 +779,9 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
             case PPC32_SPR_XER: ctx->xer = ctx->gpr[insn->rs]; break;
             case PPC32_SPR_LR:  ctx->lr = ctx->gpr[insn->rs]; break;
             case PPC32_SPR_CTR: ctx->ctr = ctx->gpr[insn->rs]; break;
+            case PPC32_SPR_SPEFSCR:
+                ctx->spefscr = ctx->gpr[insn->rs] & SPE_WRITABLE;
+                break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
             }
         }

@@ -90,13 +90,25 @@ $(OBJ_DIR)/%.o: src/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: check-abi-invariants build-darwin ## Run host ABI and P32 defect regression suites
+test: check-abi-invariants build-darwin ## Run host ABI and P32 defect regression suites (incl. Round-7 ISA)
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_defects.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_defects && \
-	./$(BUILD_DIR)/check_p32_defects
+	./$(BUILD_DIR)/check_p32_defects && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_r7_defects.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_r7_defects && \
+	./$(BUILD_DIR)/check_p32_r7_defects && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_r7b_defects.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_r7b_defects && \
+	./$(BUILD_DIR)/check_p32_r7b_defects
 
 # macOS hides MAP_ANON (no MAP_ANONYMOUS) once _POSIX_C_SOURCE is
 # defined, which would break the host syntax check below; the Linux/musl
