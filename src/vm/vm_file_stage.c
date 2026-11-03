@@ -412,8 +412,10 @@ void vm_file_shared_drop_group(uint64_t dev, uint64_t ino, uint64_t off)
             g_staged[i].ino != ino || g_staged[i].file_offset != off) {
             continue;
         }
-        stage_drain_locked(i, g_staged[i].file_offset,
-            g_staged[i].file_offset + (uint64_t)g_staged[i].staged_len);
+        /* P32-R4-4: no drain-back on drop. Guest stores already reached
+         * the file via write-through, so draining the whole extent here
+         * would write stale clean staged pages over newer external
+         * write() bytes. Just release the object. */
         (void)close(g_staged[i].stage_fd);
         (void)close(g_staged[i].src_fd);
         g_staged[i].in_use = 0U;
@@ -543,11 +545,13 @@ static void stage_fanout_groups(uint64_t dev, uint64_t ino, uint64_t flo,
 
 /* Coherence fan-out for one landed guest range (caller holds the VM
  * lock): for every MAP_SHARED file-backed region overlapping guest
- * [ea, ea + len), refresh overlapping same-inode groups from the file
- * first (direct-alias stores are only visible there), then copy the
- * landed guest bytes into those groups, and — for true guest stores —
- * write them through to the file. Private mappings never participate:
- * their stores stay copy-on-write local. */
+ * [ea, ea + len), copy the landed guest bytes (hva already holds
+ * them) into overlapping same-inode groups, and — for true guest
+ * stores — write them through to the file. No refresh-from-file here:
+ * the guest store, stwcx., copyout, or read() already landed in hva,
+ * so a refresh would overwrite hva with stale bytes before fan-out
+ * reads it (P32-R4-3). Private mappings never participate: their
+ * stores stay copy-on-write local. */
 static void cohere_locked(const ppc32_ctx_t *ctx, uint32_t ea,
     uint32_t len, bool write_file)
 {
@@ -592,7 +596,6 @@ static void cohere_locked(const ppc32_ctx_t *ctx, uint32_t ea,
         flo = r->offset + (uint64_t)(lo - r->start);
         fhi = r->offset + (uint64_t)(hi - r->start);
         hva = (const void *)((uintptr_t)ppc32_guest_ptr(ctx, lo));
-        stage_refresh_groups(dev, ino, flo, fhi);
         stage_fanout_groups(dev, ino, flo, fhi, hva, write_file);
     }
 }
@@ -704,11 +707,11 @@ void vm_file_shared_truncate_range(int fd, uint64_t lo, uint64_t hi)
     if (vm_file_fd_identity(fd, &dev, &ino, &fsz, &mtime) != 0) {
         return;
     }
-    /* Zeroing staged bytes past the new EOF must not extend the file:
-     * clamp into it (the caller holds the VM lock). */
-    if (hi > fsz) {
-        hi = fsz;
-    }
+    /* P32-R4-9: do NOT clamp hi to the post-truncate file size here:
+     * shrinking must zero the truncated tail inside each staging
+     * group, so hi is clamped per group to its own extent below.
+     * Staged zeroing never extends the file (the caller holds the
+     * VM lock). */
     if (hi <= lo) {
         return;
     }

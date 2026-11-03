@@ -145,12 +145,21 @@ int ppc32_vm_copyout_safe(const ppc32_ctx_t *ctx, uint32_t va,
     }
     ok = vm_range_prot_ok_locked(ctx, va, (uint32_t)end, 2U);
     if (ok) {
+        uint32_t inv_len = (uint32_t)len;
+        uint32_t head = va & 63U;
         memcpy(ppc32_guest_ptr(ctx, va), src, len);
         /* A committed guest store kills peer reservations even when
          * the value is unchanged (P32-R4-12), then fans out to staged
          * shared-file aliases (P32-R4-3). Both run under the VM lock
-         * already held here; neither takes another lock. */
-        vm32_store_invalidate_range(va, (uint32_t)len);
+         * already held here; neither takes another lock. The
+         * reservation table has 1024 buckets, so 1024 64-byte lines
+         * from va cover every bucket: cap the invalidate width so a
+         * large copyout (read() buffer) never loops millions of
+         * times. */
+        if (inv_len > 1024U * 64U - head) {
+            inv_len = 1024U * 64U - head;
+        }
+        vm32_store_invalidate_range(va, inv_len);
         vm_file_shared_cohere_store(ctx, va, (uint32_t)len);
     }
     if (!held) {

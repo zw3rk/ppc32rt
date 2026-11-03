@@ -161,14 +161,21 @@ int ppc32_copyin_str(const ppc32_ctx_t *ctx, uint32_t va, char *dst, size_t dsts
     }
     for (i = 0U; i < dstsz; i++) {
         uint64_t addr = (uint64_t)va + (uint64_t)i;
-        const char *p;
+        char c;
+        int rc;
 
         if (addr >= 0x100000000ULL) {
             return -EFAULT;
         }
-        p = (const char *)ppc32_guest_ptr(ctx, (uint32_t)addr);
-        dst[i] = *p;
-        if (*p == '\0') {
+        /* P32-R4-11: byte-checked copyin so sub-page permissions are
+         * enforced per byte (an accessible A2 host-page neighbor can
+         * never launder a read-only or unmapped target). */
+        rc = ppc32_copyin(ctx, (uint32_t)addr, &c, 1U);
+        if (rc != 0) {
+            return rc;
+        }
+        dst[i] = c;
+        if (c == '\0') {
             return 0;
         }
     }
