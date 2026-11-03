@@ -124,11 +124,14 @@ static inline void fp_st64(ppc32_ctx_t *ctx, uint32_t ea, uint64_t v)
 #define F_VXSQRT_M (1u << F_VXSQRT)
 #define F_VXSOFT_M (1u << F_VXSOFT)
 
-/* FPSCR summary maintenance (P32-R7-18): FX/VX are sticky-event bits,
+/* FPSCR summary maintenance (P32-R7-18): FX is a sticky-event bit,
  * set only when the mutation introduces a newly-set exception bit; a
  * software-cleared FX is never reasserted merely because an old
- * exception bit remains. FEX is a live cause/enable summary and is
- * recomputed (set or cleared). `old` is the pre-mutation FPSCR. */
+ * exception bit remains. VX is a live summary of its sub-bits and is
+ * recomputed (set or cleared), so clearing the last VX sub-bit via
+ * mtfsb0/mtfsf/mtfsfi clears VX. FEX is a live cause/enable summary
+ * and is recomputed (set or cleared). `old` is the pre-mutation
+ * FPSCR. */
 static inline void fp_touch(ppc32_ctx_t *ctx, uint32_t old)
 {
     static const uint32_t vxsub = F_VXSNAN_M | F_VXISI_M | F_VXIDI_M |
@@ -140,8 +143,10 @@ static inline void fp_touch(ppc32_ctx_t *ctx, uint32_t old)
     uint32_t cur = ctx->fpscr;
     uint32_t chg = cur & ~old;
 
-    if ((chg & vxsub) != 0u) {
+    if ((cur & vxsub) != 0u) {
         cur |= F_VX_M;
+    } else {
+        cur &= ~F_VX_M;
     }
     if ((chg & exc) != 0u) {
         cur |= F_FX_M;
@@ -280,11 +285,21 @@ static inline uint32_t fp_fprf32(uint32_t w)
     return neg ? 0x08u : 0x04u;
 }
 
-/* FPRF recompute + FI/FR assign (P32-R7-19: FR mirrors the current
- * rounding event — set iff inexact, cleared for exact operations;
- * P32-R7-22: single results classify before double expansion). */
+/* Rounded magnitude grew iff the rounded value is farther from zero
+ * than the infinitely-precise one (P32-R7-19: FR means "fraction
+ * incremented", not merely "inexact"). Callers compute the exact value
+ * in long double (wider than any operand format here). */
+static inline int fp_rounded_up(long double exact, long double rounded)
+{
+    return (fabsl(rounded) > fabsl(exact)) ? 1 : 0;
+}
+
+/* FPRF recompute + FI/FR assign (P32-R7-19: FI is set iff inexact, but
+ * FR only when the rounded magnitude strictly increased; both are
+ * cleared for exact operations. P32-R7-22: single results classify
+ * before double expansion). */
 static inline void fp_flags_arith(ppc32_ctx_t *ctx, uint64_t res, int inexact,
-    uint32_t sticky, int single)
+    int fr_inc, uint32_t sticky, int single)
 {
     uint32_t f;
     uint32_t fprf = (single != 0) ? fp_fprf32(fp_dtos(res)) :
@@ -296,7 +311,10 @@ static inline void fp_flags_arith(ppc32_ctx_t *ctx, uint64_t res, int inexact,
     f |= fprf << 12;
     f &= ~(F_FI_M | F_FR_M);
     if (inexact) {
-        f |= F_FI_M | F_FR_M;
+        f |= F_FI_M;
+        if (fr_inc) {
+            f |= F_FR_M;
+        }
     }
     ctx->fpscr = f;
 }
@@ -556,6 +574,12 @@ static inline uint32_t fp_efs_arith(ppc32_ctx_t *ctx, uint32_t a, uint32_t b,
     } else {
         spe_flags(ctx);
         r = fp_u32(fr);
+        /* P32-R7-13: e500 saturates single overflow to pmax/nmax
+         * (0x7f7fffff/0xff7fffff) with FOVF|FOVFS recorded; the
+         * saturation applies when the FOVF enable is clear. */
+        if (isinf(fr) && (ctx->spefscr & SPE_FOVFE) == 0u) {
+            r = signbit(fr) ? 0xff7fffffu : 0x7f7fffffu;
+        }
     }
     fesetround(old);
     return r;

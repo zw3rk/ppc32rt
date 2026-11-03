@@ -38,6 +38,7 @@
 #include "os/threads.h"
 #include "os/syscall_nr.h"
 #include "rt32/ppc32.h"
+#include "vm/vm32.h"
 
 /* Process-shared disposition table (kernel sighand equivalent; per-thread
  * state — the blocked mask — already lives in ppc32_ctx_t for L4b).
@@ -280,6 +281,10 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
         SIG_MUST(sig_st32(ctx, frame + ABIGAP_OFF,
             0x38000000U | PPC32_NR_RT_SIGRETURN));
         SIG_MUST(sig_st32(ctx, frame + ABIGAP_OFF + 4U, 0x44000002U));
+        /* P32-R7-3: the interpreter fetch check requires guest EXEC
+         * on the trampoline word, but the stack mapping is RW-only
+         * (Linux keeps signal stacks executable for this reason). */
+        vm32_mark_guest_exec(frame + ABIGAP_OFF, frame + ABIGAP_OFF + 8U);
         lr = frame + ABIGAP_OFF;
     }
     ctx->gpr[PPC32_REG_SP] = frame;

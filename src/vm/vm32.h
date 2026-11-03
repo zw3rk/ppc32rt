@@ -219,6 +219,12 @@ void vm32_ll_unlock(void);
  * (which never carries PROT_EXEC). Instruction fetch requires it. */
 bool vm32_page_is_exec(uint32_t gva);
 
+/* Mark mapped guest pages guest-executable (page-granular) without
+ * touching the host data mapping. The signal layer marks the
+ * on-stack sigreturn trampoline page so returning from a handler
+ * installed without SA_RESTORER passes the interpreter NX check. */
+void vm32_mark_guest_exec(uint32_t start_gva, uint32_t end_gva);
+
 /* Fork coordination (P32-R3-4): the parent holds the LL/SC reservation
  * lock across the snapshot; the child drops the inherited locked value
  * and clears the copied thread-local held flag (the syscall path never

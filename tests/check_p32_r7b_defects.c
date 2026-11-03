@@ -276,6 +276,27 @@ static void test_r7_18_fpscr_summaries(uint8_t *base)
     ctx.fpscr = 1U << 28;
     interp_step(&ctx);
     CHECK((ctx.fpscr & (1U << 31)) == 0U, "r7-18 FX stays cleared");
+
+    /* mtfsb0 of the last set VX sub-bit clears VX as well. */
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, (63U << 26) | (7U << 21) | (70U << 1));
+    ctx.nip = code;
+    ctx.fpscr = 1U << 24;
+    interp_step(&ctx);
+    CHECK((ctx.fpscr & ((1U << 29) | (1U << 24))) == 0U,
+        "r7-18 mtfsb0 clears VX");
+
+    /* mtfsf zeroing field 6 (the VXSNAN nibble) clears a derived VX. */
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, (63U << 26) | (4U << 21) | (2U << 11) |
+        (711U << 1));
+    ctx.nip = code;
+    ctx.fpscr = (1U << 29) | (1U << 24);
+    ctx.fpr[2] = 0ULL;
+    interp_step(&ctx);
+    CHECK(ctx.exit_reason == PPC32_EXIT_NONE, "r7-18 mtfsf steps");
+    CHECK((ctx.fpscr & ((1U << 29) | (1U << 24))) == 0U,
+        "r7-18 mtfsf clears VX");
 }
 
 /* P32-R7-19: FR tracks the latest rounding event. */
@@ -303,6 +324,26 @@ static void test_r7_19_fr(uint8_t *base)
     interp_step(&ctx);
     CHECK(ctx.fpr[1] == 0x0000000000000002ULL, "r7-19 fctiw rounds to 2");
     CHECK(((ctx.fpscr >> 18) & 1U) != 0U, "r7-19 FR set on rounding");
+
+    /* fadd(1, 2^-60) rounds down: FI set, FR clear. */
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, w_aform(63U, 1U, 2U, 3U, 0U, 21U, 0U));
+    ctx.nip = code;
+    ctx.fpr[2] = d64(1.0);
+    ctx.fpr[3] = d64(pow(2.0, -60.0));
+    interp_step(&ctx);
+    CHECK(((ctx.fpscr >> 17) & 1U) != 0U, "r7-19 FI on round-down");
+    CHECK(((ctx.fpscr >> 18) & 1U) == 0U, "r7-19 no FR on round-down");
+
+    /* fctiw(2.5) rounds to even (2): FI set, FR clear. */
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, w_fxform(1U, 0U, 2U, 14U, 0U));
+    ctx.nip = code;
+    ctx.fpr[2] = d64(2.5);
+    interp_step(&ctx);
+    CHECK(ctx.fpr[1] == 0x0000000000000002ULL, "r7-19 fctiw(2.5) rounds");
+    CHECK(((ctx.fpscr >> 17) & 1U) != 0U, "r7-19 fctiw FI set");
+    CHECK(((ctx.fpscr >> 18) & 1U) == 0U, "r7-19 fctiw no FR rounding down");
 }
 
 /* P32-R7-20: fctiw[z] rounds before the representability check. */
@@ -337,15 +378,28 @@ static void test_r7_21_fma_vximz(uint8_t *base)
     ppc32_ctx_t ctx;
     const uint32_t code = 0x100000U;
 
-    /* fmadd(0, +inf, QNaN): the 0*inf exception applies anyway. */
+    /* fmadd(0, +inf, QNaN): the 0*inf exception applies anyway, and
+     * the addend payload is returned. */
     ctx_init_test(&ctx, base);
     write_be32(base, code, w_aform(63U, 1U, 2U, 3U, 4U, 29U, 0U));
     ctx.nip = code;
     ctx.fpr[2] = d64(0.0);
     ctx.fpr[4] = d64(INFINITY);
-    ctx.fpr[3] = 0x7ff8000000000000ULL;
+    ctx.fpr[3] = 0x7ff80000deadbeefULL;
     interp_step(&ctx);
     CHECK(((ctx.fpscr >> 20) & 1U) != 0U, "r7-21 VXIMZ despite NaN");
+    CHECK(ctx.fpr[1] == 0x7ff80000deadbeefULL, "r7-21 NaN payload kept");
+
+    /* fmadd(0, +inf, SNaN): VXIMZ and VXSNAN, quieted payload. */
+    ctx_init_test(&ctx, base);
+    ctx.nip = code;
+    ctx.fpr[2] = d64(0.0);
+    ctx.fpr[4] = d64(INFINITY);
+    ctx.fpr[3] = 0x7ff0000000000001ULL;
+    interp_step(&ctx);
+    CHECK(((ctx.fpscr >> 20) & 1U) != 0U, "r7-21 VXIMZ with SNaN");
+    CHECK(((ctx.fpscr >> 24) & 1U) != 0U, "r7-21 VXSNAN with SNaN");
+    CHECK(ctx.fpr[1] == 0x7ff8000000000001ULL, "r7-21 SNaN quieted");
 
     /* Control: NaN addend without 0*inf raises no VXIMZ. */
     ctx_init_test(&ctx, base);
@@ -375,7 +429,8 @@ static void test_r7_22_fprf32(uint8_t *base)
     CHECK(((ctx.fpscr >> 12) & 0x1fU) == 0x14U, "r7-22 FPRF subnormal");
 }
 
-/* P32-R7-23: comparisons update FPCC only, preserving FPSCR[C]. */
+/* P32-R7-23: comparisons update FPCC (bits 15..12) only, preserving
+ * FPSCR[C] (bit 16, 0x10000). */
 static void test_r7_23_fcmp_c(uint8_t *base)
 {
     ppc32_ctx_t ctx;
@@ -387,10 +442,20 @@ static void test_r7_23_fcmp_c(uint8_t *base)
     ctx.nip = code;
     ctx.fpr[2] = d64(1.0);
     ctx.fpr[3] = d64(1.0);
-    ctx.fpscr = 1U << 12;
+    ctx.fpscr = 1U << 16;
     interp_step(&ctx);
-    CHECK(((ctx.fpscr >> 12) & 1U) != 0U, "r7-23 C preserved");
-    CHECK(((ctx.fpscr >> 13) & 0xfU) == 0x2U, "r7-23 FPCC=EQ");
+    CHECK(((ctx.fpscr >> 16) & 1U) != 0U, "r7-23 C preserved");
+    CHECK(((ctx.fpscr >> 12) & 0xfU) == 0x2U, "r7-23 FPCC=EQ");
+
+    /* Less-than with C preset: LT lands in FPCC, C is untouched. */
+    ctx_init_test(&ctx, base);
+    ctx.nip = code;
+    ctx.fpr[2] = d64(1.0);
+    ctx.fpr[3] = d64(2.0);
+    ctx.fpscr = 1U << 16;
+    interp_step(&ctx);
+    CHECK(((ctx.fpscr >> 16) & 1U) != 0U, "r7-23 LT keeps C");
+    CHECK(((ctx.fpscr >> 12) & 0xfU) == 0x8U, "r7-23 FPCC=LT");
 
     /* Unordered with C clear: C stays clear, FPCC=UN. */
     ctx_init_test(&ctx, base);
@@ -398,8 +463,8 @@ static void test_r7_23_fcmp_c(uint8_t *base)
     ctx.fpr[2] = 0x7ff8000000000000ULL;
     ctx.fpr[3] = d64(1.0);
     interp_step(&ctx);
-    CHECK(((ctx.fpscr >> 12) & 1U) == 0U, "r7-23 unordered keeps C clear");
-    CHECK(((ctx.fpscr >> 13) & 0xfU) == 0x1U, "r7-23 FPCC=UN");
+    CHECK(((ctx.fpscr >> 16) & 1U) == 0U, "r7-23 unordered keeps C clear");
+    CHECK(((ctx.fpscr >> 12) & 0xfU) == 0x1U, "r7-23 FPCC=UN");
 }
 
 /* P32-R7-24: mftb/mfspr serve a coherent advancing time-base. */
@@ -426,6 +491,16 @@ static void test_r7_24_mftb(uint8_t *base)
     interp_step(&ctx);
     CHECK(ctx.exit_reason == PPC32_EXIT_NONE, "r7-24 mfspr TBU works");
     (void)lo1;
+
+    /* mftb with an invalid TBR (8, the LR encoding) is UNDEF. */
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, w_xform(3U, 8U, 0U, 371U, 0U));
+    ctx.nip = code;
+    ctx.lr = 0x12345678U;
+    interp_step(&ctx);
+    CHECK(ctx.exit_reason == PPC32_EXIT_UNDEF, "r7-24 bad TBR UNDEF");
+    CHECK(ctx.nip == code, "r7-24 bad TBR holds NIP");
+    CHECK(ctx.gpr[3] == 0U, "r7-24 bad TBR no side effects");
 }
 
 /* P32-R7-25: integer update forms validate RA!=0 and RA!=RT. */

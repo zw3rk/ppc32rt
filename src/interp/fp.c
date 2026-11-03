@@ -61,7 +61,7 @@ static void fp_invalid(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
         return;
     }
     ctx->fpscr &= ~(F_FR_M | F_FI_M);
-    fp_flags_arith(ctx, q, 0, 0, single);
+    fp_flags_arith(ctx, q, 0, 0, 0, single);
     fp_raise(ctx, vx | F_VX_M);
     fp_done(ctx, insn, q);
 }
@@ -83,7 +83,7 @@ static void fp_nanres(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint64_t n,
         ctx->fpscr &= ~F_FR_M;
         fp_raise(ctx, F_VXSNAN_M | F_VX_M);
     }
-    fp_flags_arith(ctx, q, 0, 0, single);
+    fp_flags_arith(ctx, q, 0, 0, 0, single);
     fp_done(ctx, insn, q);
 }
 
@@ -96,13 +96,15 @@ static void fp_zero_divide(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     ctx->nip += 4u;
 }
 
-/* Commit rounded result: INEXACT, sticky bits, restore, store. */
+/* Commit rounded result: INEXACT, sticky bits, restore, store.
+ * fr_inc reports whether the rounded magnitude strictly increased
+ * (P32-R7-19: FR), computed by the caller in long double. */
 static void fp_commit(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint64_t r,
-    int old, int single)
+    int old, int single, int fr_inc)
 {
     int inexact = fetestexcept(FE_INEXACT) != 0;
     uint32_t st = fp_end(old);
-    fp_flags_arith(ctx, r, inexact, st, single);
+    fp_flags_arith(ctx, r, inexact, fr_inc, st, single);
     fp_done(ctx, insn, r);
 }
 
@@ -196,16 +198,27 @@ static void fp_arith(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int op,
             fp_zero_divide(ctx, insn);
             return;
         }
-        if (op == 0) {
-            r = fp_xtod(fp_u32(fa + fb));
-        } else if (op == 1) {
-            r = fp_xtod(fp_u32(fa - fb));
-        } else if (op == 2) {
-            r = fp_xtod(fp_u32(fa * fb));
-        } else {
-            r = fp_xtod(fp_u32(fa / fb));
+        {
+            float fr;
+            long double exact;
+
+            if (op == 0) {
+                fr = fa + fb;
+                exact = (long double)fa + (long double)fb;
+            } else if (op == 1) {
+                fr = fa - fb;
+                exact = (long double)fa - (long double)fb;
+            } else if (op == 2) {
+                fr = fa * fb;
+                exact = (long double)fa * (long double)fb;
+            } else {
+                fr = fa / fb;
+                exact = (long double)fa / (long double)fb;
+            }
+            r = fp_xtod(fp_u32(fr));
+            fp_commit(ctx, insn, r, old, 1,
+                fp_rounded_up(exact, (long double)fr));
         }
-        fp_commit(ctx, insn, r, old, 1);
         return;
     }
     sub = fp_inv2(op, da, db);
@@ -219,20 +232,63 @@ static void fp_arith(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int op,
         return;
     }
     {
+        double fa = fp_f64(da);
+        double fb = fp_f64(db);
         double fr;
+        long double exact;
         int old = fp_begin(ctx);
         if (op == 0) {
-            fr = fp_f64(da) + fp_f64(db);
+            fr = fa + fb;
+            exact = (long double)fa + (long double)fb;
         } else if (op == 1) {
-            fr = fp_f64(da) - fp_f64(db);
+            fr = fa - fb;
+            exact = (long double)fa - (long double)fb;
         } else if (op == 2) {
-            fr = fp_f64(da) * fp_f64(db);
+            fr = fa * fb;
+            exact = (long double)fa * (long double)fb;
         } else {
-            fr = fp_f64(da) / fp_f64(db);
+            fr = fa / fb;
+            exact = (long double)fa / (long double)fb;
         }
         r = fp_u64(fr);
-        fp_commit(ctx, insn, r, old, 0);
+        fp_commit(ctx, insn, r, old, 0,
+            fp_rounded_up(exact, (long double)fr));
     }
+}
+
+/* 0*inf product with a NaN addend (P32-R7-21): VXIMZ is raised
+ * (plus VXSNAN when any operand is an SNaN); a NaN addend yields its
+ * quieted payload, otherwise the default QNaN path applies. VE
+ * suppresses the destination update. */
+static void fp_fused_imz(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
+    uint64_t pa, uint64_t pc, uint64_t pb, int single)
+{
+    uint64_t ops[3];
+    int snan = 0;
+    int i;
+
+    ops[0] = pa;
+    ops[1] = pc;
+    ops[2] = pb;
+    for (i = 0; i < 3; i++) {
+        if (fp_isnan(ops[i]) && (ops[i] & 0x8000000000000ull) == 0u) {
+            snan = 1;
+        }
+    }
+    if (fp_isnan(pb)) {
+        uint64_t q = pb | 0x8000000000000ull;
+        uint32_t vx = F_VXIMZ_M | (snan ? F_VXSNAN_M : 0u);
+        if (fp_ve_enabled(ctx)) {
+            fp_raise(ctx, vx | F_VX_M);
+            if (insn->rc) fp_cr1(ctx);
+            ctx->nip += 4u;
+            return;
+        }
+        fp_raise(ctx, F_VXIMZ_M | F_VX_M);
+        fp_nanres(ctx, insn, q, snan, single);
+        return;
+    }
+    fp_invalid(ctx, insn, F_VXIMZ_M | (snan ? F_VXSNAN_M : 0u), single);
 }
 
 /* Fused multiply-add; kind: 0 madd, 1 msub, 2 nmadd, 3 nmsub. */
@@ -249,7 +305,10 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
     int snan = 0;
     int i;
     /* P32-R7-21: a 0*inf multiplication raises VXIMZ even when the
-     * addend is NaN, so this check precedes NaN propagation. */
+     * addend is NaN, so this check precedes NaN propagation. When the
+     * addend (frB) is a NaN, VXSNAN is recorded iff any operand is an
+     * SNaN, and the quieted addend payload is returned (not a default
+     * NaN). With VE set the exception suppresses the destination. */
     if (single) {
         float fa0 = (float)fp_f64(pa);
         float fc0 = (float)fp_f64(pc);
@@ -257,12 +316,12 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
         uint32_t ssc = fp_u32(fc0);
         if ((fp_szero(ssa) && fp_sinf(ssc)) ||
             (fp_szero(ssc) && fp_sinf(ssa))) {
-            fp_invalid(ctx, insn, F_VXIMZ_M, 1);
+            fp_fused_imz(ctx, insn, pa, pc, pb, 1);
             return;
         }
     } else if ((fp_iszero(pa) && fp_isinf(pc)) ||
         (fp_iszero(pc) && fp_isinf(pa))) {
-        fp_invalid(ctx, insn, F_VXIMZ_M, 0);
+        fp_fused_imz(ctx, insn, pa, pc, pb, 0);
         return;
     }
     ops[0] = pa;
@@ -319,19 +378,27 @@ static void fp_fused(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int kind,
             fr = -fr;
         }
         r = fp_xtod(fp_u32(fr));
-        fp_commit(ctx, insn, r, old, 1);
+        /* Negation never changes magnitude, so the addend sign is
+         * immaterial to the FR comparison. */
+        fp_commit(ctx, insn, r, old, 1, fp_rounded_up(
+            (long double)fa * (long double)fc + (long double)fb,
+            (long double)fr));
         return;
     }
     {
+        double da = fp_f64(pa);
+        double dc = fp_f64(pc);
+        double db = fp_f64(pb);
         double fr;
         int old = fp_begin(ctx);
-        fr = fma(fp_f64(pa), fp_f64(pc), kind == 1 || kind == 3 ?
-            -fp_f64(pb) : fp_f64(pb));
+        fr = fma(da, dc, kind == 1 || kind == 3 ? -db : db);
         if (kind >= 2) {
             fr = -fr;
         }
         r = fp_u64(fr);
-        fp_commit(ctx, insn, r, old, 0);
+        fp_commit(ctx, insn, r, old, 0, fp_rounded_up(
+            (long double)da * (long double)dc + (long double)db,
+            (long double)fr));
     }
 }
 
@@ -351,13 +418,22 @@ static void fp_sqrt(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int single)
         return;
     }
     {
+        double av = fp_f64(a);
+        long double exact = sqrtl((long double)av);
         int old = fp_begin(ctx);
         if (single) {
-            r = fp_xtod(fp_u32(sqrtf((float)fp_f64(a))));
+            float fr = sqrtf((float)av);
+
+            r = fp_xtod(fp_u32(fr));
+            fp_commit(ctx, insn, r, old, single,
+                fp_rounded_up(exact, (long double)fr));
         } else {
-            r = fp_u64(sqrt(fp_f64(a)));
+            double fr = sqrt(av);
+
+            r = fp_u64(fr);
+            fp_commit(ctx, insn, r, old, single,
+                fp_rounded_up(exact, (long double)fr));
         }
-        fp_commit(ctx, insn, r, old, single);
     }
 }
 
@@ -393,15 +469,15 @@ static void fp_fcmp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int cmpu)
         ret = 0x02u;
     }
     ctx->cr = (ctx->cr & ~(0xfu << shift)) | (ret << shift);
-    /* P32-R7-23: comparisons update only the four FPCC bits (13..16);
-     * FPSCR[C] (bit 12) is preserved, never forced. */
-    ctx->fpscr = (ctx->fpscr & ~(0xfu << 13)) | (ret << 13);
+    /* P32-R7-23: comparisons update only the four FPCC bits (15..12,
+     * mask 0xf000); FPSCR[C] (bit 16, 0x10000) is preserved, never
+     * forced — unordered compares leave a preset C set. */
+    ctx->fpscr = (ctx->fpscr & ~(0xfu << 12)) | (ret << 12);
     if (ret == 0x01u) {
         int snan = (fp_isnan(a) && (a & 0x8000000000000ull) == 0u) ||
             (fp_isnan(b) && (b & 0x8000000000000ull) == 0u);
         if (!cmpu) {
             fp_raise(ctx, F_VXVC_M | F_VX_M);
-            ctx->fpscr |= (0x01u << 16);
             if (snan) {
                 fp_raise(ctx, F_VXSNAN_M | F_VX_M);
             }
@@ -422,7 +498,16 @@ static void fp_fctiw_invalid(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
     int snan, int positive)
 {
     uint64_t sat = positive ? 0x000000007fffffffu : 0x0000000080000000ull;
+    uint32_t vx = F_VXCVI_M | (snan ? F_VXSNAN_M : 0u);
 
+    /* P32-R7-7: with VE set the exception is recorded but the
+     * destination word is not committed. */
+    if (fp_ve_enabled(ctx)) {
+        fp_raise(ctx, vx | F_VX_M);
+        if (insn->rc) fp_cr1(ctx);
+        ctx->nip += 4u;
+        return;
+    }
     ctx->fpscr &= ~(F_FR_M | F_FI_M);
     fp_raise(ctx, F_VXCVI_M | F_VX_M);
     if (snan) {
@@ -470,12 +555,15 @@ static void fp_fctiw(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, int toz)
         fesetround(old);
         ctx->fpr[insn->rt & 31u] = ((uint64_t)(uint32_t)iv) |
             ((uint64_t)(iv < 0 ? 0xffffffffu : 0u) << 32);
-        /* P32-R7-19: FR is computed alongside FI and cleared when the
-         * conversion is exact. */
+        /* P32-R7-19: FI is set whenever the conversion is inexact; FR
+         * only when the rounded magnitude strictly increased. */
         ctx->fpscr &= ~(F_FI_M | F_FR_M);
         if (inexact) {
             fp_raise(ctx, F_XX_M);
-            ctx->fpscr |= F_FI_M | F_FR_M;
+            ctx->fpscr |= F_FI_M;
+            if (fp_rounded_up((long double)v, (long double)rr)) {
+                ctx->fpscr |= F_FR_M;
+            }
         }
         if (insn->rc) fp_cr1(ctx);
         ctx->nip += 4u;
@@ -493,10 +581,12 @@ static void fp_frsp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         return;
     }
     {
+        double av = fp_f64(a);
         int old = fp_begin(ctx);
-        float fr = (float)fp_f64(a);
+        float fr = (float)av;
         r = fp_xtod(fp_u32(fr));
-        fp_commit(ctx, insn, r, old, 1);
+        fp_commit(ctx, insn, r, old, 1,
+            fp_rounded_up((long double)av, (long double)fr));
     }
 }
 

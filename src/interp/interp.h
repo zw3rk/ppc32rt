@@ -765,7 +765,12 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
                 ctx->gpr[insn->rt] = (uint32_t)(ppc32_tb_now() >> 32);
                 break;
             case PPC32_SPR_SPEFSCR:
-                /* P32-R7-13: SPEFSCR is user-accessible. */
+                /* P32-R7-13: SPEFSCR is user-accessible, but only on
+                 * the SPE profile; classic profiles take UNDEF. */
+                if (ctx->profile != PPC32_PROFILE_SPE) {
+                    ctx->exit_reason = PPC32_EXIT_UNDEF;
+                    break;
+                }
                 ctx->gpr[insn->rt] = ctx->spefscr;
                 break;
             case PPC32_SPR_PVR:
@@ -780,6 +785,11 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
             case PPC32_SPR_LR:  ctx->lr = ctx->gpr[insn->rs]; break;
             case PPC32_SPR_CTR: ctx->ctr = ctx->gpr[insn->rs]; break;
             case PPC32_SPR_SPEFSCR:
+                /* P32-R7-13: classic profiles cannot write SPEFSCR. */
+                if (ctx->profile != PPC32_PROFILE_SPE) {
+                    ctx->exit_reason = PPC32_EXIT_UNDEF;
+                    break;
+                }
                 ctx->spefscr = ctx->gpr[insn->rs] & SPE_WRITABLE;
                 break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;

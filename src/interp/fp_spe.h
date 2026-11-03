@@ -234,12 +234,12 @@ static inline uint32_t fp_mac_lane(ppc32_ctx_t *ctx, uint64_t prod, int f,
 /* SPE MAC (EREF-best-effort; qemu-ppc SIGILLs all MAC, unverifiable
  * via oracle. Whole-word ops work per 32-bit lane (high word halves
  * and low word halves independently); s=signed, f=fractional,
- * acc=accumulate into rD lanes (and ACC), acp=accumulate into ACC
- * with rD=ACC, sat=saturate, high=high-32 (else low-32),
- * half=guarded-halfword, odd=odd halves (else even). Guarded ops
- * sign/zero-extend the selected halfword products into one 64-bit
- * sum accumulated into ACC (rD=ACC). evmra (rD=rA, ACC=rA) matches
- * qemu. */
+ * acc=`a` suffix (rD=product, ACC=rD), acp=`aa` suffix (per-lane
+ * ACC=ACC+product, rD=ACC), sat=saturate, high=high-32 (else
+ * low-32), half=guarded-halfword, odd=odd halves (else even).
+ * Guarded `aa` ops accumulate one 64-bit product from the high-word
+ * selected halfword into ACC (rD=ACC). evmra (rD=rA, ACC=rA)
+ * matches qemu. */
 static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
     uint64_t d, int s, int f, int acc, int acp, int sat, int high, int half,
     int odd)
@@ -249,20 +249,19 @@ static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
         uint32_t a1 = (uint32_t)((a >> (odd ? 0u : 16u)) & 0xffffu);
         uint32_t b0 = (uint32_t)((b >> (odd ? 32u : 48u)) & 0xffffu);
         uint32_t b1 = (uint32_t)((b >> (odd ? 0u : 16u)) & 0xffffu);
-        uint64_t sum;
 
-        if (s) {
-            int64_t p0 = (int64_t)(int32_t)(int16_t)a0 *
-                (int64_t)(int32_t)(int16_t)b0;
-            int64_t p1 = (int64_t)(int32_t)(int16_t)a1 *
-                (int64_t)(int32_t)(int16_t)b1;
-
-            sum = (uint64_t)(p0 + p1);
-        } else {
-            sum = (uint64_t)(a0 * b0) + (uint64_t)(a1 * b1);
-        }
         if (acp) {
-            ctx->acc += sum;
+            /* P32-R7-10: guarded `aa` forms accumulate a single
+             * 64-bit product from the high-word selected halfword
+             * (even -> halfword 0, odd -> halfword 1) into ACC. */
+            if (s) {
+                int64_t p = (int64_t)(int16_t)a0 *
+                    (int64_t)(int16_t)b0;
+
+                ctx->acc = (uint64_t)((int64_t)ctx->acc + p);
+            } else {
+                ctx->acc += (uint64_t)a0 * (uint64_t)b0;
+            }
             return ctx->acc;
         }
         {
@@ -289,6 +288,9 @@ static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
         uint64_t res = ((uint64_t)selh << 32) | sell;
 
         if (acp) {
+            /* P32-R7-10: the `aa` suffix adds per-lane 32-bit halves
+             * (acc_hi + prod_hi, acc_lo + prod_lo) with 32-bit wrap
+             * and no 64-bit carry across the lane boundary. */
             if (sat) {
                 uint64_t sh = (uint64_t)(uint32_t)(ctx->acc >> 32) + selh;
                 uint64_t sl = (uint64_t)(uint32_t)ctx->acc + sell;
@@ -303,20 +305,19 @@ static inline uint64_t fp_spe_mac(ppc32_ctx_t *ctx, uint64_t a, uint64_t b,
                     << 32) | (sl > 0xffffffffull ? 0xffffffffu :
                     (uint32_t)sl);
             } else {
-                ctx->acc += res;
+                uint32_t ah2 = (uint32_t)(ctx->acc >> 32);
+                uint32_t al2 = (uint32_t)ctx->acc;
+
+                ctx->acc = ((uint64_t)(ah2 + selh) << 32) |
+                    (uint64_t)(al2 + sell);
             }
             return ctx->acc;
         }
         if (acc) {
-            uint32_t dh = (uint32_t)(d >> 32);
-            uint32_t dl = (uint32_t)d;
-            uint32_t rh = sat ? fp_mac_sat_add(ctx, dh, selh, 1) :
-                dh + selh;
-            uint32_t rl = sat ? fp_mac_sat_add(ctx, dl, sell, 0) :
-                dl + sell;
-
-            ctx->acc += res;
-            return ((uint64_t)rh << 32) | rl;
+            /* P32-R7-10: the `a` suffix sets rD = product and
+             * ACC = rD, ignoring the old ACC (and old rD). */
+            ctx->acc = res;
+            return res;
         }
         return res;
     }

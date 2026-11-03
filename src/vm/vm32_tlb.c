@@ -464,6 +464,33 @@ bool vm32_page_is_eof_trap(uint32_t gva)
     return trapped;
 }
 
+/* P32-R7-3: mark mapped guest pages guest-executable (page-granular).
+ * Used for the on-stack sigreturn trampoline, which the interpreter
+ * fetch check requires to be executable. Unmapped and EOF-trap pages
+ * are left alone so later accesses still fault. */
+void vm32_mark_guest_exec(uint32_t start_gva, uint32_t end_gva)
+{
+    uint32_t first;
+    uint32_t last;
+    uint32_t vpn;
+    uintptr_t base;
+
+    if (!clamp_range(start_gva, end_gva, &first, &last)) {
+        return;
+    }
+    base = vm32_arena_base();
+    tlb_lock();
+    for (vpn = first; vpn < last; vpn++) {
+        if (g_page_state[vpn] == VM32_PAGE_UNMAPPED ||
+            g_page_state[vpn] == (uint8_t)VM32_PAGE_EOF_TRAP) {
+            continue;
+        }
+        g_page_exec[vpn] = 1U;
+        tlb_refresh_slot_locked(vpn, base);
+    }
+    tlb_unlock();
+}
+
 /* P32-R7-3: guest execute permission for one VA (page-granular). */
 bool vm32_page_is_exec(uint32_t gva)
 {

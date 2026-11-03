@@ -22,6 +22,7 @@
 
 #include "interp/decode.h"
 #include "interp/interp.h"
+#include "os/signals.h"
 #include "os/syscalls.h"
 #include "ppc32rt.h"
 #include "vm/vm32.h"
@@ -214,6 +215,47 @@ static void test_r7_3_nx_fetch(uint8_t *base)
     CHECK(ctx.nip == code + 4U, "r7-3 EXEC fetch advances");
 }
 
+/* P32-R7-3: delivery without SA_RESTORER leaves an executable on-stack
+ * sigreturn trampoline (`li r0,172; sc`), so returning from the
+ * handler passes the interpreter NX fetch check on an RW stack. */
+static void test_r7_3_sigtramp_exec(uint8_t *base)
+{
+    ppc32_ctx_t ctx;
+    ppc32_sigact_t act;
+    const uint32_t code = 0x100000U;
+    uint32_t frame = 0U;
+    int rc;
+
+    ctx_init_test(&ctx, base);
+    /* Simulate the RW-only stack mapping. The frame builder checks
+     * the per-ctx region table (the global table is empty on the
+     * host harness), so drop the vm_ready shortcut here. */
+    ctx.vm_ready = false;
+    vm32_record_map(0x170000U, 0x180000U, PROT_READ | PROT_WRITE,
+        VM32_PAGE_ANON);
+    memset(&act, 0, sizeof act);
+    act.handler = code;
+    act.flags = 0U;
+    ctx.gpr[1] = 0x180000U;
+    rc = ppc32_sig_build_frame(&ctx, (int)PPC32_SIGSEGV, &act, 1, 0U,
+        0x300U, 0U, &frame);
+    CHECK(rc == 0, "r7-3 frame builds");
+    CHECK(frame != 0U, "r7-3 frame address out");
+    CHECK(vm32_page_is_exec(ctx.lr) != false, "r7-3 trampoline page exec");
+    CHECK(vm32_page_is_exec(ctx.lr + 7U) != false,
+        "r7-3 trampoline tail exec");
+
+    /* Run the trampoline itself: `li r0,172` then `sc`. */
+    ctx.vm_ready = true;
+    ctx.nip = ctx.lr;
+    ctx.exit_reason = PPC32_EXIT_NONE;
+    interp_step(&ctx);
+    CHECK(ctx.exit_reason == PPC32_EXIT_NONE, "r7-3 trampoline li runs");
+    CHECK(ctx.gpr[0] == 172U, "r7-3 trampoline loads sigreturn nr");
+    interp_step(&ctx);
+    CHECK(ctx.exit_reason == PPC32_EXIT_SYSCALL, "r7-3 trampoline sc traps");
+}
+
 /* P32-R7-4: stwcx. succeeds undisturbed, fails after an ordinary
  * same-value store (cross-ctx ABA), and never deadlocks the store
  * path. The LL serialization itself is structural (see llsc.c). */
@@ -367,6 +409,19 @@ static void test_r7_7_enabled_suppress(uint8_t *base)
     ctx.fpr[3] = d64(0.0);
     interp_step(&ctx);
     CHECK(ctx.fpr[1] == d64(INFINITY), "r7-7 plain fdiv commits inf");
+
+    /* VE=1: fctiw(NaN) raises VXCVI, keeps FRT. */
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, w_fxform(1U, 0U, 2U, 14U, 0U));
+    ctx.nip = code;
+    ctx.fpr[2] = 0x7ff8000000000000ULL;
+    ctx.fpr[1] = sentinel;
+    ctx.fpscr = 1U << 7;
+    interp_step(&ctx);
+    CHECK(ctx.exit_reason == PPC32_EXIT_NONE, "r7-7 VE fctiw steps");
+    CHECK(ctx.fpr[1] == sentinel, "r7-7 VE fctiw keeps FRT");
+    CHECK(((ctx.fpscr >> 8) & 1U) != 0U, "r7-7 VXCVI raised");
+    CHECK(ctx.nip == code + 4U, "r7-7 VE fctiw advances");
 }
 
 /* P32-R7-8: vector float compares fill one CR nibble, no bleed. */
@@ -457,6 +512,73 @@ static void test_r7_10_mac(uint8_t *base)
     CHECK(ctx.gpr[16] == 0x00000004U && ctx.gpr_hi[16] == 0x00000001U,
         "r7-10 evmwlumia per-lane rD");
     CHECK(ctx.acc == 0x0000000100000004ULL, "r7-10 evmwlumia ACC");
+
+    /* evmwhsmia (`a`): rD = product and ACC = rD, ignoring nonzero
+     * old rD and ACC. */
+    ctx_init_test(&ctx, base);
+    spe_mode(&ctx);
+    write_be32(base, code, w_spe(16U, 14U, 15U, 1133U));
+    ctx.nip = code;
+    ctx.gpr[14] = 0x00010000U;
+    ctx.gpr_hi[14] = 0x00010000U;
+    ctx.gpr[15] = 0x00010000U;
+    ctx.gpr_hi[15] = 0x00010000U;
+    ctx.gpr[16] = 5U;
+    ctx.gpr_hi[16] = 5U;
+    ctx.acc = 0x0000000700000007ULL;
+    interp_step(&ctx);
+    CHECK(ctx.gpr[16] == 0x00000001U && ctx.gpr_hi[16] == 0x00000001U,
+        "r7-10 evmwhsmia rD ignores old state");
+    CHECK(ctx.acc == 0x0000000100000001ULL, "r7-10 evmwhsmia ACC=rD");
+
+    /* evmwhsmiaa (`aa`): per-lane 32-bit ACC addition with no 64-bit
+     * carry across the lane boundary. */
+    ctx_init_test(&ctx, base);
+    spe_mode(&ctx);
+    write_be32(base, code, w_spe(16U, 14U, 15U, 1357U));
+    ctx.nip = code;
+    ctx.gpr[14] = 0x00010000U;
+    ctx.gpr_hi[14] = 0x00010000U;
+    ctx.gpr[15] = 0x00010000U;
+    ctx.gpr_hi[15] = 0x00010000U;
+    ctx.gpr[16] = 0U;
+    ctx.gpr_hi[16] = 0U;
+    ctx.acc = 0x00000000ffffffffULL;
+    interp_step(&ctx);
+    CHECK(ctx.acc == 0x0000000100000000ULL, "r7-10 evmwhsmiaa no carry");
+    CHECK(ctx.gpr[16] == 0U && ctx.gpr_hi[16] == 1U,
+        "r7-10 evmwhsmiaa rD=ACC");
+
+    /* evmhegsmiaa: a single even-halfword product accumulates into
+     * the 64-bit ACC (both halves are 1*1, only one counts). */
+    ctx_init_test(&ctx, base);
+    spe_mode(&ctx);
+    write_be32(base, code, w_spe(16U, 14U, 15U, 1321U));
+    ctx.nip = code;
+    ctx.gpr[14] = 0x00010000U;
+    ctx.gpr_hi[14] = 0x00010000U;
+    ctx.gpr[15] = 0x00010000U;
+    ctx.gpr_hi[15] = 0x00010000U;
+    ctx.gpr[16] = 0U;
+    ctx.gpr_hi[16] = 0U;
+    ctx.acc = 0U;
+    interp_step(&ctx);
+    CHECK(ctx.acc == 1ULL, "r7-10 evmhegsmiaa single product");
+
+    /* evmhogumiaa: the odd-halfword product accumulates likewise. */
+    ctx_init_test(&ctx, base);
+    spe_mode(&ctx);
+    write_be32(base, code, w_spe(16U, 14U, 15U, 1324U));
+    ctx.nip = code;
+    ctx.gpr[14] = 0x00010001U;
+    ctx.gpr_hi[14] = 0x00010001U;
+    ctx.gpr[15] = 0x00010001U;
+    ctx.gpr_hi[15] = 0x00010001U;
+    ctx.gpr[16] = 0U;
+    ctx.gpr_hi[16] = 0U;
+    ctx.acc = 0U;
+    interp_step(&ctx);
+    CHECK(ctx.acc == 1ULL, "r7-10 evmhogumiaa single product");
 }
 
 /* P32-R7-11: fractional converts use signed 2^31 scaling with the
@@ -543,6 +665,41 @@ static void test_r7_13_spefscr(uint8_t *base)
     interp_step(&ctx);
     CHECK((ctx.spefscr & 0x00100800U) == 0x00100800U,
         "r7-13 NaN sets FINV|FINVS");
+
+    /* Classic profile: mtspr/mfspr 512 are UNDEF. */
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, w_xform(3U, 0U, 16U, 467U, 0U));
+    ctx.nip = code;
+    ctx.gpr[3] = 0xffffffffU;
+    interp_step(&ctx);
+    CHECK(ctx.exit_reason == PPC32_EXIT_UNDEF, "r7-13 classic mtspr UNDEF");
+    CHECK(ctx.nip == code, "r7-13 classic mtspr holds NIP");
+    ctx_init_test(&ctx, base);
+    write_be32(base, code, w_xform(4U, 0U, 16U, 339U, 0U));
+    ctx.nip = code;
+    interp_step(&ctx);
+    CHECK(ctx.exit_reason == PPC32_EXIT_UNDEF, "r7-13 classic mfspr UNDEF");
+    CHECK(ctx.nip == code, "r7-13 classic mfspr holds NIP");
+
+    /* efsmul overflow saturates to pmax with FOVF when FOVFE is clear. */
+    ctx_init_test(&ctx, base);
+    spe_mode(&ctx);
+    write_be32(base, code, w_spe(16U, 14U, 15U, 712U));
+    ctx.nip = code;
+    ctx.gpr[14] = 0x7f000000U;
+    ctx.gpr[15] = 0x7f000000U;
+    interp_step(&ctx);
+    CHECK(ctx.gpr[16] == 0x7f7fffffU, "r7-13 overflow saturates to pmax");
+    CHECK((ctx.spefscr & 0x00000100U) != 0U, "r7-13 FOVF recorded");
+
+    /* Negative overflow saturates to nmax. */
+    ctx_init_test(&ctx, base);
+    spe_mode(&ctx);
+    ctx.nip = code;
+    ctx.gpr[14] = 0xff000000U;
+    ctx.gpr[15] = 0x7f000000U;
+    interp_step(&ctx);
+    CHECK(ctx.gpr[16] == 0xff7fffffU, "r7-13 overflow saturates to nmax");
 }
 int main(void)
 {
@@ -555,6 +712,7 @@ int main(void)
     test_r7_1_fault_before_commit(base);
     test_r7_2_fetch_fault(base);
     test_r7_3_nx_fetch(base);
+    test_r7_3_sigtramp_exec(base);
     test_r7_4_sc_serial(base);
     test_r7_5_cr1(base);
     test_r7_6_add_infinities(base);
