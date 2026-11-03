@@ -232,7 +232,9 @@ int ppc32_put_stat(const ppc32_ctx_t *ctx, uint32_t va, const struct stat *hs)
 {
     ppc32_stat_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: write needs a mapped, writable, untrapped target. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     memset(&gs, 0, sizeof gs);
@@ -252,15 +254,16 @@ int ppc32_put_stat(const ppc32_ctx_t *ctx, uint32_t va, const struct stat *hs)
     gs.st_mtime_nsec = ppc32_be32((uint32_t)stat_nsec_mt(hs));
     gs.st_ctime = (int32_t)ppc32_be32((uint32_t)stat_sec_ct(hs));
     gs.st_ctime_nsec = ppc32_be32((uint32_t)stat_nsec_ct(hs));
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
 int ppc32_put_stat64(const ppc32_ctx_t *ctx, uint32_t va, const struct stat *hs)
 {
     ppc32_stat64_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: write needs a mapped, writable, untrapped target. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     memset(&gs, 0, sizeof gs);
@@ -280,44 +283,49 @@ int ppc32_put_stat64(const ppc32_ctx_t *ctx, uint32_t va, const struct stat *hs)
     gs.st_mtime_nsec = ppc32_be32((uint32_t)stat_nsec_mt(hs));
     gs.st_ctime = (int32_t)ppc32_be32((uint32_t)stat_sec_ct(hs));
     gs.st_ctime_nsec = ppc32_be32((uint32_t)stat_nsec_ct(hs));
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
 int ppc32_put_timespec(const ppc32_ctx_t *ctx, uint32_t va, const struct timespec *hs)
 {
     ppc32_timespec_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: write needs a mapped, writable, untrapped target. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     gs.tv_sec = (int32_t)ppc32_be32((uint32_t)hs->tv_sec);
     gs.tv_nsec = (int32_t)ppc32_be32((uint32_t)hs->tv_nsec);
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
 int ppc32_put_timeval(const ppc32_ctx_t *ctx, uint32_t va, const struct timeval *hs)
 {
     ppc32_timeval_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: write needs a mapped, writable, untrapped target. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     gs.tv_sec = (int32_t)ppc32_be32((uint32_t)hs->tv_sec);
     gs.tv_usec = (int32_t)ppc32_be32((uint32_t)hs->tv_usec);
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
 int ppc32_get_timespec(const ppc32_ctx_t *ctx, uint32_t va, struct timespec *hs)
 {
     ppc32_timespec_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: read needs a mapped, readable, untrapped source. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 1U)) {
         return -EFAULT;
     }
-    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    if (ppc32_vm_copyin_safe(ctx, va, &gs, sizeof gs) != 0) {
+        return -EFAULT;
+    }
     hs->tv_sec = (time_t)(int32_t)ppc32_be32((uint32_t)gs.tv_sec);
     hs->tv_nsec = (long)(int32_t)ppc32_be32((uint32_t)gs.tv_nsec);
     return 0;
@@ -329,7 +337,9 @@ int ppc32_termios_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
 #ifdef __linux__
     ppc32_termios_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: write needs a mapped, writable, untrapped target. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     memset(&gs, 0, sizeof gs);
@@ -347,8 +357,7 @@ int ppc32_termios_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
     gs.c_ispeed = ppc32_be32((uint32_t)hs->__c_ispeed);
     gs.c_ospeed = ppc32_be32((uint32_t)hs->__c_ospeed);
 #endif
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 #else
     (void)ctx;
     (void)va;
@@ -363,10 +372,14 @@ int ppc32_termios_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
 #ifdef __linux__
     ppc32_termios_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: read needs a mapped, readable, untrapped source. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 1U)) {
         return -EFAULT;
     }
-    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    if (ppc32_vm_copyin_safe(ctx, va, &gs, sizeof gs) != 0) {
+        return -EFAULT;
+    }
     memset(hs, 0, sizeof *hs);
     hs->c_iflag = (tcflag_t)ppc32_be32(gs.c_iflag);
     hs->c_oflag = (tcflag_t)ppc32_be32(gs.c_oflag);
@@ -396,15 +409,16 @@ int ppc32_winsize_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
 {
     ppc32_winsize_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: write needs a mapped, writable, untrapped target. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     gs.ws_row = ppc32_be16(hs->ws_row);
     gs.ws_col = ppc32_be16(hs->ws_col);
     gs.ws_xpixel = ppc32_be16(hs->ws_xpixel);
     gs.ws_ypixel = ppc32_be16(hs->ws_ypixel);
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
 int ppc32_winsize_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
@@ -412,10 +426,14 @@ int ppc32_winsize_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
 {
     ppc32_winsize_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: read needs a mapped, readable, untrapped source. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 1U)) {
         return -EFAULT;
     }
-    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    if (ppc32_vm_copyin_safe(ctx, va, &gs, sizeof gs) != 0) {
+        return -EFAULT;
+    }
     hs->ws_row = ppc32_be16(gs.ws_row);
     hs->ws_col = ppc32_be16(gs.ws_col);
     hs->ws_xpixel = ppc32_be16(gs.ws_xpixel);
@@ -428,7 +446,9 @@ int ppc32_flock_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
 {
     ppc32_flock_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: write needs a mapped, writable, untrapped target. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     memset(&gs, 0, sizeof gs);
@@ -437,8 +457,7 @@ int ppc32_flock_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
     gs.l_start = (int32_t)ppc32_be32((uint32_t)hs->l_start);
     gs.l_len = (int32_t)ppc32_be32((uint32_t)hs->l_len);
     gs.l_pid = (int32_t)ppc32_be32((uint32_t)hs->l_pid);
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
 int ppc32_flock_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
@@ -446,10 +465,14 @@ int ppc32_flock_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
 {
     ppc32_flock_t gs;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: read needs a mapped, readable, untrapped source. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 1U)) {
         return -EFAULT;
     }
-    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    if (ppc32_vm_copyin_safe(ctx, va, &gs, sizeof gs) != 0) {
+        return -EFAULT;
+    }
     memset(hs, 0, sizeof *hs);
     hs->l_type = (short)(int16_t)ppc32_be16((uint16_t)gs.l_type);
     hs->l_whence = (short)(int16_t)ppc32_be16((uint16_t)gs.l_whence);
@@ -465,12 +488,17 @@ int ppc32_flock64_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
     ppc32_flock64_t gs;
     uint64_t w;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: RMW needs a mapped, readable+writable, untrapped slot. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 1U) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 2U)) {
         return -EFAULT;
     }
     /* Read-modify-write: the 4-byte pad (and any tail bytes) keep
      * whatever the guest had; the oracle never touches them. */
-    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    if (ppc32_vm_copyin_safe(ctx, va, &gs, sizeof gs) != 0) {
+        return -EFAULT;
+    }
     gs.l_type = (int16_t)ppc32_be16((uint16_t)hs->l_type);
     gs.l_whence = (int16_t)ppc32_be16((uint16_t)hs->l_whence);
     w = ppc32_be64((uint64_t)hs->l_start);
@@ -478,8 +506,7 @@ int ppc32_flock64_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
     w = ppc32_be64((uint64_t)hs->l_len);
     memcpy(gs.l_len, &w, sizeof w);
     gs.l_pid = (int32_t)ppc32_be32((uint32_t)hs->l_pid);
-    memcpy(ppc32_guest_ptr(ctx, va), &gs, sizeof gs);
-    return 0;
+    return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
 int ppc32_flock64_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
@@ -488,10 +515,14 @@ int ppc32_flock64_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
     ppc32_flock64_t gs;
     uint64_t w;
 
-    if (hs == NULL || !ppc32_range_ok(va, sizeof gs)) {
+    /* P32-R9-5: read needs a mapped, readable, untrapped source. */
+    if (hs == NULL || !ppc32_range_ok(va, sizeof gs) ||
+        !ppc32_vm_range_prot_ok(ctx, va, sizeof gs, 1U)) {
         return -EFAULT;
     }
-    memcpy(&gs, ppc32_guest_ptr(ctx, va), sizeof gs);
+    if (ppc32_vm_copyin_safe(ctx, va, &gs, sizeof gs) != 0) {
+        return -EFAULT;
+    }
     memset(hs, 0, sizeof *hs);
     hs->l_type = (short)(int16_t)ppc32_be16((uint16_t)gs.l_type);
     hs->l_whence = (short)(int16_t)ppc32_be16((uint16_t)gs.l_whence);

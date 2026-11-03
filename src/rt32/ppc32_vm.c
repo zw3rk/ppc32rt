@@ -387,6 +387,13 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         return (uint32_t)(-EBADF);
     }
 
+    /* P32-R9-1: MAP_FIXED replaces whatever lived here; drop stale
+     * inode records first (mirrors vm_munmap_locked) so a later
+     * ftruncate cannot retrap the now-anonymous pages. */
+    if ((flags & PPC32_MAP_FIXED) != 0U) {
+        vm_file_untrack_range(target_va, map_end);
+    }
+
     int sh_fd = -1;
     if (is_shared && (flags & PPC32_MAP_ANONYMOUS) != 0U && fd < 0) {
         sh_fd = vm_create_shared_anon_fd(host_map_len);
@@ -546,6 +553,11 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
     }
     if (update_cursor) {
         g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + host_map_len);
+    }
+    /* P32-R9-2: replacing a mapping kills outstanding LL/SC
+     * reservations, like mprotect/munmap/brk-shrink do. */
+    if ((flags & (PPC32_MAP_FIXED | PPC32_MAP_FIXED_NOREPLACE)) != 0U) {
+        vm32_ll_note_remap();
     }
     return target_va;
 }
@@ -829,6 +841,14 @@ uint32_t ppc32_vm_mremap(ppc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             }
         }
         if (copy_bytes > 0U) {
+            /* P32-R9-4: EOF-trapped source pages fault (-EFAULT). */
+            uint32_t tp = old_addr & ~(uint32_t)0xFFFU;
+            for (; (uint64_t)tp < (uint64_t)old_addr + copy_bytes; tp += 0x1000U) {
+                if (vm32_page_is_eof_trap(tp)) {
+                    (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+                    return vm_mremap_unlock(ctx, mremap_fd, (uint32_t)(-EFAULT));
+                }
+            }
             if ((prot & 0x1U) == 0U) {
                 int prc = vm32_is_a2() ?
                     vm32_protect_union(old_addr, (uint32_t)copy_bytes, (uint8_t)PROT_READ) :

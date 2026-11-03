@@ -54,7 +54,17 @@ static bool vm_range_prot_ok_locked(const ppc32_ctx_t *ctx, uint32_t va,
         }
         cur = (r->end < end) ? r->end : end;
     }
-    return cur >= end;
+    if (cur < end) {
+        return false;
+    }
+    /* P32-R9-4: EOF-trapped pages fault; checked copies return -EFAULT
+     * instead of reading zeros or crashing the host. */
+    for (uint32_t p = va & ~(uint32_t)0xFFFU; p < end; p += 0x1000U) {
+        if (vm32_page_is_eof_trap(p)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ppc32_vm_range_prot_ok(const ppc32_ctx_t *ctx, uint32_t va,

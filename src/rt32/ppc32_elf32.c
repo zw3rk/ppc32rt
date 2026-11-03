@@ -36,6 +36,7 @@
 #define PT_LOAD   1U
 #define PT_INTERP 3U
 #define PT_PHDR   6U
+#define PT_GNU_ATTRIBUTES 0x6ffffff5U
 
 #define PF_X 0x1U
 #define PF_W 0x2U
@@ -85,6 +86,91 @@ static void elf_swap_ehdr(elf32_ehdr_t *e)
     e->e_shentsize = ppc32_be16(e->e_shentsize);
     e->e_shnum     = ppc32_be16(e->e_shnum);
     e->e_shstrndx  = ppc32_be16(e->e_shstrndx);
+}
+
+/* Read one ULEB128 at [p, end): bytes consumed, or 0 when truncated
+ * or overlong (P32-R9-7 helper). */
+static size_t read_uleb128(const uint8_t *p, const uint8_t *end, uint64_t *out)
+{
+    const uint8_t *start = p;
+    uint64_t val = 0U;
+    unsigned shift = 0U;
+
+    while (p < end && shift < 70U) {
+        uint8_t b = *p++;
+
+        val |= (uint64_t)(b & 0x7FU) << shift;
+        shift += 7U;
+        if ((b & 0x80U) == 0U) {
+            *out = val;
+            return (size_t)(p - start);
+        }
+    }
+    return 0U;
+}
+
+/* P32-R9-7: look for Tag_GNU_Power_ABI_Spe (tag 8, value 1) in a
+ * PT_GNU_ATTRIBUTES payload: an 'A' version byte, then length-prefixed
+ * vendor subsections (the length counts its own 4 bytes); numeric
+ * "gnu"-vendor tags carry ULEB128 values. Anything malformed simply
+ * reports absent; the full-text opcode scan stays the backstop. */
+static int gnu_attrs_have_power_spe(const uint8_t *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    const uint8_t *end = buf + len;
+
+    if (len < 1U || buf[0] != (uint8_t)'A') {
+        return 0;
+    }
+    p++;
+    while (p < end) {
+        uint32_t slen;
+        const uint8_t *sub;
+        const uint8_t *sub_end;
+        const uint8_t *v;
+        const uint8_t *q;
+
+        if ((size_t)(end - p) < 4U) {
+            return 0;
+        }
+        slen = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+               ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        if (slen < 5U || (size_t)(end - p) < slen) {
+            return 0;
+        }
+        sub = p + 4U;
+        sub_end = p + slen;
+        v = sub;
+        while (v < sub_end && *v != 0U) {
+            v++;
+        }
+        if (v >= sub_end) {
+            return 0;
+        }
+        q = v + 1U;
+        if ((size_t)(v - sub) == 3U && memcmp(sub, "gnu", 3U) == 0) {
+            while (q < sub_end) {
+                uint64_t tag = 0U;
+                uint64_t val = 0U;
+                size_t n = read_uleb128(q, sub_end, &tag);
+
+                if (n == 0U) {
+                    break;
+                }
+                q += n;
+                n = read_uleb128(q, sub_end, &val);
+                if (n == 0U) {
+                    break;
+                }
+                q += n;
+                if (tag == 8U && val == 1U) {
+                    return 1;
+                }
+            }
+        }
+        p = sub_end;
+    }
+    return 0;
 }
 
 /* Swap one ELF32 program header from file (big-endian) to host order. */
@@ -311,12 +397,26 @@ static int load_elf32_image(ppc32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             if (out->interp_path[0] == '\0') {
                 return -1;
             }
+        } else if (ph->p_type == PT_GNU_ATTRIBUTES) {
+            /* P32-R9-7: GNU power-ABI attributes (SPE marker). Small
+             * payload; anything larger falls back to the opcode scan. */
+            if (ph->p_filesz > 0U && ph->p_filesz <= 4096U) {
+                uint8_t attrs[4096];
+
+                if (pread_full(fd, attrs, ph->p_filesz,
+                        (off_t)ph->p_offset) == 0 &&
+                    gnu_attrs_have_power_spe(attrs, ph->p_filesz) != 0) {
+                    out->gnu_power_spe = 1U;
+                }
+            }
         }
     }
 
     uint32_t highest_mapped_end  = 0U;
     uint32_t highest_mapped_prot = 0U;
-    uint32_t prev_seg_end        = 0U;
+    uint32_t seg_starts[64];
+    uint32_t seg_ends[64];
+    size_t   nsegs               = 0U;
     uint32_t fallback_phdr_vaddr = 0U;
     bool     entry_in_load       = false;
     bool     phdr_in_load        = false;
@@ -344,12 +444,21 @@ static int load_elf32_image(ppc32_ctx_t *ctx, int fd, uint32_t default_pie_base,
 
         uint32_t seg_vaddr = (uint32_t)seg_vaddr64;
         uint64_t seg_end64 = seg_vaddr64 + memsz;
-        if (seg_vaddr < prev_seg_end) {
-            fprintf(stderr, "ppc32rt: %s: overlapping or out-of-order PT_LOAD segment at 0x%x\n",
-                    label, seg_vaddr);
-            return -1;
+        /* P32-R9-10: reject true overlaps only; out-of-order but
+         * disjoint segments (accepted by Linux) load fine. */
+        for (size_t s = 0U; s < nsegs; s++) {
+            if (seg_vaddr64 < (uint64_t)seg_ends[s] &&
+                seg_end64 > (uint64_t)seg_starts[s]) {
+                fprintf(stderr, "ppc32rt: %s: overlapping PT_LOAD segment at 0x%x\n",
+                        label, seg_vaddr);
+                return -1;
+            }
         }
-        prev_seg_end = (uint32_t)seg_end64;
+        if (nsegs < 64U) {
+            seg_starts[nsegs] = seg_vaddr;
+            seg_ends[nsegs] = (uint32_t)seg_end64;
+            nsegs++;
+        }
 
         if (out->entry != 0U) {
             /* PowerPC: fixed 4-byte instructions, entry verified aligned. */

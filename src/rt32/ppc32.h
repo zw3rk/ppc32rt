@@ -79,6 +79,10 @@ typedef struct ppc32_elf_info {
     uint32_t interp_base;
     uint32_t text_start;
     uint32_t text_end;
+    /* P32-R9-7: nonzero when a PT_GNU_ATTRIBUTES segment carries
+     * Tag_GNU_Power_ABI_Spe (tag 8, value 1); profile selection
+     * honors it even when the opcode scan is inconclusive. */
+    uint32_t gnu_power_spe;
     char     interp_path[256];
 } ppc32_elf_info_t;
 

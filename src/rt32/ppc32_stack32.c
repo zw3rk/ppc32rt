@@ -56,6 +56,11 @@ static int push_string_table(ppc32_ctx_t *ctx, uint32_t *sp, char **strs,
         while (count < max_count && count < 511 && strs[count] != NULL) {
             count++;
         }
+        /* P32-R9-9: a vector longer than the 511-entry table is an
+         * error (-E2BIG upstream), never a silent truncation. */
+        if (count == 511 && strs[511] != NULL) {
+            return -1;
+        }
         for (int i = count - 1; i >= 0; i--) {
             out_ptrs[i] = push_cstring(ctx, sp, strs[i]);
             if (out_ptrs[i] == 0U) {
@@ -148,7 +153,7 @@ int ppc32_stack_setup(ppc32_ctx_t *ctx, const ppc32_elf_info_t *elf_info,
     /* RC2 full auxv (Phase 2 L2a scope): static glibc startup walks
      * AT_PHDR (TLS/relro), reads AT_RANDOM (pointer guard), and dispatches
      * IFUNCs off AT_HWCAP. HWCAP bits per arch/powerpc uapi cputable.h. */
-    uint32_t auxv[40];
+    uint32_t auxv[48];
     size_t aux_idx = 0U;
 
     auxv[aux_idx++] = 3U; /* AT_PHDR */
@@ -190,6 +195,14 @@ int ppc32_stack_setup(ppc32_ctx_t *ctx, const ppc32_elf_info_t *elf_info,
     auxv[aux_idx++] = 7U; /* AT_BASE */
     auxv[aux_idx++] = elf_info->interp_base;
     auxv[aux_idx++] = 23U; /* AT_SECURE */
+    auxv[aux_idx++] = 0U;
+    /* P32-R9-8: cache-block sizes (750/e500v2: 32-byte lines; no
+     * unified cache, so AT_UCACHEBSIZE is 0). */
+    auxv[aux_idx++] = 19U; /* AT_DCACHEBSIZE */
+    auxv[aux_idx++] = 32U;
+    auxv[aux_idx++] = 20U; /* AT_ICACHEBSIZE */
+    auxv[aux_idx++] = 32U;
+    auxv[aux_idx++] = 21U; /* AT_UCACHEBSIZE */
     auxv[aux_idx++] = 0U;
     auxv[aux_idx++] = 0U; /* AT_NULL */
     auxv[aux_idx++] = 0U;

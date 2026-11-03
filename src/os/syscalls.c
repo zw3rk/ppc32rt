@@ -335,14 +335,18 @@ static long sys_uname(ppc32_ctx_t *ctx, uint32_t buf_va)
         "ppc",
         "(none)",
     };
-    uint8_t *buf;
+    /* P32-R9-5: compose into a host buffer, then publish through the
+     * permission-checked copyout (mapped/write/trap-checked) so an
+     * unmapped or kernel-region VA returns -EFAULT instead of killing
+     * the host with a SIGSEGV outside hostfault_run. */
+    uint8_t buf[PPC32_UTS_FIELD * PPC32_UTS_FIELDS];
     size_t i;
     size_t j;
 
-    if (!ppc32_range_ok(buf_va, PPC32_UTS_FIELD * PPC32_UTS_FIELDS)) {
+    if (!ppc32_range_ok(buf_va, sizeof buf) ||
+        !ppc32_vm_range_prot_ok(ctx, buf_va, sizeof buf, 2U)) {
         return -EFAULT;
     }
-    buf = (uint8_t *)ppc32_guest_ptr(ctx, buf_va);
     for (i = 0U; i < PPC32_UTS_FIELDS; i++) {
         uint8_t *field = buf + (size_t)i * PPC32_UTS_FIELD;
 
@@ -351,7 +355,7 @@ static long sys_uname(ppc32_ctx_t *ctx, uint32_t buf_va)
             field[j] = (uint8_t)fields[i][j];
         }
     }
-    return 0;
+    return (long)ppc32_vm_copyout_safe(ctx, buf_va, buf, sizeof buf);
 }
 
 static long sys_clock_gettime(ppc32_ctx_t *ctx, uint32_t clk, uint32_t ts_va,
@@ -368,12 +372,18 @@ static long sys_clock_gettime(ppc32_ctx_t *ctx, uint32_t clk, uint32_t ts_va,
         return -(long)errno;
     }
     if (is64) {
-        if (!ppc32_range_ok(ts_va, 16U)) {
+        /* P32-R9-5: publish through the permission-checked copyout so
+         * an unmapped VA faults with -EFAULT instead of crashing. */
+        uint64_t sec_be = ppc32_be64((uint64_t)(int64_t)ts.tv_sec);
+        uint64_t nsec_be = ppc32_be64((uint64_t)(int64_t)ts.tv_nsec);
+        uint8_t tmp[16];
+
+        memcpy(tmp, &sec_be, sizeof sec_be);
+        memcpy(tmp + 8U, &nsec_be, sizeof nsec_be);
+        if (!ppc32_range_ok(ts_va, sizeof tmp)) {
             return -EFAULT;
         }
-        ppc32_st64be(ctx, ts_va, (uint64_t)(int64_t)ts.tv_sec);
-        ppc32_st64be(ctx, ts_va + 8U, (uint64_t)(int64_t)ts.tv_nsec);
-        return 0L;
+        return (long)ppc32_vm_copyout_safe(ctx, ts_va, tmp, sizeof tmp);
     }
     return (long)ppc32_put_timespec(ctx, ts_va, &ts);
 }
@@ -614,6 +624,11 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         break;
     case PPC32_NR_MPROTECT:
         ret = sys_mprotect(ctx, a0, a1, a2);
+        break;
+    case PPC32_NR_MREMAP:
+        /* P32-R9-3: the vm layer implements mremap; dispatch it so the
+         * guest does not always see -ENOSYS. */
+        ret = (long)(int32_t)ppc32_vm_mremap(ctx, a0, a1, a2, a3, a4);
         break;
     case PPC32_NR_UNAME:
         ret = sys_uname(ctx, a0);

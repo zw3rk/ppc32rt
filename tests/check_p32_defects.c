@@ -27,6 +27,7 @@
 #include "interp/interp.h"
 #include "os/backend.h"
 #include "os/hostfault.h"
+#include "os/proc.h"
 #include "os/procfs.h"
 #include "os/signals.h"
 #include "os/syscall_nr.h"
@@ -810,6 +811,38 @@ static void test_p32_r6_followups(void)
     ppc32_sig_reset();
 }
 
+/* P32-R9-4/R9-7: checked copies reject EOF-trapped pages, and the
+ * profile redetect sees an SPE opcode past the old 64K-insn cap. */
+static void test_p32_r9_trap_and_spe(uint8_t *base)
+{
+    ppc32_ctx_t ctx;
+    uint8_t dst[16];
+
+    ctx_init_test(&ctx, base);
+    /* The harness keeps its region in ctx->regions (the global table
+     * stays empty until ppc32_vm_init); exercise that mirror path. */
+    ctx.vm_ready = false;
+
+    /* Late SPE first (raw scan, so before any page is trapped):
+     * opcode-4 word at insn 100000 of the 128K-insn text window. */
+    write_be32(base, 0x100000U + 100000U * 4U, 0x10000000U);
+    ctx.profile = -1;
+    ctx.is_spe = 0U;
+    ppc32_proc_redetect_profile(&ctx, 0x100000U, 0x180000U);
+    CHECK(ctx.profile == PPC32_PROFILE_SPE && ctx.is_spe != 0U,
+        "r9-7 late SPE opcode detected");
+
+    vm32_mark_eof_trap(0x100000U, 0x101000U);
+    CHECK(!ppc32_vm_range_prot_ok(&ctx, 0x100000U, 0x1000U, 1U),
+        "r9-4 trapped page fails range check");
+    CHECK(ppc32_vm_copyin_safe(&ctx, 0x100000U, dst, sizeof dst) ==
+        -EFAULT, "r9-4 trapped copyin faults");
+    CHECK(ppc32_vm_copyout_safe(&ctx, 0x100000U, dst, sizeof dst) ==
+        -EFAULT, "r9-4 trapped copyout faults");
+    CHECK(ppc32_vm_range_prot_ok(&ctx, 0x101000U, 0x1000U, 1U),
+        "r9-4 neighbor page still readable");
+}
+
 int main(void)
 {
     uint8_t *base = (uint8_t *)mmap(NULL, 0x200000U, PROT_READ | PROT_WRITE,
@@ -823,6 +856,7 @@ int main(void)
     test_p32_3_and_7_sync_and_neg(base);
     test_p32_4_and_10_atomics(base);
     test_p32_r2_5_6_alu_div_ov(base);
+    test_p32_r9_trap_and_spe(base);
     (void)munmap(base, 0x200000U);
 
     test_p32_5_6_11_vm_and_syscalls();

@@ -187,9 +187,11 @@ long ppc32_proc_vfork(ppc32_ctx_t *ctx)
     return ppc32_proc_fork(ctx);
 }
 
-/* Scan guest text for a major-opcode-4 word (SPE APU, SPEC 2.2). Only
- * the first 65536 instructions are probed to stay bounded; SPE binaries
- * execute vector code from entry, so presence shows early. */
+/* Scan guest text for a major-opcode-4 word (SPE APU, SPEC 2.2).
+ * P32-R9-7: the whole executable segment is probed (not just the first
+ * 65536 instructions) so late-SPE binaries classify correctly; a
+ * PT_GNU_ATTRIBUTES SPE marker (ppc32_elf_info_t.gnu_power_spe) is
+ * honored by the callers on top of this scan. */
 void ppc32_proc_redetect_profile(ppc32_ctx_t *ctx, uint32_t text_start,
     uint32_t text_end)
 {
@@ -206,16 +208,15 @@ void ppc32_proc_redetect_profile(ppc32_ctx_t *ctx, uint32_t text_start,
         return;
     }
     if (text_end <= text_start ||
-        !ppc32_range_ok(text_start, (size_t)(text_end - text_start))) {
+        !ppc32_range_ok(text_start, (size_t)(text_end - text_start)) ||
+        !ppc32_vm_range_prot_ok(ctx, text_start,
+            (size_t)(text_end - text_start), 1U)) {
         ctx->profile = PPC32_PROFILE_CLASSIC;
         ctx->is_spe = 0U;
         return;
     }
     len = (uint64_t)text_end - (uint64_t)text_start;
     n = len / 4ULL;
-    if (n > 65536ULL) {
-        n = 65536ULL;
-    }
     for (i = 0ULL; i < n; i++) {
         uint32_t w = ppc32_ld32be(ctx,
             (uint32_t)(text_start + (uint32_t)(i * 4ULL)));
@@ -270,7 +271,10 @@ static long proc_copy_vec(ppc32_ctx_t *ctx, uint32_t vec_va, char ***out,
             proc_free_vec(vec, n);
             return -E2BIG;
         }
-        if (!ppc32_range_ok(vec_va + n * 4U, 4U)) {
+        /* P32-R9-5: the vector slot needs a mapped, readable,
+         * untrapped page; a raw ld32be could crash the host. */
+        if (!ppc32_range_ok(vec_va + n * 4U, 4U) ||
+            !ppc32_vm_range_prot_ok(ctx, vec_va + n * 4U, 4U, 1U)) {
             proc_free_vec(vec, n);
             return -EFAULT;
         }
@@ -540,6 +544,14 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         return -ENOMEM;
     }
     ppc32_proc_redetect_profile(ctx, info.text_start, info.text_end);
+    /* P32-R9-7: a PT_GNU_ATTRIBUTES SPE marker wins over the opcode
+     * scan (an explicit --profile still wins; redetect honors it). */
+    if (info.gnu_power_spe != 0U &&
+        ctx->profile != PPC32_PROFILE_CLASSIC &&
+        ctx->profile != PPC32_PROFILE_SPE) {
+        ctx->profile = PPC32_PROFILE_SPE;
+        ctx->is_spe = 1U;
+    }
     /* RC5: interpreter entry when PT_INTERP is present (see main.c). */
     ctx->nip = ctx->elf_entry;
     ctx->gpr[PPC32_REG_SP] = sp;

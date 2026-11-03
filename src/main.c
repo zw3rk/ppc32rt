@@ -33,6 +33,7 @@
 #include "interp/interp.h"
 #include "os/convert.h"
 #include "os/hostfault.h"
+#include "os/proc.h"
 #include "os/signals.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls.h"
@@ -358,6 +359,17 @@ static int guest_load(ppc32_ctx_t *ctx, ppc32_elf_info_t *info, uint32_t *sp)
     /* ppc32_elf_load closes fd (success and failure paths). */
     if (ppc32_elf_load(ctx, fd, ctx->exec_path, info) != 0) {
         return 1;
+    }
+    /* P32-R9-6: profile auto-detect runs on the initial load too (the
+     * execve path already redetects) and before the stack publishes
+     * AT_HWCAP. An explicit --profile/PPC32RT_PROFILE setting wins. */
+    if (ctx->profile != PPC32_PROFILE_CLASSIC &&
+        ctx->profile != PPC32_PROFILE_SPE) {
+        ppc32_proc_redetect_profile(ctx, info->text_start, info->text_end);
+        if (info->gnu_power_spe != 0U) {
+            ctx->profile = PPC32_PROFILE_SPE;
+            ctx->is_spe = 1U;
+        }
     }
     if (ppc32_stack_setup(ctx, info, ctx->guest_argc, ctx->guest_argv,
             ctx->host_envp, sp) != 0) {
