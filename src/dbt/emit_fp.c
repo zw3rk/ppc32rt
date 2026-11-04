@@ -144,32 +144,33 @@ static void fp_restore_fpcr(a64_buf_t *b)
     a64_patch_cbz_w(b, skip, b->count);
 }
 
-/* FPSR cumulative -> FPSCR accumulation (fpscr in w9; bit 0/IOC ORs
- * the preclassified mask in w17, set by every caller before fp_accum:
- * fp_inv_classify for arithmetic, a MOV for compare/converts). */
-static void fp_accum(a64_buf_t *b)
+/* FPSR cumulative -> FPSCR accumulation (fpscr in w9; bit 0/IOC invokes
+ * fp_inv_classify only inside the cold IOC != 0 branch, and arithmetic
+ * ops (iop < 0xFE) update FR in-place before storing fpscr). */
+static void fp_accum(a64_buf_t *b, unsigned iop, bool dbl)
 {
+    static const uint32_t masks[4] = { FP_ZX | FP_FX, FP_OX | FP_FX,
+        FP_UX | FP_FX, FP_XX | FP_FX | FP_FI };
     size_t skip_all;
     size_t next;
     uint32_t bit;
     a64_emit(b, 0xD53B4420U | 10U); /* mrs x10, fpsr */
-    a64_emit_movz_w(b, EI_T2, 0x1FU, 0U);
-    a64_emit_and_reg_w(b, false, EI_T, EI_B, EI_T2, A64_SHIFT_LSL, 0U);
-    /* Per-bit masks; bit 0 (IOC) takes w17. P32-R8-5: FI rides the XX
-     * mask; FR is maintained by the callers' rounded-up tests. */
-    static const uint32_t masks[4] = { FP_ZX | FP_FX, FP_OX | FP_FX,
-        FP_UX | FP_FX, FP_XX | FP_FX | FP_FI };
+    a64_emit_ubfm_w(b, EI_T, EI_B, 0U, 4U);
     skip_all = a64_emit_cbz_w_placeholder(b, false, EI_T);
-    for (bit = 0U; bit < 5U; bit++) {
+    for (bit = 1U; bit < 5U; bit++) {
         a64_emit_ubfm_w(b, EI_T, EI_B, bit, bit);
         next = a64_emit_cbz_w_placeholder(b, false, EI_T);
-        if (bit == 0U) {
-            a64_emit_orr_reg_w(b, EI_A, EI_A, 17U, A64_SHIFT_LSL, 0U);
-        } else {
-            a64_emit_mov_imm32(b, EI_X, masks[bit - 1U]);
-            a64_emit_orr_reg_w(b, EI_A, EI_A, EI_X, A64_SHIFT_LSL, 0U);
-        }
+        a64_emit_mov_imm32(b, EI_X, masks[bit - 1U]);
+        a64_emit_orr_reg_w(b, EI_A, EI_A, EI_X, A64_SHIFT_LSL, 0U);
         a64_patch_cbz_w(b, next, b->count);
+    }
+    a64_emit_ubfm_w(b, EI_T, EI_B, 0U, 0U);
+    next = a64_emit_cbz_w_placeholder(b, false, EI_T);
+    fp_inv_classify(b, iop, dbl);
+    a64_emit_orr_reg_w(b, EI_A, EI_A, 17U, A64_SHIFT_LSL, 0U);
+    a64_patch_cbz_w(b, next, b->count);
+    if (iop < 0xFEU) {
+        fp_fr_arith(b, iop, dbl);
     }
     a64_patch_cbz_w(b, skip_all, b->count);
     fp_st_fpscr(b, EI_A);
@@ -198,12 +199,13 @@ static int fp_tail(a64_buf_t *b, const ppc32_insn_t *insn)
 
 /* Convert tail: exception accumulation, FPCR restore, shared tail.
  * P32-R8-5: FI and FR are cleared per op here (oracle fp_flags_arith);
- * FR is re-set by the caller's rounded-up test (fp_fr_* fixup). */
-static int fp_conv_end(a64_buf_t *b, const ppc32_insn_t *insn)
+ * FR is re-set by fp_fr_arith (in fp_accum) or fp_fr_mag (converts). */
+static int fp_conv_end(a64_buf_t *b, const ppc32_insn_t *insn,
+    unsigned iop, bool dbl)
 {
     a64_emit_mov_imm32(b, EI_X, FP_FI | FP_FR);
     a64_emit_bic_reg_w(b, false, EI_A, EI_A, EI_X, A64_SHIFT_LSL, 0U);
-    fp_accum(b);
+    fp_accum(b, iop, dbl);
     fp_restore_fpcr(b);
     return fp_tail(b, insn);
 }
@@ -313,10 +315,10 @@ static const uint8_t fp_a_op[32] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 
 /* Rounding prologue/epilogue for one arithmetic op (fpscr in w9). */
 static int fp_round_end(a64_buf_t *b, const ppc32_insn_t *insn,
-    unsigned vd, bool dbl)
+    unsigned vd, unsigned iop, bool dbl)
 {
     fp_fprf(b, vd, dbl);
-    return fp_conv_end(b, insn);
+    return fp_conv_end(b, insn, iop, dbl);
 }
 
 /* Classic A-form arithmetic (primaries 59/63); prec 0 = S, 1 = D. */
@@ -368,9 +370,9 @@ static int fp_arith(a64_buf_t *b, const ppc32_insn_t *insn, unsigned prec)
             fp_ld(b, 2U, frc, dbl);
         }
     }
-    /* P32-R8-5/6: save A (v7) and preclassify the IOC mask (w17). */
-    a64_emit(b, 0x1E604000U | (0U << 5) | 7U); /* fmov d7, d0 */
-    fp_inv_classify(b, (op <= (uint8_t)SP_DIV) ? (unsigned)op : 0xFFU, dbl);
+    if (!(b->fp_next_is_arith && insn->rc == 0U)) {
+        a64_emit(b, 0x1E604000U | (0U << 5) | 7U); /* fmov d7, d0 */
+    }
     if (op >= (uint8_t)SP_MADD && op <= (uint8_t)SP_NMSUB) {
         fp_calc(b, op, prec, 2U, 1U);
     } else if (op == (uint8_t)SP_MUL) {
@@ -383,23 +385,7 @@ static int fp_arith(a64_buf_t *b, const ppc32_insn_t *insn, unsigned prec)
         b->fp_batch_open = true; return PPC32_EMIT_NEXT;
     }
     if (b->fp_batch_open) { fp_ld_fpscr(b, EI_A); b->fp_batch_open = false; }
-    {
-        uint32_t redo;
-        int rc;
-        /* P32-R8-5: repeat the op writing v5 from saved A (v7) under RZ. */
-        if (op <= (uint8_t)SP_DIV) {
-            redo = fp_base[op][prec] |
-                ((((unsigned)op == (unsigned)SP_MUL) ? 2U : 1U) << 16) |
-                (7U << 5) | 5U;
-        } else if (op == (uint8_t)SP_SQRT) {
-            redo = fp_base[(unsigned)op][prec] | (7U << 5) | 5U;
-        } else {
-            redo = fp_base[(unsigned)op][prec] | (2U << 16) | (1U << 10) | (7U << 5) | 5U;
-        }
-        rc = fp_round_end(b, insn, 0U, dbl);
-        fp_fr_arith(b, redo, dbl);
-        return rc;
-    }
+    return fp_round_end(b, insn, 0U, (unsigned)op, dbl);
 }
 /* fcmpu/fcmpo: CR[bf] = [LT,GT,EQ,UN] from A64 NZCV. */
 static int fp_cmp(a64_buf_t *b, const ppc32_insn_t *insn)
@@ -434,9 +420,7 @@ static int fp_cmp(a64_buf_t *b, const ppc32_insn_t *insn)
     a64_emit_mov_imm32(b, EI_T2, 0xF000U);
     a64_emit_bic_reg_w(b, false, EI_A, EI_A, EI_T2, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, EI_A, EI_A, EI_R, A64_SHIFT_LSL, 12U);
-    /* P32-R8-6: compare invalid is always VXSNAN (VXVC ORed above). */
-    a64_emit_mov_imm32(b, 17U, FP_VXSNAN | FP_VX | FP_FX);
-    fp_accum(b);
+    fp_accum(b, 0xFFU, true);
     return fp_tail(b, insn);
 }
 
@@ -589,10 +573,9 @@ static int spe_cvtf(a64_buf_t *b, const ppc32_insn_t *insn, unsigned in,
     if (in == 2U) { /* frsp: narrow D->S (base line above, P32-R8-3),
                      * then widen back to double. */
         int rc;
-        a64_emit_mov_imm32(b, 17U, FP_VXSNAN | FP_VX | FP_FX);
         a64_emit(b, 0x1E22C000U | (0U << 5) | 0U); /* fcvt d0, s0 */
         fp_st(b, insn->rt, 0U, true, false);
-        rc = fp_round_end(b, insn, 0U, true);
+        rc = fp_round_end(b, insn, 0U, 0xFFU, true);
         fp_fr_mag(b, 7U, 0U, false); /* P32-R8-5: FR iff widened > orig */
         return rc;
     }
@@ -676,8 +659,7 @@ static int spe_cvti(a64_buf_t *b, const ppc32_insn_t *insn, unsigned in,
         a64_emit(b, 0x93407C00U | (11U << 5) | 11U); /* sxtw */
         FP_STR_X_OFF(11U, A64_XCTX, FP_OFF(insn->rt));
         b->fpr_cache_valid &= (uint8_t)~(uint8_t)(1U << (insn->rt & 7U));
-        a64_emit_mov_imm32(b, 17U, FP_VXCVI | FP_VX | FP_FX);
-        rc = fp_conv_end(b, insn);
+        rc = fp_conv_end(b, insn, 0xFEU, true);
         fp_fr_mag(b, 7U, 11U, true); /* P32-R8-5: FR iff |int|>|exact| */
         return rc;
     } else {

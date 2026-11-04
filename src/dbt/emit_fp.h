@@ -52,6 +52,7 @@ int ppc32_emit_fp(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn,
 #define FP_VXIMZ 0x00100000U
 #define FP_FR 0x00040000U
 #define FP_FI 0x00020000U
+#define FP_VXSQRT 0x00000200U
 #define FP_VXCVI 0x00000100U
 #define FP_FPRF_MASK 0x0003F000U
 
@@ -65,15 +66,14 @@ void fp_fprf(struct a64_buf *b, unsigned vd, bool dbl);
  * statics, exposed for the post-store FR fixups below). */
 void fp_fpscr_ld(struct a64_buf *b, unsigned wd);
 void fp_fpscr_st(struct a64_buf *b, unsigned ws);
-/* P32-R8-6: preclassify the IOC mask for a binary op (iop: 0 add, 1 sub,
- * 2 mul, 3 div; anything else keeps VXSNAN) from the live inputs into
- * w17 for fp_accum. */
+/* P32-R8-6: classify the IOC mask for an op (iop: 0 add, 1 sub, 2 mul,
+ * 3 div, 7 sqrt, 0xFE cvti, else VXSNAN) from saved A (v7) and B
+ * (v1/v2) into w17 inside the cold IOC != 0 path of fp_accum. */
 void fp_inv_classify(struct a64_buf *b, unsigned iop, bool dbl);
-/* P32-R8-5: post-store FR fixups (oracle fp_rounded_up). fp_fr_arith
- * repeats the op (redo writes v5 from A in v7) under RZ for RN mode and
- * uses sign rules otherwise; fp_fr_mag compares a double/int result
- * against the saved original (to_int selects SCVTF W->D first). */
-void fp_fr_arith(struct a64_buf *b, uint32_t redo, bool dbl);
+/* P32-R8-5: FR fixups (oracle fp_rounded_up). fp_fr_arith updates FR in
+ * w9 inside fp_accum when FI (IXC) is set; fp_fr_mag compares a
+ * double/int result against the saved original for frsp/fctiw. */
+void fp_fr_arith(struct a64_buf *b, unsigned op, bool dbl);
 void fp_fr_mag(struct a64_buf *b, unsigned orig_v, unsigned round_v,
     bool to_int);
 

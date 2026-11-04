@@ -145,12 +145,11 @@ static void fp_isinf(a64_buf_t *b, unsigned xsrc, unsigned wdst, bool dbl)
     a64_emit_and_reg_w(b, false, wdst, wdst, EI_X, A64_SHIFT_LSL, 0U);
 }
 
-/* P32-R8-6: preclassify the IOC mask for a binary op (iop: 0 add, 1 sub,
- * 2 mul, 3 div; anything else keeps the VXSNAN default) from the live
- * inputs (D0/D1, D2 for mul; S0/S1/S2 for single) into w17 (A64_TMP2)
- * for fp_accum. The default also covers SNaN (quiet NaNs raise no IOC,
- * so the mask goes unused for them). Mirrors the oracle fp_inv2 and
- * fp_inv2s lane checks. Clobbers w10, w12-w15; w9/w11 preserved. */
+/* P32-R8-6: classify the IOC mask for an op (iop: 0 add, 1 sub, 2 mul,
+ * 3 div, 7 sqrt, 0xFE cvti, else VXSNAN) from saved A (v7) and B
+ * (v1/v2) into w17 (A64_TMP2) inside the cold IOC != 0 branch of
+ * fp_accum. Uses x11 as the pattern source for fp_isinf so it never
+ * aliases the w10/w14 temporaries or w12/w13 outputs. */
 void fp_inv_classify(a64_buf_t *b, unsigned iop, bool dbl)
 {
     unsigned v2 = (iop == 2U) ? 2U : 1U;
@@ -159,17 +158,28 @@ void fp_inv_classify(a64_buf_t *b, unsigned iop, bool dbl)
     uint32_t fmov = dbl ? 0x9E660000U : 0x1E260000U;
     size_t skip;
 
+    if (iop == 0xFEU) {
+        a64_emit_mov_imm32(b, 17U, FP_VXCVI | FP_VX | FP_FX);
+        return;
+    }
     a64_emit_mov_imm32(b, 17U, FP_VXSNAN | FP_VX | FP_FX);
+    if (iop == 7U) {
+        a64_emit(b, fcmp0 | (7U << 5)); /* fcmp A(v7), #0 */
+        skip = a64_emit_b_cond_placeholder(b, A64_COND_PL);
+        a64_emit_mov_imm32(b, 17U, FP_VXSQRT | FP_VX | FP_FX);
+        a64_patch_b_cond(b, skip, b->count);
+        return;
+    }
     if (iop > 3U) {
         return;
     }
-    a64_emit(b, fmov | (0U << 5) | 10U); /* pattern A -> x10/w10 */
-    a64_emit(b, fmov | (v2 << 5) | 12U); /* pattern B -> x12/w12 */
     if (iop <= 1U) {
         /* VXISI: both infinities, opposite (add) or same (sub) signs. */
-        fp_isinf(b, 10U, EI_T2, dbl);
-        fp_isinf(b, 12U, EI_T, dbl);
-        a64_emit(b, fcmp | (v2 << 16) | (0U << 5)); /* fcmp A, B */
+        a64_emit(b, fmov | (7U << 5) | 11U);
+        fp_isinf(b, 11U, EI_T2, dbl);
+        a64_emit(b, fmov | (v2 << 5) | 11U);
+        fp_isinf(b, 11U, EI_T, dbl);
+        a64_emit(b, fcmp | (v2 << 16) | (7U << 5)); /* fcmp A, B */
         ei_cset(b, 15U, (iop == 0U) ? A64_COND_NE : A64_COND_EQ);
         a64_emit_and_reg_w(b, false, EI_T2, EI_T2, EI_T, A64_SHIFT_LSL, 0U);
         a64_emit_and_reg_w(b, false, EI_T2, EI_T2, 15U, A64_SHIFT_LSL, 0U);
@@ -178,10 +188,12 @@ void fp_inv_classify(a64_buf_t *b, unsigned iop, bool dbl)
         a64_patch_cbz_w(b, skip, b->count);
     } else if (iop == 2U) {
         /* VXIMZ: 0*Inf either way round. */
-        fp_isinf(b, 10U, EI_T2, dbl); /* infA */
-        a64_emit(b, fcmp0 | (0U << 5)); /* fcmp A, #0 */
+        a64_emit(b, fmov | (7U << 5) | 11U);
+        fp_isinf(b, 11U, EI_T2, dbl); /* infA */
+        a64_emit(b, fcmp0 | (7U << 5)); /* fcmp A, #0 */
         ei_cset(b, 15U, A64_COND_EQ); /* zeroA */
-        fp_isinf(b, 12U, EI_T, dbl); /* infB */
+        a64_emit(b, fmov | (v2 << 5) | 11U);
+        fp_isinf(b, 11U, EI_T, dbl); /* infB */
         a64_emit(b, fcmp0 | (v2 << 5)); /* fcmp B, #0 */
         ei_cset(b, EI_X, A64_COND_EQ); /* zeroB */
         a64_emit_and_reg_w(b, false, 15U, 15U, EI_T, A64_SHIFT_LSL, 0U);
@@ -194,7 +206,7 @@ void fp_inv_classify(a64_buf_t *b, unsigned iop, bool dbl)
         size_t skip2;
 
         /* VXZDZ: 0/0; VXIDI: Inf/Inf. */
-        a64_emit(b, fcmp0 | (0U << 5)); /* fcmp A, #0 */
+        a64_emit(b, fcmp0 | (7U << 5)); /* fcmp A, #0 */
         ei_cset(b, EI_T2, A64_COND_EQ); /* zeroA */
         a64_emit(b, fcmp0 | (v2 << 5)); /* fcmp B, #0 */
         ei_cset(b, EI_T, A64_COND_EQ); /* zeroB */
@@ -202,8 +214,10 @@ void fp_inv_classify(a64_buf_t *b, unsigned iop, bool dbl)
         skip = a64_emit_cbz_w_placeholder(b, false, EI_T2);
         a64_emit_mov_imm32(b, 17U, FP_VXZDZ | FP_VX | FP_FX);
         a64_patch_cbz_w(b, skip, b->count);
-        fp_isinf(b, 10U, EI_T2, dbl); /* infA */
-        fp_isinf(b, 12U, EI_T, dbl); /* infB */
+        a64_emit(b, fmov | (7U << 5) | 11U);
+        fp_isinf(b, 11U, EI_T2, dbl); /* infA */
+        a64_emit(b, fmov | (v2 << 5) | 11U);
+        fp_isinf(b, 11U, EI_T, dbl); /* infB */
         a64_emit_and_reg_w(b, false, EI_T2, EI_T2, EI_T, A64_SHIFT_LSL, 0U);
         skip2 = a64_emit_cbz_w_placeholder(b, false, EI_T2);
         a64_emit_mov_imm32(b, 17U, FP_VXIDI | FP_VX | FP_FX);
@@ -211,77 +225,116 @@ void fp_inv_classify(a64_buf_t *b, unsigned iop, bool dbl)
     }
 }
 
-/* P32-R8-5: post-store FR fixup for arithmetic (oracle fp_rounded_up).
- * redo repeats the op writing v5 from the saved inputs (A in v7) under
- * RZ; the RN result is in v0. Reloads fpscr into w9, sets FR iff the
- * rounded magnitude grew, stores. Skips everything when FPSR[IXC] is
- * clear (exact); RZ mode never rounds up; RP (RM) rounds up iff the
- * result is above (below) zero. Clobbers w10, w12-w15, x21, v5, v6. */
-void fp_fr_arith(a64_buf_t *b, uint32_t redo, bool dbl)
+/* P32-R8-5: FR fixup for arithmetic (oracle fp_rounded_up), called inside
+ * fp_accum when FPSR is non-zero with fpscr in w9 (EI_A) and FI (bit 17)
+ * already reflecting IXC. For RN mode, ADD/SUB/MUL/DIV/SQRT compute the
+ * exact rounding residual via FastTwoSum / FMSUB / FNMSUB without
+ * touching FPCR or issuing ISB; FMA ops (op >= 8) fall back to RZ redo.
+ * Clobbers w10-w15, x21, v4-v6. */
+void fp_fr_arith(a64_buf_t *b, unsigned op, bool dbl)
 {
     uint32_t fabsop = dbl ? 0x1E60C000U : 0x1E20C000U;
     uint32_t fcmpop = dbl ? 0x1E602000U : 0x1E202000U;
     uint32_t fcmp0 = dbl ? 0x1E602008U : 0x1E202008U;
+    uint32_t fcsel = dbl ? 0x1E600C00U : 0x1E200C00U;
+    uint32_t fsubop = dbl ? 0x1E603800U : 0x1E203800U;
+    uint32_t fmsub = dbl ? 0x1F408000U : 0x1F008000U;
+    uint32_t fnmsub = dbl ? 0x1F608000U : 0x1F208000U;
     size_t skip_ixc;
     size_t to_not_rn;
     size_t to_rz;
-    size_t to_rm;
-    size_t to_end;
-    size_t to_end2;
+    size_t to_join;
     size_t skip_fr;
-    size_t skip_rp;
-    size_t skip_rm;
 
-    fp_fpscr_ld(b, EI_A);
-    a64_emit(b, 0xD53B4420U | 10U); /* mrs x10, fpsr */
-    a64_emit_ubfm_w(b, EI_T, EI_B, 4U, 4U); /* T = IXC */
+    a64_emit_ubfm_w(b, EI_T, EI_A, 17U, 17U); /* T = FI (IXC) */
     skip_ixc = a64_emit_cbz_w_placeholder(b, false, EI_T);
     a64_emit_ubfm_w(b, EI_T2, EI_A, 0U, 1U); /* T2 = RN mode */
     to_not_rn = a64_emit_cbz_w_placeholder(b, true, EI_T2);
-    /* RN: |RN result| > |RZ redo| iff rounded up (post-store, so the
-     * redo's FPSR is dead and needs no save). */
-    a64_emit(b, 0x1E604000U | (0U << 5) | 6U); /* fmov d6, d0 */
-    a64_emit(b, 0xD53B4400U | 15U); /* mrs x15, fpcr */
-    a64_emit_mov_imm32(b, 21U, 0x00C00000U); /* RMode mask */
-    a64_emit_orr_reg_w(b, 15U, 15U, 21U, A64_SHIFT_LSL, 0U); /* RZ */
-    a64_emit(b, 0xD51B4400U | 15U); /* msr fpcr, x15 */
-    a64_emit(b, 0xD5033FDFU); /* isb */
-    a64_emit(b, redo); /* RZ result -> v5 */
-    a64_emit_bic_reg_w(b, false, 15U, 15U, 21U, A64_SHIFT_LSL, 0U);
-    a64_emit(b, 0xD51B4400U | 15U); /* msr fpcr, x15 (guest mode) */
-    a64_emit(b, 0xD5033FDFU); /* isb */
-    a64_emit(b, fabsop | (6U << 5) | 6U); /* fabs v6, v6 */
-    a64_emit(b, fabsop | (5U << 5) | 5U); /* fabs v5, v5 */
-    a64_emit(b, fcmpop | (5U << 16) | (6U << 5)); /* fcmp v6, v5 */
-    ei_cset(b, EI_T, A64_COND_HI);
-    skip_fr = a64_emit_cbz_w_placeholder(b, false, EI_T);
-    a64_emit_mov_imm32(b, EI_X, FP_FR);
-    a64_emit_orr_reg_w(b, EI_A, EI_A, EI_X, A64_SHIFT_LSL, 0U);
-    to_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+    if (op <= 1U) {
+        /* ADD/SUB: FastTwoSum exact residual T = R - H vs L. */
+        if (op == 1U) {
+            a64_emit(b, (dbl ? 0x1E614000U : 0x1E214000U) | (1U << 5) | 4U);
+        } else {
+            a64_emit(b, 0x1E604000U | (1U << 5) | 4U);
+        }
+        a64_emit(b, fabsop | (7U << 5) | 5U); /* fabs v5, v7 (|A|) */
+        a64_emit(b, fabsop | (4U << 5) | 6U); /* fabs v6, v4 (|B'|) */
+        a64_emit(b, fcmpop | (6U << 16) | (5U << 5));
+        a64_emit(b, fcsel | (4U << 16) | ((uint32_t)A64_COND_GE << 12) |
+            (7U << 5) | 5U); /* v5 = H */
+        a64_emit(b, fcsel | (7U << 16) | ((uint32_t)A64_COND_GE << 12) |
+            (4U << 5) | 6U); /* v6 = L */
+        a64_emit(b, fsubop | (5U << 16) | (0U << 5) | 5U); /* T = R - H */
+        a64_emit(b, fcmp0 | (0U << 5)); /* fcmp R, #0.0 */
+        a64_emit(b, fcsel | (6U << 16) | ((uint32_t)A64_COND_GT << 12) |
+            (5U << 5) | 4U);
+        a64_emit(b, fcsel | (5U << 16) | ((uint32_t)A64_COND_GT << 12) |
+            (6U << 5) | 6U);
+        a64_emit(b, fcmpop | (6U << 16) | (4U << 5));
+        ei_cset(b, EI_T, A64_COND_GT);
+    } else {
+        size_t to_fast = 0U;
+        uint32_t fbase = dbl ? 0x1E600000U : 0x1E200000U;
+        uint32_t redo;
+        if (op == 2U) {
+            redo = (fbase | 0x0800U) | (2U << 16) | (7U << 5) | 5U;
+            a64_emit(b, fabsop | (0U << 5) | 6U); /* fabs v6, v0 (|R|) */
+            a64_emit(b, fabsop | (7U << 5) | 5U); /* fabs v5, v7 (|A|) */
+            a64_emit(b, fabsop | (2U << 5) | 4U); /* fabs v4, v2 (|B|) */
+            a64_emit(b, fmsub | (4U << 16) | (6U << 10) | (5U << 5) | 5U);
+        } else if (op == 3U) {
+            redo = (fbase | 0x1800U) | (1U << 16) | (7U << 5) | 5U;
+            a64_emit(b, fabsop | (0U << 5) | 6U); /* fabs v6, v0 (|R|) */
+            a64_emit(b, fabsop | (7U << 5) | 5U); /* fabs v5, v7 (|A|) */
+            a64_emit(b, fabsop | (1U << 5) | 4U); /* fabs v4, v1 (|B|) */
+            a64_emit(b, fnmsub | (4U << 16) | (5U << 10) | (6U << 5) | 5U);
+        } else if (op == 7U) {
+            redo = (fbase | 0x1C000U) | (7U << 5) | 5U;
+            a64_emit(b, fnmsub | (0U << 16) | (7U << 10) | (0U << 5) | 5U);
+        } else {
+            redo = (dbl ? 0x1F400000U : 0x1F000000U) |
+                (((op - 8U) & 2U) << 20) | (((op - 8U) & 1U) << 15) |
+                (2U << 16) | (1U << 10) | (7U << 5) | 5U;
+        }
+        if (op < 8U) {
+            a64_emit(b, fcmp0 | (5U << 5));
+            ei_cset(b, EI_T, A64_COND_GT);
+            to_fast = a64_emit_b_cond_placeholder(b, A64_COND_NE);
+        }
+        a64_emit(b, 0x1E604000U | (0U << 5) | 6U); /* fmov d6, d0 */
+        a64_emit(b, 0xD53B4400U | 15U); /* mrs x15, fpcr */
+        a64_emit_mov_imm32(b, 21U, 0x00C00000U); /* RMode mask */
+        a64_emit_orr_reg_w(b, 15U, 15U, 21U, A64_SHIFT_LSL, 0U); /* RZ */
+        a64_emit(b, 0xD51B4400U | 15U); /* msr fpcr, x15 */
+        a64_emit(b, 0xD5033FDFU); /* isb */
+        a64_emit(b, redo); /* RZ result -> v5 */
+        a64_emit_bic_reg_w(b, false, 15U, 15U, 21U, A64_SHIFT_LSL, 0U);
+        a64_emit(b, 0xD51B4400U | 15U); /* msr fpcr, x15 */
+        a64_emit(b, 0xD5033FDFU); /* isb */
+        a64_emit(b, fabsop | (6U << 5) | 6U);
+        a64_emit(b, fabsop | (5U << 5) | 5U);
+        a64_emit(b, fcmpop | (5U << 16) | (6U << 5));
+        ei_cset(b, EI_T, A64_COND_HI);
+        if (op < 8U) {
+            a64_patch_b_cond(b, to_fast, b->count);
+        }
+    }
+    to_join = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_cbz_w(b, to_not_rn, b->count);
     ei_cmp_imm(b, EI_T2, 1U); /* RZ never rounds up */
     to_rz = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
     a64_emit(b, fcmp0 | (0U << 5)); /* fcmp result, #0 */
+    ei_cset(b, EI_T, A64_COND_GT); /* RP: result > +0 */
+    ei_cset(b, EI_X, A64_COND_MI); /* RM: result < -0 */
     ei_cmp_imm(b, EI_T2, 2U); /* RP? */
-    to_rm = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    ei_cset(b, EI_T, A64_COND_GT); /* RP rounds up iff result > +0 */
-    skip_rp = a64_emit_cbz_w_placeholder(b, false, EI_T);
+    a64_emit_csel_w(b, EI_T, EI_T, EI_X, A64_COND_EQ);
+    a64_patch_b_cond(b, to_join, b->count);
+    skip_fr = a64_emit_cbz_w_placeholder(b, false, EI_T);
     a64_emit_mov_imm32(b, EI_X, FP_FR);
     a64_emit_orr_reg_w(b, EI_A, EI_A, EI_X, A64_SHIFT_LSL, 0U);
-    to_end2 = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_b_cond(b, to_rm, b->count);
-    ei_cset(b, EI_T, A64_COND_LT); /* RM rounds up iff result < -0 */
-    skip_rm = a64_emit_cbz_w_placeholder(b, false, EI_T);
-    a64_emit_mov_imm32(b, EI_X, FP_FR);
-    a64_emit_orr_reg_w(b, EI_A, EI_A, EI_X, A64_SHIFT_LSL, 0U);
-    a64_patch_cbz_w(b, skip_ixc, b->count);
     a64_patch_cbz_w(b, skip_fr, b->count);
-    a64_patch_cbz_w(b, skip_rp, b->count);
-    a64_patch_cbz_w(b, skip_rm, b->count);
     a64_patch_b_cond(b, to_rz, b->count);
-    a64_patch_b_cond(b, to_end, b->count);
-    a64_patch_b_cond(b, to_end2, b->count);
-    fp_fpscr_st(b, EI_A);
+    a64_patch_cbz_w(b, skip_ixc, b->count);
 }
 
 /* P32-R8-5: post-store FR fixup for converts (frsp/fctiw): FR iff the
