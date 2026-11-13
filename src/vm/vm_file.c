@@ -405,23 +405,25 @@ void vm_file_promote_cow(uint32_t gva_page)
 }
 
 /* Zero an in-place private file span without faulting on read-only
- * host pages (P32-R4-9): widen the covering host pages writable,
- * memset, then restore the per-sub-page union (never PROT_EXEC).
- * Best-effort: an mprotect failure skips the zeroing. A2-only; on A1
- * the kernel owns private file pages and handles truncation itself. */
-static void file_zero_private_span(uint32_t lo, uint32_t hi)
+ * host pages (P32-R4-9/R13-4): widen the covering host pages writable,
+ * memset, then restore the per-sub-page union (never PROT_EXEC). A
+ * failed final sync restores PROT_NONE so pages never stay writable.
+ * A2-only; on A1 the kernel owns private file pages. Returns 0 or a
+ * negative errno. */
+static int file_zero_private_span(uint32_t lo, uint32_t hi)
 {
     uintptr_t base;
     size_t h;
     uintptr_t hlo;
     uintptr_t hhi;
+    int rc;
 
     if (hi <= lo || !vm32_is_a2()) {
-        return;
+        return 0;
     }
     base = vm32_arena_base();
     if (base == 0U) {
-        return;
+        return -ENOMEM;
     }
     h = vm32_host_page_size();
     if (h < VM32_GUEST_PAGE_SIZE) {
@@ -430,14 +432,19 @@ static void file_zero_private_span(uint32_t lo, uint32_t hi)
     hlo = (base + (uint64_t)lo) & ~(h - 1U);
     hhi = ((base + (uint64_t)hi) + h - 1U) & ~(h - 1U);
     if (hhi <= hlo) {
-        return;
+        return 0;
     }
     if (mprotect((void *)hlo, (size_t)(hhi - hlo),
             PROT_READ | PROT_WRITE) != 0) {
-        return;
+        return -errno;
     }
     (void)memset((void *)(base + (uint64_t)lo), 0, (size_t)(hi - lo));
-    (void)vm32_sync_host_range(lo, hi);
+    rc = vm32_sync_host_range(lo, hi);
+    if (rc != 0) {
+        (void)mprotect((void *)hlo, (size_t)(hhi - hlo), PROT_NONE);
+        return (rc < 0) ? rc : -EIO;
+    }
+    return 0;
 }
 
 /* Truncate in two phases (P32-R4-8/R4-9). Phase 1 runs under the inode
@@ -504,7 +511,7 @@ static void file_truncate_rerecord(uint32_t glo, uint32_t ghi,
     vm32_tlb_invalidate_range(glo, ghi);
 }
 
-static void file_truncate_phase2(uint64_t dev, uint64_t ino,
+static int file_truncate_phase2(uint64_t dev, uint64_t ino,
     uint64_t old_size, uint64_t new_size)
 {
     uint64_t new_eof = (new_size + 4095ULL) & ~4095ULL;
@@ -513,6 +520,7 @@ static void file_truncate_phase2(uint64_t dev, uint64_t ino,
     bool grew = new_size > old_size;
     size_t i;
     bool held = vm_lock_held_by_self();
+    int first_err = 0;
 
     if (!held) {
         vm_lock_acquire();
@@ -549,9 +557,12 @@ static void file_truncate_phase2(uint64_t dev, uint64_t ino,
         if (zrhi > zrlo) {
             vm_file_shared_truncate_range(r->fd, zrlo, zrhi);
             if (!is_shared) {
-                file_zero_private_span(
+                int zrc = file_zero_private_span(
                     (uint32_t)((uint64_t)r->start + (zrlo - rlo)),
                     (uint32_t)((uint64_t)r->start + (zrhi - rlo)));
+                if (zrc != 0 && first_err == 0) {
+                    first_err = zrc;
+                }
             }
         }
         /* Pages wholly beyond the new EOF trap (SIGBUS) in every
@@ -581,6 +592,7 @@ static void file_truncate_phase2(uint64_t dev, uint64_t ino,
     if (!held) {
         vm_lock_release();
     }
+    return first_err;
 }
 
 /* Identity truncate: only mappings of the truncated file move. The
@@ -601,7 +613,12 @@ int vm_file_on_truncate_fd(int host_fd, uint64_t new_size)
         return -errno;
     }
     file_truncate_phase1(dev, ino, new_size, &old_size);
-    file_truncate_phase2(dev, ino, old_size, new_size);
+    {
+        int prc = file_truncate_phase2(dev, ino, old_size, new_size);
+        if (prc != 0) {
+            return prc;
+        }
+    }
     return 0;
 }
 

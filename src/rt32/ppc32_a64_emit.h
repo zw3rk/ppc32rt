@@ -140,15 +140,6 @@ static inline uint32_t ppc32_ror32(uint32_t val, unsigned rot)
     return (val >> rot) | (val << (32U - rot));
 }
 
-static inline unsigned ppc32_load_reg(a64_buf_t *b, unsigned reg, uint32_t pc_val, unsigned scratch)
-{
-    if (reg == 15U) {
-        a64_emit_mov_pc32(b, scratch, pc_val);
-        return scratch;
-    }
-    return reg;
-}
-
 /* Arithmetic (32-bit W) */
 void a64_emit_add_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, uint16_t imm12, unsigned sh);
 void a64_emit_sub_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, uint16_t imm12, unsigned sh);

@@ -106,6 +106,29 @@ static long dyn_access(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t mode)
     return 0;
 }
 
+/* P32-R13-2: BE image helpers writing into a stack buffer (never
+ * directly to guest memory). Shared by the Linux and fallback writers. */
+static void dyn_buf16(uint8_t *b, uint32_t off, uint16_t v)
+{
+    uint16_t w = ppc32_be16(v);
+
+    memcpy(b + off, &w, sizeof w);
+}
+
+static void dyn_buf32(uint8_t *b, uint32_t off, uint32_t v)
+{
+    uint32_t w = ppc32_be32(v);
+
+    memcpy(b + off, &w, sizeof w);
+}
+
+static void dyn_buf64(uint8_t *b, uint32_t off, uint64_t v)
+{
+    uint64_t w = ppc32_be64(v);
+
+    memcpy(b + off, &w, sizeof w);
+}
+
 #ifdef __linux__
 /* Verify the host statx shape once: the member-wise converter below
  * addresses the 256 B UAPI layout by offset. */
@@ -115,37 +138,40 @@ _Static_assert(sizeof(struct statx) == DYN_STATX_SIZE,
 static long dyn_put_statx(ppc32_ctx_t *ctx, uint32_t va,
     const struct statx *hs)
 {
+    uint8_t buf[DYN_STATX_SIZE];
     uint64_t mnt_id;
 
-    if (!ppc32_range_ok(va, DYN_STATX_SIZE)) {
+    memset(buf, 0, sizeof buf);
+    memcpy(&mnt_id, (const unsigned char *)hs + 144U, sizeof mnt_id);
+    dyn_buf32(buf, 0U, hs->stx_mask);
+    dyn_buf32(buf, 4U, hs->stx_blksize);
+    dyn_buf64(buf, 8U, hs->stx_attributes);
+    dyn_buf32(buf, 16U, hs->stx_nlink);
+    dyn_buf32(buf, 20U, hs->stx_uid);
+    dyn_buf32(buf, 24U, hs->stx_gid);
+    dyn_buf16(buf, 28U, hs->stx_mode);
+    dyn_buf64(buf, 32U, hs->stx_ino);
+    dyn_buf64(buf, 40U, hs->stx_size);
+    dyn_buf64(buf, 48U, hs->stx_blocks);
+    dyn_buf64(buf, 56U, hs->stx_attributes_mask);
+    dyn_buf64(buf, 64U, (uint64_t)hs->stx_atime.tv_sec);
+    dyn_buf32(buf, 72U, hs->stx_atime.tv_nsec);
+    dyn_buf64(buf, 80U, (uint64_t)hs->stx_btime.tv_sec);
+    dyn_buf32(buf, 88U, hs->stx_btime.tv_nsec);
+    dyn_buf64(buf, 96U, (uint64_t)hs->stx_ctime.tv_sec);
+    dyn_buf32(buf, 104U, hs->stx_ctime.tv_nsec);
+    dyn_buf64(buf, 112U, (uint64_t)hs->stx_mtime.tv_sec);
+    dyn_buf32(buf, 120U, hs->stx_mtime.tv_nsec);
+    dyn_buf32(buf, 128U, hs->stx_rdev_major);
+    dyn_buf32(buf, 132U, hs->stx_rdev_minor);
+    dyn_buf32(buf, 136U, hs->stx_dev_major);
+    dyn_buf32(buf, 140U, hs->stx_dev_minor);
+    dyn_buf64(buf, 144U, mnt_id);
+    /* P32-R13-2: checked write only (mapping + PROT_WRITE verified
+     * before any guest byte changes; invalidates LL/SMC on success). */
+    if (ppc32_vm_copyout_safe(ctx, va, buf, DYN_STATX_SIZE) != 0) {
         return -EFAULT;
     }
-    memset(ppc32_guest_ptr(ctx, va), 0, DYN_STATX_SIZE);
-    memcpy(&mnt_id, (const unsigned char *)hs + 144U, sizeof mnt_id);
-    ppc32_st32be(ctx, va + 0U, hs->stx_mask);
-    ppc32_st32be(ctx, va + 4U, hs->stx_blksize);
-    ppc32_st64be(ctx, va + 8U, hs->stx_attributes);
-    ppc32_st32be(ctx, va + 16U, hs->stx_nlink);
-    ppc32_st32be(ctx, va + 20U, hs->stx_uid);
-    ppc32_st32be(ctx, va + 24U, hs->stx_gid);
-    ppc32_st16be(ctx, va + 28U, hs->stx_mode);
-    ppc32_st64be(ctx, va + 32U, hs->stx_ino);
-    ppc32_st64be(ctx, va + 40U, hs->stx_size);
-    ppc32_st64be(ctx, va + 48U, hs->stx_blocks);
-    ppc32_st64be(ctx, va + 56U, hs->stx_attributes_mask);
-    ppc32_st64be(ctx, va + 64U, (uint64_t)hs->stx_atime.tv_sec);
-    ppc32_st32be(ctx, va + 72U, hs->stx_atime.tv_nsec);
-    ppc32_st64be(ctx, va + 80U, (uint64_t)hs->stx_btime.tv_sec);
-    ppc32_st32be(ctx, va + 88U, hs->stx_btime.tv_nsec);
-    ppc32_st64be(ctx, va + 96U, (uint64_t)hs->stx_ctime.tv_sec);
-    ppc32_st32be(ctx, va + 104U, hs->stx_ctime.tv_nsec);
-    ppc32_st64be(ctx, va + 112U, (uint64_t)hs->stx_mtime.tv_sec);
-    ppc32_st32be(ctx, va + 120U, hs->stx_mtime.tv_nsec);
-    ppc32_st32be(ctx, va + 128U, hs->stx_rdev_major);
-    ppc32_st32be(ctx, va + 132U, hs->stx_rdev_minor);
-    ppc32_st32be(ctx, va + 136U, hs->stx_dev_major);
-    ppc32_st32be(ctx, va + 140U, hs->stx_dev_minor);
-    ppc32_st64be(ctx, va + 144U, mnt_id);
     return 0;
 }
 
@@ -320,36 +346,38 @@ static long dyn_put_stat_fallback(ppc32_ctx_t *ctx, uint32_t va,
     uint64_t dev;
     uint32_t major;
     uint32_t minor;
+    uint8_t buf[DYN_STATX_SIZE];
 
-    if (!ppc32_range_ok(va, DYN_STATX_SIZE)) {
-        return -EFAULT;
+    memset(buf, 0, sizeof buf);
+    dyn_buf32(buf, 0U, DYN_STATX_BASIC);
+    dyn_buf32(buf, 4U, (uint32_t)hs->st_blksize);
+    dyn_buf64(buf, 8U, 0ULL);
+    dyn_buf32(buf, 16U, (uint32_t)hs->st_nlink);
+    dyn_buf32(buf, 20U, (uint32_t)hs->st_uid);
+    dyn_buf32(buf, 24U, (uint32_t)hs->st_gid);
+    dyn_buf16(buf, 28U, (uint16_t)hs->st_mode);
+    dyn_buf64(buf, 32U, (uint64_t)hs->st_ino);
+    dyn_buf64(buf, 40U, (uint64_t)hs->st_size);
+    dyn_buf64(buf, 48U, (uint64_t)hs->st_blocks);
+    dyn_buf64(buf, 56U, 0ULL);
+    /* P32-R13-9: atime/mtime/ctime via the shared convert helper;
+     * btime stays local (Linux statx callers get zero here). */
+    {
+        int64_t at_s;
+        int64_t mt_s;
+        int64_t ct_s;
+        uint32_t at_n;
+        uint32_t mt_n;
+        uint32_t ct_n;
+
+        ppc32_host_stat_times(hs, &at_s, &at_n, &mt_s, &mt_n, &ct_s, &ct_n);
+        dyn_buf64(buf, 64U, (uint64_t)at_s);
+        dyn_buf32(buf, 72U, at_n);
+        dyn_buf64(buf, 96U, (uint64_t)ct_s);
+        dyn_buf32(buf, 104U, ct_n);
+        dyn_buf64(buf, 112U, (uint64_t)mt_s);
+        dyn_buf32(buf, 120U, mt_n);
     }
-    memset(ppc32_guest_ptr(ctx, va), 0, DYN_STATX_SIZE);
-    ppc32_st32be(ctx, va + 0U, DYN_STATX_BASIC);
-    ppc32_st32be(ctx, va + 4U, (uint32_t)hs->st_blksize);
-    ppc32_st64be(ctx, va + 8U, 0ULL);
-    ppc32_st32be(ctx, va + 16U, (uint32_t)hs->st_nlink);
-    ppc32_st32be(ctx, va + 20U, (uint32_t)hs->st_uid);
-    ppc32_st32be(ctx, va + 24U, (uint32_t)hs->st_gid);
-    ppc32_st16be(ctx, va + 28U, (uint16_t)hs->st_mode);
-    ppc32_st64be(ctx, va + 32U, (uint64_t)hs->st_ino);
-    ppc32_st64be(ctx, va + 40U, (uint64_t)hs->st_size);
-    ppc32_st64be(ctx, va + 48U, (uint64_t)hs->st_blocks);
-    ppc32_st64be(ctx, va + 56U, 0ULL);
-/* convert.c parity: st_atim on Linux, st_*timespec on Darwin with
- * _DARWIN_C_SOURCE, plain st_atime siblings under strict -std=c11. */
-#if defined(__linux__)
-    sec = (int64_t)hs->st_atim.tv_sec;
-    nsec = (uint32_t)hs->st_atim.tv_nsec;
-#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
-    sec = (int64_t)hs->st_atimespec.tv_sec;
-    nsec = (uint32_t)hs->st_atimespec.tv_nsec;
-#else
-    sec = (int64_t)hs->st_atime;
-    nsec = 0U;
-#endif
-    ppc32_st64be(ctx, va + 64U, (uint64_t)sec);
-    ppc32_st32be(ctx, va + 72U, nsec);
 #if defined(__linux__)
     sec = 0;
     nsec = 0U;
@@ -360,43 +388,22 @@ static long dyn_put_stat_fallback(ppc32_ctx_t *ctx, uint32_t va,
     sec = 0;
     nsec = 0U;
 #endif
-    ppc32_st64be(ctx, va + 80U, (uint64_t)sec);
-    ppc32_st32be(ctx, va + 88U, nsec);
-#if defined(__linux__)
-    sec = (int64_t)hs->st_ctim.tv_sec;
-    nsec = (uint32_t)hs->st_ctim.tv_nsec;
-#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
-    sec = (int64_t)hs->st_ctimespec.tv_sec;
-    nsec = (uint32_t)hs->st_ctimespec.tv_nsec;
-#else
-    sec = (int64_t)hs->st_ctime;
-    nsec = 0U;
-#endif
-    ppc32_st64be(ctx, va + 96U, (uint64_t)sec);
-    ppc32_st32be(ctx, va + 104U, nsec);
-#if defined(__linux__)
-    sec = (int64_t)hs->st_mtim.tv_sec;
-    nsec = (uint32_t)hs->st_mtim.tv_nsec;
-#elif defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
-    sec = (int64_t)hs->st_mtimespec.tv_sec;
-    nsec = (uint32_t)hs->st_mtimespec.tv_nsec;
-#else
-    sec = (int64_t)hs->st_mtime;
-    nsec = 0U;
-#endif
-    ppc32_st64be(ctx, va + 112U, (uint64_t)sec);
-    ppc32_st32be(ctx, va + 120U, nsec);
+    dyn_buf64(buf, 80U, (uint64_t)sec);
+    dyn_buf32(buf, 88U, nsec);
     dev = (uint64_t)hs->st_rdev;
     major = (uint32_t)(((dev >> 8) & 0xFFFULL) | ((dev >> 32) & 0xFFFFF000ULL));
     minor = (uint32_t)((dev & 0xFFULL) | ((dev >> 12) & 0xFFFFFF00ULL));
-    ppc32_st32be(ctx, va + 128U, major);
-    ppc32_st32be(ctx, va + 132U, minor);
+    dyn_buf32(buf, 128U, major);
+    dyn_buf32(buf, 132U, minor);
     dev = (uint64_t)hs->st_dev;
     major = (uint32_t)(((dev >> 8) & 0xFFFULL) | ((dev >> 32) & 0xFFFFF000ULL));
     minor = (uint32_t)((dev & 0xFFULL) | ((dev >> 12) & 0xFFFFFF00ULL));
-    ppc32_st32be(ctx, va + 136U, major);
-    ppc32_st32be(ctx, va + 140U, minor);
-    ppc32_st64be(ctx, va + 144U, 0ULL);
+    dyn_buf32(buf, 136U, major);
+    dyn_buf32(buf, 140U, minor);
+    dyn_buf64(buf, 144U, 0ULL);
+    if (ppc32_vm_copyout_safe(ctx, va, buf, DYN_STATX_SIZE) != 0) {
+        return -EFAULT;
+    }
     return 0;
 }
 

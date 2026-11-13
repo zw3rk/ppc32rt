@@ -41,8 +41,7 @@ uint32_t               g_vm_mmap_cursor = PPC32_MMAP_BASE_32;
 ppc32_region_t         g_vm_regions[PPC32_MAX_REGIONS];
 size_t                 g_vm_region_count = 0U;
 
-/* Translation-cache invalidation on guest mm ops (D11 SMC): real since
- * Phase H H1; the interpreter has no code cache (the call is cheap). */
+/* JIT invalidation on guest mm ops (D11 SMC; interp path is cheap). */
 #ifdef PPC32RT_NO_DBT
 static inline void vm_invalidate_jit(ppc32_ctx_t *ctx, uint32_t start, uint32_t end)
 {
@@ -84,7 +83,7 @@ static int try_reserve_window(uint64_t base)
     return 0;
 }
 
-/* Publish two-regime state around the legacy probe-owned window. */
+/* Publish two-regime state around the probe-owned window. */
 static void vm32_attach_legacy(void)
 {
     long host_page = sysconf(_SC_PAGESIZE);
@@ -95,9 +94,7 @@ static void vm32_attach_legacy(void)
     vm32_tlb_invalidate_all();
 }
 
-/* Reserve one window candidate: the vm32 layer owns [G, G+4GiB) when
- * the platform allows it, else the legacy PROT_NONE probe keeps the
- * G=0 guard-hole layout. Exactly one owner reserves per boot. */
+/* Reserve one window: vm32 owns [G,G+4GiB), else the G=0 guard hole. */
 static int reserve_window(ppc32_ctx_t *ctx, uint64_t base)
 {
     if (base != 0ULL && vm32_init(ctx, base) == 0) {
@@ -176,8 +173,7 @@ int ppc32_vm_init(ppc32_ctx_t *ctx, uint64_t requested_window)
     return 0;
 }
 
-/* Exec teardown: drop every region except the vdso from the global
- * list (ctx->regions is a one-way mirror, so only this clear sticks). */
+/* Exec teardown: drop every region except the vdso. */
 void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
 {
     vm_lock_acquire();
@@ -196,19 +192,13 @@ void ppc32_vm_reset_for_exec(ppc32_ctx_t *ctx)
     g_vm_mmap_cursor = PPC32_MMAP_BASE_32;
     vm_lock_release();
 
-    /* Kernel exec semantics: execve destroys ALL old address space, so
-     * tear the window down too — stale host mappings of the previous
-     * image would otherwise collide with the new image's allocations.
-     * The next stack setup re-maps the vDSO and the stack. */
+    /* execve destroys the old address space: tear the window down too. */
     (void)munmap((void *)(uintptr_t)(ctx->guest_base + (uint64_t)PPC32_LOW_GUARD_SIZE),
                  (size_t)(PPC32_WINDOW_SIZE - (uint64_t)PPC32_LOW_GUARD_SIZE));
-    /* The old address space is gone: translations and reservations die,
-     * and no recorded prot/state may outlive it (A2 union layer too). */
     vm32_tlb_invalidate_all();
     vm32_ll_note_remap();
 
-    /* Mirror the cleared state into the caller's ctx (vdso_base clears
-     * too, or a fork child would skip the re-map and lose the vDSO). */
+    /* Mirror the cleared state (vdso_base too, for fork children). */
     ctx->brk_base    = 0U;
     ctx->brk_curr    = 0U;
     ctx->mmap_cursor = PPC32_MMAP_BASE_32;
@@ -292,11 +282,17 @@ uint32_t ppc32_vm_brk(ppc32_ctx_t *ctx, uint32_t new_brk)
             vm_lock_release();
             return curr;
         }
+        /* P32-R13-15: failed shrink keeps the old break (Linux brk). */
         uint32_t len = old_page - new_page;
-        if (vm32_is_a2()) {
-            (void)vm32_unmap_union(new_page, len);
-        } else {
-            (void)vm_reserve_prot_none(ctx, new_page, len);
+        int urc = vm32_is_a2() ? vm32_unmap_union(new_page, len)
+                               : vm_reserve_prot_none(ctx, new_page, len);
+        if (urc != 0) {
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_brk_to_ctx(ctx);
+            vm_lock_release();
+            return curr;
+        }
+        if (!vm32_is_a2()) {
             vm32_record_unmap(new_page, old_page);
         }
         vm_unmap_regions_locked(new_page, old_page);
@@ -418,8 +414,7 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         ((uint64_t)target_va + host_map_len <= (uint64_t)PPC32_TASK_SIZE_TOP);
     bool shared_direct = is_shared && use_fd >= 0 &&
                          va_host_aligned && off_host_aligned && in_window;
-    /* P32-R4-3: a host-aligned mapping overlapping a live staged group
-     * of the same file joins staging, keeping one coherent backing. */
+    /* Same-file staged overlap joins staging (one coherent backing). */
     if (shared_direct && vm_file_shared_group_referenced(use_fd,
             (uint64_t)host_off, (size_t)aligned_len)) {
         shared_direct = false;
@@ -428,8 +423,7 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
                          use_fd >= 0 &&
                          (host_flags & MAP_ANONYMOUS) == 0 &&
                          va_host_aligned && in_window;
-    /* Guest-visible extent stays map_end: host rounding pads backing
-     * only, never accessible memory past the requested mapping. */
+    /* Host rounding pads backing only, never accessible memory. */
     if ((shared_direct || shared_staged) && host_map_len > aligned_len) {
         uint32_t host_end = (uint32_t)((uint64_t)target_va + host_map_len);
         bool tail_busy = vm_range_overlaps_locked(map_end, host_end);
@@ -457,8 +451,14 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             return (uint32_t)err;
         }
         vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
-        if (vm32_is_a2()) {
+        /* P32-R13-3: a failed final sync must not leave RW staging. */
+        if (vm32_is_a2() && vm32_sync_host_range(target_va, map_end) != 0) {
+            vm32_record_unmap(target_va, map_end);
             (void)vm32_sync_host_range(target_va, map_end);
+            if (sh_fd >= 0) {
+                (void)close(sh_fd);
+            }
+            return (uint32_t)(-ENOMEM);
         }
     } else if (shared_staged) {
         /* Coherent sub-page sharing through the staged object. */
@@ -501,7 +501,15 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
             }
         }
         vm32_record_map(target_va, map_end, (uint8_t)(prot & 0x7U), state);
-        (void)vm32_sync_host_range(target_va, map_end);
+        /* P32-R13-3: failed final sync rolls back; no RW staging left. */
+        if (vm32_sync_host_range(target_va, map_end) != 0) {
+            vm32_record_unmap(target_va, map_end);
+            (void)vm32_sync_host_range(target_va, map_end);
+            if (sh_fd >= 0) {
+                (void)close(sh_fd);
+            }
+            return (uint32_t)(-ENOMEM);
+        }
     } else {
         void *res = mmap(host_target, (size_t)aligned_len, host_prot,
                          host_flags | MAP_FIXED, use_fd,
@@ -536,16 +544,12 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         }
         return (uint32_t)(-ENOMEM);
     }
-    /* Region publication unmaps overlapping ranges first, which drops
-     * their inode records — including the fresh one populated above.
-     * Re-register file backing after the insert so the new mapping
-     * keeps its identity and EOF tracking. */
+    /* Publication drops overlapped inode records; re-register below. */
     if (sh_fd < 0 && use_fd >= 0 && (host_flags & MAP_ANONYMOUS) == 0) {
         vm_file_note_private(use_fd, target_va,
             (uint32_t)(aligned_len / 4096ULL),
             (uint64_t)host_off);
-        /* Beyond-EOF pages trap for shared and (A2) private mappings
-         * alike (P32-R4-7); A1 private mappings stay kernel-owned. */
+        /* Beyond-EOF pages trap (A2; A1 private stays kernel-owned). */
         if (vm32_is_a2()) {
             vm_file_trap_beyond_eof(use_fd, target_va,
                 (uint64_t)host_off, (size_t)aligned_len);
@@ -554,8 +558,7 @@ static uint32_t vm_mmap2_locked(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
     if (update_cursor) {
         g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + host_map_len);
     }
-    /* P32-R9-2: replacing a mapping kills outstanding LL/SC
-     * reservations, like mprotect/munmap/brk-shrink do. */
+    /* Replacing a mapping kills outstanding LL/SC reservations. */
     if ((flags & (PPC32_MAP_FIXED | PPC32_MAP_FIXED_NOREPLACE)) != 0U) {
         vm32_ll_note_remap();
     }
@@ -580,8 +583,6 @@ uint32_t ppc32_vm_mmap2(ppc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t 
          (prot & (uint32_t)PROT_EXEC) != 0U)) {
         vm_invalidate_jit(ctx, res, (uint32_t)((uint64_t)res + page_align_up((uint64_t)len)));
     }
-
-    /* No AOT pre-translator: the DBT compiles lazily (Phase 3). */
 
     return res;
 }

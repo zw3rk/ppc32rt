@@ -26,6 +26,55 @@
 
 /* Memory/branch/trap helpers live in interp.h; interp_step below. */
 
+/* P32-R13-7: shared string byte-pack loop for LSWI/STSWI/LSWX/STSWX.
+ * Loads pack bytes into successive registers (partial final words
+ * clear); stores unpack them. Stops at the first failed byte. */
+static void exec_string_ldst(ppc32_ctx_t *ctx, uint32_t ea, uint32_t n,
+    uint32_t base_reg, bool is_load)
+{
+    uint32_t i;
+
+    if (is_load) {
+        uint32_t cur = 0U;
+        uint32_t cur_reg = 0U;
+        bool have = false;
+
+        for (i = 0U; i < n; i++) {
+            uint32_t reg = (base_reg + i / 4U) & 31U;
+            uint32_t shift = (3U - (i % 4U)) * 8U;
+            uint32_t byte;
+
+            if (!have || reg != cur_reg) {
+                if (have) {
+                    ctx->gpr[cur_reg] = cur;
+                }
+                cur = 0U;
+                cur_reg = reg;
+                have = true;
+            }
+            byte = ld8(ctx, ea + i);
+            if (ctx->exit_reason != PPC32_EXIT_NONE) {
+                have = false;
+                break;
+            }
+            cur = (cur & ~(0xFFU << shift)) | (byte << shift);
+        }
+        if (have) {
+            ctx->gpr[cur_reg] = cur;
+        }
+        return;
+    }
+    for (i = 0U; i < n; i++) {
+        uint32_t reg = (base_reg + i / 4U) & 31U;
+        uint32_t shift = (3U - (i % 4U)) * 8U;
+
+        st8(ctx, ea + i, (uint8_t)((ctx->gpr[reg] >> shift) & 0xFFU));
+        if (ctx->exit_reason != PPC32_EXIT_NONE) {
+            break;
+        }
+    }
+}
+
 void interp_step(ppc32_ctx_t *ctx)
 {
     ppc32_insn_t insn;
@@ -603,51 +652,11 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t ea = (insn.ra == 0U) ? 0U : ctx->gpr[insn.ra];
         uint32_t nb = ((raw >> 11U) & 31U);
         uint32_t n = (nb == 0U) ? 32U : nb;
-        uint32_t i;
+        bool is_load = (insn.op == PPC32_OP_LSWI);
 
         if (!interp_mem_ok(ea, n)) { fault(ctx, ea); break; }
-        if (insn.op == PPC32_OP_LSWI) {
-            uint32_t cur = 0U;
-            uint32_t cur_reg = 0U;
-            bool have = false;
-
-            for (i = 0U; i < n; i++) {
-                uint32_t reg = (insn.rt + i / 4U) & 31U;
-                uint32_t shift = (3U - (i % 4U)) * 8U;
-                uint32_t byte;
-
-                if (!have || reg != cur_reg) {
-                    if (have) {
-                        ctx->gpr[cur_reg] = cur;
-                    }
-                    /* P32-R7-16: unfilled bytes clear. */
-                    cur = 0U;
-                    cur_reg = reg;
-                    have = true;
-                }
-                byte = ld8(ctx, ea + i);
-                /* P32-R7-1: stop at the first failed byte. */
-                if (ctx->exit_reason != PPC32_EXIT_NONE) {
-                    have = false;
-                    break;
-                }
-                cur = (cur & ~(0xFFU << shift)) | (byte << shift);
-            }
-            if (have) {
-                ctx->gpr[cur_reg] = cur;
-            }
-        } else {
-            for (i = 0U; i < n; i++) {
-                uint32_t reg = (insn.rs + i / 4U) & 31U;
-                uint32_t shift = (3U - (i % 4U)) * 8U;
-
-                st8(ctx, ea + i,
-                    (uint8_t)((ctx->gpr[reg] >> shift) & 0xFFU));
-                if (ctx->exit_reason != PPC32_EXIT_NONE) {
-                    break;
-                }
-            }
-        }
+        exec_string_ldst(ctx, ea, n,
+            is_load ? insn.rt : insn.rs, is_load);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             break;
         }
@@ -663,49 +672,11 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t ea = (insn.ra == 0U ? 0U : ctx->gpr[insn.ra]) +
             ctx->gpr[insn.rb];
         uint32_t n = ctx->xer & 0x7FU;
-        uint32_t i;
+        bool is_load = (insn.op == PPC32_OP_LSWX);
 
         if (!interp_mem_ok(ea, n)) { fault(ctx, ea); break; }
-        if (insn.op == PPC32_OP_LSWX) {
-            uint32_t cur = 0U;
-            uint32_t cur_reg = 0U;
-            bool have = false;
-
-            for (i = 0U; i < n; i++) {
-                uint32_t reg = (insn.rt + i / 4U) & 31U;
-                uint32_t shift = (3U - (i % 4U)) * 8U;
-                uint32_t byte;
-
-                if (!have || reg != cur_reg) {
-                    if (have) {
-                        ctx->gpr[cur_reg] = cur;
-                    }
-                    cur = 0U;
-                    cur_reg = reg;
-                    have = true;
-                }
-                byte = ld8(ctx, ea + i);
-                if (ctx->exit_reason != PPC32_EXIT_NONE) {
-                    have = false;
-                    break;
-                }
-                cur = (cur & ~(0xFFU << shift)) | (byte << shift);
-            }
-            if (have) {
-                ctx->gpr[cur_reg] = cur;
-            }
-        } else {
-            for (i = 0U; i < n; i++) {
-                uint32_t reg = (insn.rs + i / 4U) & 31U;
-                uint32_t shift = (3U - (i % 4U)) * 8U;
-
-                st8(ctx, ea + i,
-                    (uint8_t)((ctx->gpr[reg] >> shift) & 0xFFU));
-                if (ctx->exit_reason != PPC32_EXIT_NONE) {
-                    break;
-                }
-            }
-        }
+        exec_string_ldst(ctx, ea, n,
+            is_load ? insn.rt : insn.rs, is_load);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             break;
         }

@@ -280,14 +280,17 @@ enum { SP_ADD, SP_SUB, SP_MUL, SP_DIV, SP_ABS, SP_NABS, SP_NEG, SP_SQRT,
     SP_MADD, SP_MSUB, SP_NMADD, SP_NMSUB, SP_SELM, SP_FMOV, SV_ADD = 16,
     SV_SUB, SV_AND, SV_XOR, SV_OR, SV_TRN1, SV_TRN2, SV_EXT10, SV_EXT01 };
 
-/* [op][prec]: S, D, V; rows ADD,SUB,MUL,DIV,ABS,NABS,NEG,SQRT,MADD,MSUB,NMADD,NMSUB,SELM,FMOV. */
+/* [op][prec]: S, D, V; rows ADD,SUB,MUL,DIV,ABS,NABS,NEG,SQRT,MADD,MSUB,NMADD,NMSUB,SELM,FMOV.
+ * P32-R15-1: fp_calc wires Rn=frA, Rm=frC, Ra=frB, so PPC fmsub
+ * (A*C-B) needs ARM FNMSUB and PPC fnmsub needs ARM FMSUB: the MSUB
+ * and NMSUB rows carry the swapped ARM encodings. */
 static const uint32_t fp_base[14][3] = {
     { 0x1E202800U, 0x1E602800U, 0x0E20D400U }, { 0x1E203800U, 0x1E603800U, 0x0EA0D400U },
     { 0x1E200800U, 0x1E600800U, 0x2E20DC00U }, { 0x1E201800U, 0x1E601800U, 0x2E20FC00U },
     { 0x1E20C000U, 0x1E60C000U, 0x0EA0B800U }, { 0U, 0U, 0U },
     { 0x1E214000U, 0x1E614000U, 0x2EA0B800U }, { 0x1E21C000U, 0x1E61C000U, 0x2EA1F800U },
-    { 0x1F000000U, 0x1F400000U, 0U }, { 0x1F008000U, 0x1F408000U, 0U },
-    { 0x1F200000U, 0x1F600000U, 0U }, { 0x1F208000U, 0x1F608000U, 0U },
+    { 0x1F000000U, 0x1F400000U, 0U }, { 0x1F208000U, 0x1F608000U, 0U },
+    { 0x1F200000U, 0x1F600000U, 0U }, { 0x1F008000U, 0x1F408000U, 0U },
     { 0x1E200C00U, 0x1E600C00U, 0U }, { 0x1E204000U, 0x1E604000U, 0U } };
 /* Shared engine: operands in v0 (A), v1 (B), v2 (C); result in v0. */
 static void fp_calc(a64_buf_t *b, unsigned op, unsigned prec,

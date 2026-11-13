@@ -18,6 +18,10 @@
 
 #include <stdint.h>
 
+/* P32-R13-8: canonical guest stat layouts live in os/convert.h; this
+ * header re-exports them so signal-frame consumers keep working. */
+#include "os/convert.h"
+
 /* ---- mc_gregs word indices (asm/ptrace.h PT_R0..PT_DSCR) ---- */
 enum {
     PPC32_MC_R0 = 0,
@@ -81,57 +85,7 @@ typedef struct {
     int32_t abigap[56];    /* 0x520: rs6000/xcoff register-save gap */
 } ppc32_rt_sigframe_t;
 
-/* ---- struct stat (ppc32, asm/stat.h: 72 B) ----
- * 32-bit powerpc packs nlink as ushort (uid realigns at 0x10); every
- * other member is a 32-bit word. Offsets VERIFIED against kernel UAPI
- * text this session. */
-typedef struct {
-    uint32_t st_dev;        /* 0x00 */
-    uint32_t st_ino;        /* 0x04 */
-    uint32_t st_mode;       /* 0x08 */
-    uint16_t st_nlink;      /* 0x0c */
-    uint32_t st_uid;        /* 0x10 */
-    uint32_t st_gid;        /* 0x14 */
-    uint32_t st_rdev;       /* 0x18 */
-    int32_t st_size;        /* 0x1c */
-    uint32_t st_blksize;    /* 0x20 */
-    uint32_t st_blocks;     /* 0x24 */
-    int32_t st_atime;       /* 0x28 */
-    uint32_t st_atime_nsec; /* 0x2c */
-    int32_t st_mtime;       /* 0x30 */
-    uint32_t st_mtime_nsec; /* 0x34 */
-    int32_t st_ctime;       /* 0x38 */
-    uint32_t st_ctime_nsec; /* 0x3c */
-    uint32_t __unused4;     /* 0x40 */
-    uint32_t __unused5;     /* 0x44 */
-} ppc32_stat_t;
-
-/* ---- struct stat64 (ppc32, asm/stat.h: 104 B, "matches glibc2.1") ----
- * Layout VERIFIED (E04 probe, native run ALL OK). __pad2 corroborates
- * 8-byte alignment of the following 64-bit members on PPC32 SysV. */
-typedef struct {
-    uint64_t st_dev;        /* 0x00 */
-    uint64_t st_ino;        /* 0x08 */
-    uint32_t st_mode;       /* 0x10 */
-    uint32_t st_nlink;      /* 0x14 */
-    uint32_t st_uid;        /* 0x18 */
-    uint32_t st_gid;        /* 0x1c */
-    uint64_t st_rdev;       /* 0x20 */
-    uint16_t __pad2;        /* 0x28 */
-    int64_t st_size;        /* 0x30 */
-    int32_t st_blksize;     /* 0x38 */
-    int64_t st_blocks;      /* 0x40 */
-    int32_t st_atime;       /* 0x48 */
-    uint32_t st_atime_nsec; /* 0x4c */
-    int32_t st_mtime;       /* 0x50 */
-    uint32_t st_mtime_nsec; /* 0x54 */
-    int32_t st_ctime;       /* 0x58 */
-    uint32_t st_ctime_nsec; /* 0x5c */
-    uint32_t __unused4;     /* 0x60 */
-    uint32_t __unused5;     /* 0x64 */
-} ppc32_stat64_t;
-
-/* ---- frozen ABI assertions ---- */
+/* ---- frozen ABI assertions (stat layouts canonical in convert.h) ---- */
 _Static_assert(sizeof(ppc32_mcontext_t) == 992, "mcontext must be 992 B");
 _Static_assert(sizeof(ppc32_ucontext_t) == 1184, "ucontext must be 1184 B");
 _Static_assert(sizeof(ppc32_rt_sigframe_t) == 1536, "rt_sigframe 1536 B");

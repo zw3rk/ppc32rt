@@ -177,24 +177,6 @@ static inline uint64_t fp_spe_cvt(ppc32_ctx_t *ctx, uint64_t in, int op,
     }
 }
 
-/* Saturating signed 32-bit lane add (P32-R7-10 `sat` forms; P32-R7-13
- * records lane overflow in SPEFSCR). */
-static inline uint32_t fp_mac_sat_add(ppc32_ctx_t *ctx, uint32_t x,
-    uint32_t y, int high)
-{
-    int64_t sum = (int64_t)(int32_t)x + (int64_t)(int32_t)y;
-
-    if (sum > 2147483647ll) {
-        spe_raise(ctx, high ? (SPE_SOVH | SPE_OVH) : (SPE_SOV | SPE_OV));
-        return 0x7fffffffu;
-    }
-    if (sum < -2147483648ll) {
-        spe_raise(ctx, high ? (SPE_SOVH | SPE_OVH) : (SPE_SOV | SPE_OV));
-        return 0x80000000u;
-    }
-    return (uint32_t)(int32_t)sum;
-}
-
 /* One whole-word MAC lane (P32-R7-10): the lane's own 32x32 product is
  * formed (never the neighbor lane's); fractional products scale by
  * >>31 with the -1*-1 special case, integer products select the high

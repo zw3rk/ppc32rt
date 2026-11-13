@@ -35,6 +35,11 @@ struct stat;
 struct timespec;
 struct timeval;
 
+/* P32-R13-9: shared host stat timestamps (seconds + nanoseconds). */
+void ppc32_host_stat_times(const struct stat *st, int64_t *atime_s,
+    uint32_t *atime_ns, int64_t *mtime_s, uint32_t *mtime_ns,
+    int64_t *ctime_s, uint32_t *ctime_ns);
+
 /* Replica of the ppc32 kernel struct stat (asm/stat.h, 32-bit only). */
 typedef struct ppc32_stat {
     uint32_t st_dev;

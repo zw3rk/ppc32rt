@@ -105,6 +105,30 @@ static int32_t stat_sec_ct(const struct stat *hs)
 #endif
 }
 
+void ppc32_host_stat_times(const struct stat *hs, int64_t *atime_s,
+    uint32_t *atime_ns, int64_t *mtime_s, uint32_t *mtime_ns,
+    int64_t *ctime_s, uint32_t *ctime_ns)
+{
+    if (atime_s != NULL) {
+        *atime_s = (int64_t)stat_sec_at(hs);
+    }
+    if (atime_ns != NULL) {
+        *atime_ns = stat_nsec_at(hs);
+    }
+    if (mtime_s != NULL) {
+        *mtime_s = (int64_t)stat_sec_mt(hs);
+    }
+    if (mtime_ns != NULL) {
+        *mtime_ns = stat_nsec_mt(hs);
+    }
+    if (ctime_s != NULL) {
+        *ctime_s = (int64_t)stat_sec_ct(hs);
+    }
+    if (ctime_ns != NULL) {
+        *ctime_ns = stat_nsec_ct(hs);
+    }
+}
+
 int ppc32_range_ok(uint32_t va, size_t len)
 {
     uint64_t end;
@@ -248,12 +272,22 @@ int ppc32_put_stat(const ppc32_ctx_t *ctx, uint32_t va, const struct stat *hs)
     gs.st_size = (int32_t)ppc32_be32((uint32_t)hs->st_size);
     gs.st_blksize = ppc32_be32((uint32_t)hs->st_blksize);
     gs.st_blocks = ppc32_be32((uint32_t)hs->st_blocks);
-    gs.st_atime = (int32_t)ppc32_be32((uint32_t)stat_sec_at(hs));
-    gs.st_atime_nsec = ppc32_be32((uint32_t)stat_nsec_at(hs));
-    gs.st_mtime = (int32_t)ppc32_be32((uint32_t)stat_sec_mt(hs));
-    gs.st_mtime_nsec = ppc32_be32((uint32_t)stat_nsec_mt(hs));
-    gs.st_ctime = (int32_t)ppc32_be32((uint32_t)stat_sec_ct(hs));
-    gs.st_ctime_nsec = ppc32_be32((uint32_t)stat_nsec_ct(hs));
+    {
+        int64_t at_s;
+        int64_t mt_s;
+        int64_t ct_s;
+        uint32_t at_n;
+        uint32_t mt_n;
+        uint32_t ct_n;
+
+        ppc32_host_stat_times(hs, &at_s, &at_n, &mt_s, &mt_n, &ct_s, &ct_n);
+        gs.st_atime = (int32_t)ppc32_be32((uint32_t)at_s);
+        gs.st_atime_nsec = ppc32_be32(at_n);
+        gs.st_mtime = (int32_t)ppc32_be32((uint32_t)mt_s);
+        gs.st_mtime_nsec = ppc32_be32(mt_n);
+        gs.st_ctime = (int32_t)ppc32_be32((uint32_t)ct_s);
+        gs.st_ctime_nsec = ppc32_be32(ct_n);
+    }
     return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 
@@ -277,12 +311,22 @@ int ppc32_put_stat64(const ppc32_ctx_t *ctx, uint32_t va, const struct stat *hs)
     gs.st_size = (int64_t)ppc32_be64((uint64_t)hs->st_size);
     gs.st_blksize = (int32_t)ppc32_be32((uint32_t)hs->st_blksize);
     gs.st_blocks = (int64_t)ppc32_be64((uint64_t)hs->st_blocks);
-    gs.st_atime = (int32_t)ppc32_be32((uint32_t)stat_sec_at(hs));
-    gs.st_atime_nsec = ppc32_be32((uint32_t)stat_nsec_at(hs));
-    gs.st_mtime = (int32_t)ppc32_be32((uint32_t)stat_sec_mt(hs));
-    gs.st_mtime_nsec = ppc32_be32((uint32_t)stat_nsec_mt(hs));
-    gs.st_ctime = (int32_t)ppc32_be32((uint32_t)stat_sec_ct(hs));
-    gs.st_ctime_nsec = ppc32_be32((uint32_t)stat_nsec_ct(hs));
+    {
+        int64_t at_s;
+        int64_t mt_s;
+        int64_t ct_s;
+        uint32_t at_n;
+        uint32_t mt_n;
+        uint32_t ct_n;
+
+        ppc32_host_stat_times(hs, &at_s, &at_n, &mt_s, &mt_n, &ct_s, &ct_n);
+        gs.st_atime = (int32_t)ppc32_be32((uint32_t)at_s);
+        gs.st_atime_nsec = ppc32_be32(at_n);
+        gs.st_mtime = (int32_t)ppc32_be32((uint32_t)mt_s);
+        gs.st_mtime_nsec = ppc32_be32(mt_n);
+        gs.st_ctime = (int32_t)ppc32_be32((uint32_t)ct_s);
+        gs.st_ctime_nsec = ppc32_be32(ct_n);
+    }
     return ppc32_vm_copyout_safe(ctx, va, &gs, sizeof gs);
 }
 

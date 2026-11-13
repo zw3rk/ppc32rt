@@ -559,14 +559,26 @@ int64_t rt_host_futex_wake(_Atomic uint32_t *pinned_host_uaddr,
 #if defined(__APPLE__)
     ulock_wake_fn wake = NULL;
 
-    (void)key; (void)count; (void)bitset;
-    load_ptr(RTLD_DEFAULT, "__ulock_wake", &wake, sizeof wake);
-    if (wake == NULL) {
+    (void)key; (void)bitset;
+    if (count <= 0) {
         return 0;
     }
-    (void)wake(PPC32_UL_COMPARE_AND_WAIT | PPC32_ULF_WAKE_ALL,
-        (void *)pinned_host_uaddr, 0ULL);
-    return (int64_t)count;
+    load_ptr(RTLD_DEFAULT, "__ulock_wake", &wake, sizeof wake);
+    if (wake == NULL) {
+        return (int64_t)-ENOSYS;
+    }
+    {
+        uint32_t op = PPC32_UL_COMPARE_AND_WAIT |
+            (uint32_t)((count > 1) ? PPC32_ULF_WAKE_ALL : 0U);
+        int r = wake(op, (void *)pinned_host_uaddr, 0ULL);
+        if (r < 0) {
+            if (errno == ENOENT) {
+                return 0;
+            }
+            return (int64_t)-errno;
+        }
+        return 1;
+    }
 #else
     (void)pinned_host_uaddr; (void)key; (void)count; (void)bitset;
     return (int64_t)-ENOSYS;

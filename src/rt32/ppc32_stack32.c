@@ -9,12 +9,13 @@
  * retyped on ppc32_ctx_t; guest stack top PPC32_STACK_TOP (0xBFFF0000,
  * SPEC 1.1); AT_PLATFORM "ppc".
  *
- * Phase 0 scope: maps the stack and builds a minimal valid initial frame
- * (argc/argv/envp + AT_NULL-terminated auxv). The full PPC32 auxv
- * (AT_PHDR/AT_ENTRY/AT_UID/..., AT_DCACHEBSIZE from E04/E07 follow-ups),
- * AT_RANDOM/AT_EXECFN, and the synthetic vDSO/sigtramp mapping at
- * PPC32_SIGTRAMP_BASE arrive with the Phase 2 os lane; this file's
- * ppc32_stack_setup() signature is frozen for it.
+ * This file maps the stack and builds the initial frame (argc/argv/envp
+ * + AT_NULL-terminated auxv). ppc32_stack_setup() writes AT_PHDR,
+ * AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_FLAGS, AT_ENTRY, AT_UID, AT_EUID,
+ * AT_GID, AT_EGID, AT_PLATFORM, AT_HWCAP, AT_CLKTCK, AT_RANDOM, AT_HWCAP2,
+ * AT_EXECFN, AT_BASE, AT_SECURE, AT_DCACHEBSIZE, AT_ICACHEBSIZE, and
+ * AT_UCACHEBSIZE. Only the synthetic vDSO/sigtramp mapping at
+ * PPC32_SIGTRAMP_BASE is installed by the OS signal layer.
  */
 
 #define _GNU_SOURCE

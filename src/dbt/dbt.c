@@ -461,6 +461,19 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
         if (ppc32_page_down(cur) != start_page) {
             break;
         }
+        /* P32-R13-1: guest NX/mapping check mirroring interp fetch_raw.
+         * First word failure faults (NULL + FAULT so the driver takes
+         * the ISI/SEGV path); later words simply end the block. */
+        if (!vm32_page_is_exec(cur) || !vm32_page_is_exec(cur + 3U)) {
+            if (n == 0U) {
+                ctx->fault_addr = pc;
+                ctx->fault_signo = (uint32_t)PPC32_SIGSEGV;
+                ctx->fault_is_store = 0U;
+                ctx->exit_reason = PPC32_EXIT_FAULT;
+                return NULL;
+            }
+            break;
+        }
         memcpy(&raw, ppc32_guest_ptr(ctx, cur), sizeof(raw));
         raw = ppc32_be32(raw);
         memset(&insn, 0, sizeof(insn));
@@ -490,6 +503,10 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
 
                 if (n + 1U + k >= PPC32_DBT_BLOCK_BUDGET ||
                     ppc32_page_down(fwd) != start_page) {
+                    break;
+                }
+                if (!vm32_page_is_exec(fwd) ||
+                    !vm32_page_is_exec(fwd + 3U)) {
                     break;
                 }
                 memcpy(&scan_raw, ppc32_guest_ptr(ctx, fwd),

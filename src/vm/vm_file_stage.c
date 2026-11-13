@@ -424,7 +424,14 @@ int vm_file_shared_map_at(void *host_target, size_t map_len, int use_fd,
         return -errno;
     }
     vm32_record_map(target_va, map_end, prot, state);
-    (void)vm32_sync_host_range(target_va, map_end);
+    {
+        int sync_rc = vm32_sync_host_range(target_va, map_end);
+        if (sync_rc != 0) {
+            vm32_record_unmap(target_va, map_end);
+            (void)vm32_sync_host_range(target_va, map_end);
+            return (sync_rc < 0) ? sync_rc : -EIO;
+        }
+    }
     return 0;
 }
 

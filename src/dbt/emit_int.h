@@ -333,21 +333,23 @@ static inline void ei_ld_ca(a64_buf_t *b, unsigned rd)
     a64_emit_and_reg_w(b, false, rd, rd, EI_T2, A64_SHIFT_LSL, 0U);
 }
 
-/* ((x ^ r) & (y ^ r)) >> 31: add overflow bit into EI_A. */
+/* ((x ^ r) & (y ^ r)) >> 31 into EI_A. Temps are EI_T/EI_T2 (never
+ * x/y/r at call sites) so same-reg operands are safe; all flag-free,
+ * so AArch64 NZCV (the pending C for CA) survives. */
 static inline void ei_add_ov(a64_buf_t *b, unsigned x, unsigned y, unsigned r)
 {
-    a64_emit_eor_reg_w(b, EI_A, x, r, A64_SHIFT_LSL, 0U);
-    a64_emit_eor_reg_w(b, EI_B, y, r, A64_SHIFT_LSL, 0U);
-    a64_emit_and_reg_w(b, false, EI_A, EI_A, EI_B, A64_SHIFT_LSL, 0U);
+    a64_emit_eor_reg_w(b, EI_T, x, r, A64_SHIFT_LSL, 0U);
+    a64_emit_eor_reg_w(b, EI_T2, y, r, A64_SHIFT_LSL, 0U);
+    a64_emit_and_reg_w(b, false, EI_A, EI_T, EI_T2, A64_SHIFT_LSL, 0U);
     a64_emit_shift_imm_w(b, EI_A, EI_A, A64_SHIFT_LSR, 31U, false, NULL);
 }
 
-/* ((y ^ r) & (y ^ x)) >> 31: sub overflow bit for r = y - x into EI_A. */
+/* ((y ^ x) & (y ^ r)) >> 31 into EI_A. Same temp/flag discipline. */
 static inline void ei_sub_ov(a64_buf_t *b, unsigned x, unsigned y, unsigned r)
 {
-    a64_emit_eor_reg_w(b, EI_A, y, r, A64_SHIFT_LSL, 0U);
-    a64_emit_eor_reg_w(b, EI_B, y, x, A64_SHIFT_LSL, 0U);
-    a64_emit_and_reg_w(b, false, EI_A, EI_A, EI_B, A64_SHIFT_LSL, 0U);
+    a64_emit_eor_reg_w(b, EI_T, y, x, A64_SHIFT_LSL, 0U);
+    a64_emit_eor_reg_w(b, EI_T2, y, r, A64_SHIFT_LSL, 0U);
+    a64_emit_and_reg_w(b, false, EI_A, EI_T, EI_T2, A64_SHIFT_LSL, 0U);
     a64_emit_shift_imm_w(b, EI_A, EI_A, A64_SHIFT_LSR, 31U, false, NULL);
 }
 

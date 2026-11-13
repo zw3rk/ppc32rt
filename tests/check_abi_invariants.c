@@ -65,7 +65,7 @@ _Static_assert(offsetof(ppc32_stat_t, st_blocks) == 0x24, "stat blks@0x24");
 _Static_assert(offsetof(ppc32_stat_t, st_atime) == 0x28, "stat atime@0x28");
 _Static_assert(offsetof(ppc32_stat_t, st_mtime) == 0x30, "stat mtime@0x30");
 _Static_assert(offsetof(ppc32_stat_t, st_ctime) == 0x38, "stat ctime@0x38");
-_Static_assert(offsetof(ppc32_stat_t, __unused5) == 0x44, "stat un5@0x44");
+_Static_assert(offsetof(ppc32_stat_t, st_unused5) == 0x44, "stat un5@0x44");
 _Static_assert(sizeof(ppc32_stat_t) == 72, "ppc32 stat 72 B");
 
 _Static_assert(offsetof(ppc32_stat64_t, st_dev) == 0x0, "st64 dev@0x0");
@@ -75,15 +75,15 @@ _Static_assert(offsetof(ppc32_stat64_t, st_nlink) == 0x14, "st64 nlink@0x14");
 _Static_assert(offsetof(ppc32_stat64_t, st_uid) == 0x18, "st64 uid@0x18");
 _Static_assert(offsetof(ppc32_stat64_t, st_gid) == 0x1c, "st64 gid@0x1c");
 _Static_assert(offsetof(ppc32_stat64_t, st_rdev) == 0x20, "st64 rdev@0x20");
-_Static_assert(offsetof(ppc32_stat64_t, __pad2) == 0x28, "st64 pad2@0x28");
+_Static_assert(offsetof(ppc32_stat64_t, st_pad2) == 0x28, "st64 pad2@0x28");
 _Static_assert(offsetof(ppc32_stat64_t, st_size) == 0x30, "st64 size@0x30");
 _Static_assert(offsetof(ppc32_stat64_t, st_blksize) == 0x38, "st64 blksz@0x38");
 _Static_assert(offsetof(ppc32_stat64_t, st_blocks) == 0x40, "st64 blks@0x40");
 _Static_assert(offsetof(ppc32_stat64_t, st_atime) == 0x48, "st64 at@0x48");
 _Static_assert(offsetof(ppc32_stat64_t, st_mtime) == 0x50, "st64 mt@0x50");
 _Static_assert(offsetof(ppc32_stat64_t, st_ctime) == 0x58, "st64 ct@0x58");
-_Static_assert(offsetof(ppc32_stat64_t, __unused4) == 0x60, "st64 un4@0x60");
-_Static_assert(offsetof(ppc32_stat64_t, __unused5) == 0x64, "st64 un5@0x64");
+_Static_assert(offsetof(ppc32_stat64_t, st_unused4) == 0x60, "st64 un4@0x60");
+_Static_assert(offsetof(ppc32_stat64_t, st_unused5) == 0x64, "st64 un5@0x64");
 _Static_assert(sizeof(ppc32_stat64_t) == 104, "ppc32 stat64 104 B");
 
 /* ---- compile-time pins: SPEC §2.1 ctx locked prefix (real ppc32_ctx_t) ---- */

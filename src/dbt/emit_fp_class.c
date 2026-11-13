@@ -40,11 +40,11 @@ void fp_nzcv_field(a64_buf_t *b)
 /* Exact FPRF of the result in Dvd/Svd into fpscr (w9); no FPSR use:
  * LT/GT/EQ/UN come from fcmp+NZCV; the class bit from the exponent.
  * P32-R8-2: C matches the oracle (fp_fprf64/fp_fprf32): set for QNaN,
- * denormals, and -0; clear for Inf, normals, and +0. The CSETs above
- * clobber x12/w12, so the pattern is reloaded before the mantissa,
- * sign, and quiet extracts below. x16 holds the saved FPCR across
- * fp_sync_fpcr/fp_restore_fpcr, so sign/quiet use w15; w10 is dead
- * after the mantissa CSET and holds the denormal flag. */
+ * denormals, and -0; clear for Inf, normals, and +0. P32-R15-2: FU
+ * (bit 0) is set for +-Inf (FPRF 0x05/0x09), not just NaN/denormal.
+ * The CSETs clobber x12/w12, so the pattern is reloaded before the
+ * mantissa, sign, and quiet extracts. x16 holds the saved FPCR, so
+ * sign/quiet use w15; w10 is dead after the mantissa CSET. */
 void fp_fprf(a64_buf_t *b, unsigned vd, bool dbl)
 {
     uint32_t xmax = dbl ? 0x7FFU : 0xFFU;
@@ -64,6 +64,9 @@ void fp_fprf(a64_buf_t *b, unsigned vd, bool dbl)
     }
     a64_emit(b, cmp | (xmax << 10) | (10U << 5) | 31U);
     ei_cset(b, EI_T, A64_COND_EQ); /* isMaxExp */
+    /* P32-R15-2: stash isMaxExp (x12 is reloaded with the FP pattern
+     * below, so the Inf FU fixup cannot read EI_T late). */
+    a64_emit_mov_w(b, A64_TMP3, EI_T);
     a64_emit(b, cmp | (10U << 5) | 31U);
     ei_cset(b, EI_T2, A64_COND_EQ); /* isZeroExp */
     if (dbl) {
@@ -92,6 +95,12 @@ void fp_fprf(a64_buf_t *b, unsigned vd, bool dbl)
         a64_emit(b, 0x53000000U | (22U << 16) | (22U << 10) |
             (12U << 5) | 15U); /* w15 = quiet */
     }
+    /* P32-R15-2: Inf is stashed-maxExp & mantZero (EI_X == 1 here);
+     * OR the FU bit into the FPRF field (no-op for NaN/QNaN paths
+     * that already carry UN, and for non-Inf classes). */
+    a64_emit_and_reg_w(b, false, A64_TMP3, A64_TMP3, EI_X, A64_SHIFT_LSL,
+        0U);
+    a64_emit_orr_reg_w(b, EI_R, EI_R, A64_TMP3, A64_SHIFT_LSL, 0U);
     a64_emit_bic_reg_w(b, false, EI_T, EI_T, EI_X, A64_SHIFT_LSL, 0U);
     a64_emit_and_reg_w(b, false, EI_T, EI_T, 15U, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, EI_T, EI_T, EI_B, A64_SHIFT_LSL, 0U);
@@ -292,8 +301,12 @@ void fp_fr_arith(a64_buf_t *b, unsigned op, bool dbl)
             redo = (fbase | 0x1C000U) | (7U << 5) | 5U;
             a64_emit(b, fnmsub | (0U << 16) | (7U << 10) | (0U << 5) | 5U);
         } else {
+            /* P32-R15-1: same MSUB/NMSUB swap as fp_base: bit21 is
+             * the xor of the MADD-row low bits, bit15 keeps its sense. */
+            uint32_t o = op - 8U;
             redo = (dbl ? 0x1F400000U : 0x1F000000U) |
-                (((op - 8U) & 2U) << 20) | (((op - 8U) & 1U) << 15) |
+                ((((o & 2U) >> 1U) ^ (o & 1U)) << 21U) |
+                ((o & 1U) << 15U) |
                 (2U << 16) | (1U << 10) | (7U << 5) | 5U;
         }
         if (op < 8U) {

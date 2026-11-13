@@ -159,14 +159,20 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         break;
     case PPC32_OP_ADDC:
         a64_emit_add_reg_w(b, true, EI_R, EI_A, EI_B, A64_SHIFT_LSL, 0U);
-        ei_xer_ca_from_c(b);
+        /* P32-R14-1: with OE the OV computation runs first (it
+         * preserves NZCV); CA is extracted after, in the OE block. */
+        if (in->oe == 0U) {
+            ei_xer_ca_from_c(b);
+        }
         break;
     case PPC32_OP_SUBF:
         a64_emit_sub_reg_w(b, false, EI_R, EI_B, EI_A, A64_SHIFT_LSL, 0U);
         break;
     case PPC32_OP_SUBFC:
         a64_emit_sub_reg_w(b, true, EI_R, EI_B, EI_A, A64_SHIFT_LSL, 0U);
-        ei_xer_ca_from_c(b);
+        if (in->oe == 0U) {
+            ei_xer_ca_from_c(b);
+        }
         break;
     case PPC32_OP_NEG:
         a64_emit_sub_reg_w(b, false, EI_R, A64_ZR, EI_A, A64_SHIFT_LSL, 0U);
@@ -239,6 +245,10 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         break;
     }
     if (in->oe != 0U && in->op != PPC32_OP_NEG) {
+        /* P32-R14-1: ei_add_ov/ei_sub_ov preserve NZCV, so the CA
+         * extracted below still sees the add/sub carry. */
+        bool need_ca = (in->op == PPC32_OP_ADDC ||
+            in->op == PPC32_OP_SUBFC);
         if (is_sub && in->op != PPC32_OP_SUBFC && in->op != PPC32_OP_SUBFE &&
             in->op != PPC32_OP_SUBF) {
             /* SUBFME/SUBFZE: ov = (r>>31) != (~a>>31). */
@@ -254,7 +264,14 @@ static int ei_addsub_xo(a64_buf_t *b, const ppc32_insn_t *in)
         } else {
             ei_add_ov(b, EI_A, EI_B, EI_R);
         }
-        ei_xer_ov_reg(b, EI_A);
+        if (need_ca) {
+            /* OV bit is in EI_A; stash it before CA clobbers EI_A/B. */
+            a64_emit_mov_w(b, EI_T, EI_A);
+            ei_xer_ca_from_c(b);
+            ei_xer_ov_reg(b, EI_T);
+        } else {
+            ei_xer_ov_reg(b, EI_A);
+        }
     }
     if (in->oe != 0U && in->op == PPC32_OP_NEG) {
         a64_emit_mov_imm32(b, EI_B, 0x80000000U);
