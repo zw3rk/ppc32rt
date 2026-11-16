@@ -148,6 +148,7 @@ _Static_assert(sizeof(a32h_info_t) == 256, "a32h_info_t must be exactly 256 byte
 #define A32H_DACT_SPAWN_THREAD   (1U << 2) /* Spawn worker pthread at spawn_pc/sp/r0/tls */
 #define A32H_DACT_EXIT_PROCESS   (1U << 3) /* Terminate guest with exit_status */
 #define A32H_DACT_DELIVER_SIGNAL (1U << 4) /* Signal frame installed; reload FP/vec if dirty */
+#define A32H_DACT_EXIT_THREAD    (1U << 5) /* Terminate this worker; process lives on */
 
 /* `a32h_darwin_cpu_state_t.state_flags` */
 #define A32H_DSTATE_FP_VALID  (1U << 0) /* Translator populated fpr[32] */

@@ -32,6 +32,11 @@
 #define PPC32_SPR_LR  8U
 #define PPC32_SPR_CTR 9U
 #define PPC32_SPR_VRSAVE 256U
+/* Darwin 32-bit PowerPC user thread pointer: SPRG3, SPR 259, readable
+ * (and writable) in user mode via mfspr/mtspr rD, 259. r2 and r13 stay
+ * ordinary GPRs on this profile; the TP lives in darwin_tls_tp and
+ * SPR 259 is served only when ctx->is_darwin is set (UNDEF on Linux). */
+#define PPC32_SPR_SPRG3_TLS 259U
 #define PPC32_SPR_SPEFSCR 512U
 /* e500v2 SPEFSCR (P32-R7-13; EREF/SPEPEM Table 2-35, PSIM
  * e500_registers.h): sticky status, current-op status, enables, and the
@@ -292,12 +297,18 @@ typedef struct ppc32_ctx {
      * vector registers plus VSCR and VRSAVE (SPR 256). C-only tail,
      * outside the ABI-locked prefix; interp, DBT fallback, and the
      * G02 bridge share these fields. vr[r][0] holds the most
-     * significant byte (big-endian lane order). */
-    uint8_t vr[32][16];
+     * significant byte (big-endian lane order). 16-byte aligned so
+     * word-lane access never violates effective-type alignment. */
+    _Alignas(16) uint8_t vr[32][16];
     uint32_t vscr;
     uint32_t vrsave;
 
-    /* G02 Darwin bridge per-thread state (C-only tail). */
+    /* G02 Darwin bridge per-thread state (C-only tail). is_darwin
+     * marks a context running under the Darwin personality: SPR 259
+     * serves darwin_tls_tp, VMX ld/st + arithmetic stay available,
+     * and the bridge owns thread/VM exits. Linux contexts leave it
+     * clear (SPR 259 UNDEFs, r2 is the TLS GPR per E06). */
+    bool is_darwin;
     uint32_t darwin_tls_tp;
     uint32_t darwin_tid;
     uint64_t darwin_aot_hash;

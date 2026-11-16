@@ -145,6 +145,7 @@ static bool dbt_store_shape(const ppc32_insn_t *insn, uint32_t *len_out,
         break;
     }
     case PPC32_OP_SPE:
+    case PPC32_OP_VMX:
         /* 64-bit indexed stores only (768/770 are the loads). */
         if (insn->xo != 800U && insn->xo != 802U) {
             return false;

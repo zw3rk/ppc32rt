@@ -89,6 +89,33 @@ void difftest_check(ppc32_ctx_t *interp_ctx, ppc32_ctx_t *dbt_ctx,
             dbt_ctx->fpscr);
         (*mismatches)++;
     }
+    if (interp_ctx->vscr != dbt_ctx->vscr) {
+        printf("difftest: MISMATCH pc=0x%08" PRIX32 " vscr interp=0x%08" PRIX32
+            " dbt=0x%08" PRIX32 "\n", pc, interp_ctx->vscr,
+            dbt_ctx->vscr);
+        (*mismatches)++;
+    }
+    if (interp_ctx->vrsave != dbt_ctx->vrsave) {
+        printf("difftest: MISMATCH pc=0x%08" PRIX32
+            " vrsave interp=0x%08" PRIX32 " dbt=0x%08" PRIX32 "\n",
+            pc, interp_ctx->vrsave, dbt_ctx->vrsave);
+        (*mismatches)++;
+    }
+    if (interp_ctx->darwin_tls_tp != dbt_ctx->darwin_tls_tp) {
+        printf("difftest: MISMATCH pc=0x%08" PRIX32
+            " tls_tp interp=0x%08" PRIX32 " dbt=0x%08" PRIX32 "\n",
+            pc, interp_ctx->darwin_tls_tp, dbt_ctx->darwin_tls_tp);
+        (*mismatches)++;
+    }
+    for (i = 0; i < 32; i++) {
+        if (memcmp(interp_ctx->vr[i], dbt_ctx->vr[i], 16) != 0) {
+            printf("difftest: MISMATCH pc=0x%08" PRIX32
+                " vr[%d] interp=%02X%02X.. dbt=%02X%02X..\n",
+                pc, i, interp_ctx->vr[i][0], interp_ctx->vr[i][1],
+                dbt_ctx->vr[i][0], dbt_ctx->vr[i][1]);
+            (*mismatches)++;
+        }
+    }
     for (i = 0; i < 32; i++) {
         if (interp_ctx->fpr[i] != dbt_ctx->fpr[i]) {
             printf("difftest: MISMATCH pc=0x%08" PRIX32
@@ -201,12 +228,25 @@ void ppc32_difftest_sync_dut(ppc32_ctx_t *dut, const ppc32_ctx_t *ref)
 
     for (i = 0U; i < 32U; i++) {
         dut->gpr[i] = ref->gpr[i];
+        dut->fpr[i] = ref->fpr[i];
     }
     dut->nip = ref->nip;
     dut->lr = ref->lr;
     dut->ctr = ref->ctr;
     dut->cr = ref->cr;
     dut->xer = ref->xer;
+    dut->fpscr = ref->fpscr;
+    dut->darwin_tls_tp = ref->darwin_tls_tp;
+    memcpy(dut->vr, ref->vr, sizeof dut->vr);
+    dut->vscr = ref->vscr;
+    dut->vrsave = ref->vrsave;
+    if (ref->is_spe != 0U || dut->is_spe != 0U) {
+        for (i = 0U; i < 32U; i++) {
+            dut->gpr_hi[i] = ref->gpr_hi[i];
+        }
+        dut->acc = ref->acc;
+        dut->spefscr = ref->spefscr;
+    }
     dut->exit_arg = ref->exit_arg;
     dut->brk_base = ref->brk_base;
     dut->brk_curr = ref->brk_curr;

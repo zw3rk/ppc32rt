@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,6 +27,7 @@
 #include "dbt/aot/aot.h"
 
 #define AOT_RUN_NAME "ppc32-aot.cache"
+#define AOT_RUN_NAME_FMT "ppc32-aot-d%08x.cache"
 #define AOT_RUN_CODE_CAP 65552U
 /* ppc32_aot_hdr_t layout: magic[8] version block_count profile
  * personality (all u32 LE); block_count sits at byte offset 12. */
@@ -117,13 +119,31 @@ static int run_ensure_open(ppc32_ctx_t *ctx)
     }
     if (stat(ctx->cache_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
         size_t n = strlen(ctx->cache_dir);
+        /* Linux (hash 0) keeps the historic file name; Darwin folds
+         * its personality tag into the name so alternating --cache
+         * runs on one DIR never thrash each other's files (the header
+         * personality check is the second line of defense). */
+        char leaf[64];
+        size_t ln;
 
-        if (n + 1U + sizeof AOT_RUN_NAME >= sizeof path) {
+        if (ctx->darwin_aot_hash == 0U) {
+            (void)memcpy(leaf, AOT_RUN_NAME, sizeof AOT_RUN_NAME);
+            ln = sizeof AOT_RUN_NAME;
+        } else {
+            int w = snprintf(leaf, sizeof leaf, AOT_RUN_NAME_FMT,
+                ppc32_aot_personality_tag(ctx->darwin_aot_hash));
+
+            if (w <= 0 || (size_t)w >= sizeof leaf) {
+                return -ENAMETOOLONG;
+            }
+            ln = (size_t)w + 1U;
+        }
+        if (n + 1U + ln >= sizeof path) {
             return -ENAMETOOLONG;
         }
         (void)memcpy(path, ctx->cache_dir, n);
         path[n] = '/';
-        (void)memcpy(path + n + 1U, AOT_RUN_NAME, sizeof AOT_RUN_NAME);
+        (void)memcpy(path + n + 1U, leaf, ln);
     } else {
         size_t n = strlen(ctx->cache_dir);
 

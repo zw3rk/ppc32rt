@@ -19,6 +19,7 @@
 #ifndef PPC32RT_INTERP_DECODE_H
 #define PPC32RT_INTERP_DECODE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -183,5 +184,10 @@ typedef struct ppc32_insn {
  * on success, -1 (leaving `*out` zeroed) when the word is not a known
  * 32-bit encoding or `out` is null. Never fails on any input word. */
 int ppc_decode(uint32_t raw, ppc32_insn_t *out);
+
+/* Exact G4 AltiVec primary-4 XO test (full 11-bit XO, Rc included;
+ * VA-form low-6 match, VXR compare base+1024). True when the word is
+ * a G4 VMX encoding (PPC32_OP_VMX), false for SPE/UNDEF. */
+bool ppc32_is_vmx_xo(uint32_t x);
 
 #endif /* PPC32RT_INTERP_DECODE_H */

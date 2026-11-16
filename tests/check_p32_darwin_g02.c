@@ -101,7 +101,7 @@ static int handler_a(void *opaque, unsigned long req, void *arg)
         w32(t->window, c + 24U, w_vx3(3, 3, 3, 1220));
         w32(t->window, c + 28U, w_x31(4, 5, 0, 6, 0));
         w32(t->window, c + 32U, w_va(2, 1, 0, 4, 43));
-        w32(t->window, c + 36U, w_vx3(5, 0, 0, 7));
+        w32(t->window, c + 36U, w_vx3(5, 0, 0, 1030));
         w32(t->window, c + 40U, w_dform(14U, 7, 5, 16));
         w32(t->window, c + 44U, w_x31(2, 0, 7, 231, 0));
         w32(t->window, c + 48U, w_dform(14U, 8, 5, 64));
@@ -135,7 +135,7 @@ static int handler_a(void *opaque, unsigned long req, void *arg)
                             ok = 0;
                         }
                     }
-                    if (ok && ((st->cpsr_or_cr >> 4) & 0xFU) == 0x2U) {
+                    if (ok && ((st->cpsr_or_cr >> 4) & 0xFU) == 0x8U) {
                         t->saw_vec_ok = 1;
                     }
                 }
@@ -531,7 +531,10 @@ static int handler_d(void *opaque, unsigned long req, void *arg)
         w32(t->window, w + 16U, w_bne(w + 16U, w + 4U));
         w32(t->window, w + 20U, w_dform(13U, 3, 3, 0xFFFFU));
         w32(t->window, w + 24U, w_bne(w + 24U, w + 4U));
-        w32(t->window, w + 28U, (18U << 26) | (1U << 1));
+        /* Worker epilogue: trap (never `ba 0`; a branch to 0 is an
+         * exec fault, not a clean thread exit). The handler replies
+         * EXIT_THREAD and the bridge rendezvous follow. */
+        w32(t->window, w + 28U, w_x31(31, 0, 0, 4, 0));
         return 0;
     }
     if (req == (unsigned long)A32H_DARWIN_TRAP) {
@@ -561,7 +564,13 @@ static int handler_d(void *opaque, unsigned long req, void *arg)
             return 0;
         }
         if (tr->exit_reason == (uint32_t)A32H_DEXIT_BKPT) {
-            uint32_t counter = r32(t->window, DATA_VA);
+            uint32_t counter;
+            if (tr->tid == 2U || tr->tid == 3U) {
+                /* Worker epilogue trap: end only this thread. */
+                tr->reply_action = A32H_DACT_EXIT_THREAD;
+                return 0;
+            }
+            counter = r32(t->window, DATA_VA);
             if (counter == 2U * D_ITERS && t->thread_exits == 2) {
                 tr->reply_action = A32H_DACT_EXIT_PROCESS;
                 tr->exit_status = 0;
@@ -649,11 +658,11 @@ static int handler_e(void *opaque, unsigned long req, void *arg)
         w32(t->window, c + 44U, w_va(2, 1, 10, 4, 43));
         w32(t->window, c + 48U, w_va(6, 2, 2, 2, 44));
         w32(t->window, c + 52U, w_vx3(7, 6, 6, 64));
-        w32(t->window, c + 56U, w_vx3(8, 6, 6, 196));
+        w32(t->window, c + 56U, w_vx3(8, 6, 6, 1088));
         w32(t->window, c + 60U, w_vx3(9, 7, 8, 12));
         w32(t->window, c + 64U, w_vx3(11, 9, 9, 14));
         w32(t->window, c + 68U, w_vx3(12, 11, 11, 398));
-        w32(t->window, c + 72U, w_vx3(5, 2, 2, 7));
+        w32(t->window, c + 72U, w_vx3(5, 2, 2, 1030));
         w32(t->window, c + 76U, w_dform(14U, 7, 5, 64));
         w32(t->window, c + 80U, w_x31(2, 0, 7, 231, 0));
         w32(t->window, c + 84U, w_dform(14U, 8, 5, 128));

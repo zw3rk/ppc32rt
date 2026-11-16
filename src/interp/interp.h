@@ -693,11 +693,21 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
 
 /* P32-R7-24: coherent guest time-base. TB/TBU expose one 64-bit
  * microsecond (1 MHz) counter sampled from the host monotonic clock;
- * each mftb/mfspr read samples once so TBU:TB never tears. */
+ * each mftb/mfspr read samples once so TBU:TB never tears.
+ * Deterministic mode: while ppc32_tb_lockstep_on is set (--difftest
+ * and the G02 bridge lockstep runner), tb_now returns the frozen
+ * ppc32_tb_lockstep_val so interp and dbt observe identical values
+ * (0 divergences) and mftb/mftbu poll loops still terminate. */
+extern bool ppc32_tb_lockstep_on;
+extern uint64_t ppc32_tb_lockstep_val;
+
 static inline uint64_t ppc32_tb_now(void)
 {
     struct timespec ts;
 
+    if (ppc32_tb_lockstep_on) {
+        return ppc32_tb_lockstep_val;
+    }
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL +
         (uint64_t)ts.tv_nsec / 1000ULL;
@@ -803,6 +813,16 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
                  * profile (every 10.4/10.5 prologue uses it). */
                 ctx->gpr[insn->rt] = ctx->vrsave;
                 break;
+            case PPC32_SPR_SPRG3_TLS:
+                /* G02: user-readable SPRG3 thread pointer. Served
+                 * only on Darwin personalities; r2 is never touched
+                 * (r2/r13 stay ordinary GPRs on 32-bit Darwin PPC). */
+                if (!ctx->is_darwin) {
+                    ctx->exit_reason = PPC32_EXIT_UNDEF;
+                    break;
+                }
+                ctx->gpr[insn->rt] = ctx->darwin_tls_tp;
+                break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
             }
         } else {
@@ -820,6 +840,13 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
                 break;
             case PPC32_SPR_VRSAVE:
                 ctx->vrsave = ctx->gpr[insn->rs];
+                break;
+            case PPC32_SPR_SPRG3_TLS:
+                if (!ctx->is_darwin) {
+                    ctx->exit_reason = PPC32_EXIT_UNDEF;
+                    break;
+                }
+                ctx->darwin_tls_tp = ctx->gpr[insn->rs];
                 break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
             }

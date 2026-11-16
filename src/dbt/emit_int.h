@@ -544,7 +544,8 @@ static inline int ei_spr_far(a64_buf_t *b, const ppc32_insn_t *in,
     return PPC32_EMIT_NEXT;
 }
 
-static inline int ei_spr(a64_buf_t *b, const ppc32_insn_t *in)
+static inline int ei_spr(a64_buf_t *b, const ppc32_insn_t *in,
+    const ppc32_emit_ctx_t *e)
 {
     uint32_t off;
 
@@ -559,6 +560,16 @@ static inline int ei_spr(a64_buf_t *b, const ppc32_insn_t *in)
          * inline load/store, never a privileged trap (interp parity). */
         return ei_spr_far(b, in,
             (uint32_t)offsetof(ppc32_ctx_t, vrsave));
+    } else if (in->ui == PPC32_SPR_SPRG3_TLS) {
+        /* G02: user-readable SPRG3 thread pointer. Linux guests UNDEF
+         * in interp (is_darwin clear), so DBT must fall back there;
+         * on Darwin the inline far load/store reads darwin_tls_tp
+         * and never touches gpr[2]. */
+        if (e == NULL || e->ctx == NULL || !e->ctx->is_darwin) {
+            return PPC32_EMIT_FALLBACK;
+        }
+        return ei_spr_far(b, in,
+            (uint32_t)offsetof(ppc32_ctx_t, darwin_tls_tp));
     } else if (in->ui == 268U || in->ui == 269U) {
         /* mftb/mftbu serve the host monotonic clock in interp
          * (ppc32_tb_now): fall back to the single-step so DBT reads

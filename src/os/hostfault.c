@@ -146,20 +146,21 @@ int ppc32_hostfault_run(ppc32_ctx_t *ctx, ppc32_hostfault_fn_t run)
                 opcd == 47U || (opcd >= 52U && opcd <= 55U)) {
                 rc->fault_is_store = 1U;
             } else if (opcd == 31U &&
-                (xo == 150U || xo == 151U || xo == 183U || xo == 215U ||
-                 xo == 247U || xo == 407U || xo == 439U || xo == 661U ||
-                 xo == 662U || xo == 663U || xo == 695U || xo == 725U ||
-                 xo == 727U || xo == 759U || xo == 918U || xo == 983U ||
-                 xo == 1014U)) {
+                (xo == 135U || xo == 150U || xo == 151U || xo == 167U ||
+                 xo == 183U || xo == 199U || xo == 215U || xo == 231U ||
+                 xo == 247U || xo == 407U || xo == 439U || xo == 487U ||
+                 xo == 661U || xo == 662U || xo == 663U || xo == 695U ||
+                 xo == 725U || xo == 727U || xo == 759U || xo == 918U ||
+                 xo == 983U || xo == 1014U)) {
+                /* Primary-31 stores incl. the G4 VMX vector stores
+                 * (stvebx 135 / stvehx 167 / stvewx 199 / stvx 231 /
+                 * stvxl 487): all report WRITE (PPC DSISR store bit
+                 * + guest SIGBUS/SIGSEGV write attribution). */
                 rc->fault_is_store = 1U;
             } else if (opcd == 4U &&
-                ((w & 0x7FFU) == 800U || (w & 0x7FFU) == 802U ||
-                (w & 0x7FFU) == 135U || (w & 0x7FFU) == 167U ||
-                (w & 0x7FFU) == 199U || (w & 0x7FFU) == 231U ||
-                (w & 0x7FFU) == 487U)) {
-                /* SPE 64-bit indexed stores (800/802) and the G4 VMX
-                 * vector stores (stvebx/stvehx/stvewx/stvx/stvxl):
-                 * all primary-4 store shapes report WRITE. */
+                ((w & 0x7FFU) == 800U || (w & 0x7FFU) == 802U)) {
+                /* SPE 64-bit indexed stores (800/802): primary-4
+                 * store shapes report WRITE. */
                 rc->fault_is_store = 1U;
             }
         }

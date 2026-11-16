@@ -22,6 +22,11 @@
 #include "interp/fp.h"
 #include "vm/vm32.h"
 
+/* Deterministic timebase for --difftest / bridge lockstep (interp.h):
+ * frozen value observed identically by both engines. */
+bool ppc32_tb_lockstep_on = false;
+uint64_t ppc32_tb_lockstep_val = 0x123456789ABCULL;
+
 /* LL/SC reservation table, fork coordination, and the store
  * invalidation fan-out live in llsc.c (file-size discipline). */
 
@@ -826,25 +831,25 @@ void interp_step(ppc32_ctx_t *ctx)
         ppc32_fp_step(ctx, &insn);
         break;
     case PPC32_OP_SPE:
-        /* Shared primary-4 encoding: SPE profile runs the SPE
-         * handler, otherwise the G4 VMX handler (which UNDEFs
-         * non-VMX XOs, preserving classic strictness). */
-        if (ctx->is_spe != 0U) {
-            ppc32_fp_step(ctx, &insn);
-        } else {
-            ppc32_altivec_step(ctx, &insn);
-        }
-        break;
     case PPC32_OP_VMX:
-        /* Overlapping primary-4 XOs (e.g. 1220): SPE profile runs
-         * the SPE meaning, otherwise the VMX meaning. */
-        if (ctx->is_spe != 0U) {
+        /* Shared primary-4 encoding (e.g. XO 1220 is both vvxor and
+         * an SPE logical): SPE profile runs the SPE handler,
+         * otherwise the G4 VMX handler (which UNDEFs non-VMX XOs,
+         * preserving classic strictness). */
+        if (ctx->is_spe != 0U || ctx->profile == PPC32_PROFILE_SPE) {
             ppc32_fp_step(ctx, &insn);
-        } else {
+        } else if (ctx->is_darwin) {
             ppc32_altivec_step(ctx, &insn);
+        } else {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
         }
         break;
     case PPC32_OP_VMX_LDST:
+        if (!ctx->is_darwin || ctx->is_spe != 0U ||
+            ctx->profile == PPC32_PROFILE_SPE) {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+            break;
+        }
         ppc32_vmx_ldst_step(ctx, &insn);
         break;
     default:

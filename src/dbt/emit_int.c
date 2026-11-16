@@ -732,7 +732,12 @@ int ppc32_emit_int(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn, uint32_t pc)
         return ei_mtcrf(b, insn);
     case PPC32_OP_MFSPR:
     case PPC32_OP_MTSPR:
-        return ei_spr(b, insn);
+        return ei_spr(b, insn, e);
+    case PPC32_OP_VMX:
+    case PPC32_OP_VMX_LDST:
+        /* G4 VMX has no native AArch64 lowering yet: fall back so
+         * interp_step handles the word and --difftest stays exact. */
+        return PPC32_EMIT_FALLBACK;
     case PPC32_OP_B:
         return ei_b(b, insn, pc);
     case PPC32_OP_BC:

@@ -721,7 +721,7 @@ void ppc32_fp_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     int is_spe = (ctx->is_spe != 0U) ||
         (ctx->profile == PPC32_PROFILE_SPE);
 
-    if (insn->op == PPC32_OP_SPE) {
+    if (insn->op == PPC32_OP_SPE || insn->op == PPC32_OP_VMX) {
         if (!is_spe) {
             ctx->exit_reason = PPC32_EXIT_UNDEF;
             return;
@@ -755,6 +755,7 @@ void ppc32_fp_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         }
         break;
     case PPC32_OP_SPE:
+    case PPC32_OP_VMX:
         fp_spe(ctx, insn);
         break;
     default:

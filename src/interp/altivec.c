@@ -4,90 +4,33 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Covers the Darwin G4 libSystem / Accelerate / compiler subset from
- * the work order: lvx/lvxl/lvebx/lvehx/lvewx/lvsl/lvsr/stvx/stvxl/
- * stvebx/stvehx/stvewx, dst/dss no-ops (decoded to SYNC), core
- * integer/logical/permute/splat/merge/pack/unpack/sldoi/shift/rotate,
- * vaddubm/hm/wm + vsububm/hm/wm, vaddfp/vsubfp/vmaddfp/vnmsubfp,
- * vcmpeq and vcmpgt families (Rc -> CR6), mtvscr/mfvscr, dcbz/dcba zeroing,
- * dcbf/dcbst/dcbt/dcbtst address-checked no-ops, icbi/isync no-ops.
+ * Covers the Darwin G4 libSystem / Accelerate / compiler subset:
+ * lvx/lvxl/lvebx/lvehx/lvewx/lvsl/lvsr/stvx/stvxl/
+ * stvebx/stvehx/stvewx, integer/logical/permute/splat/merge/pack/unpack/
+ * sldoi/shift/rotate, vaddubm/hm/wm + vsububm/hm/wm, saturating
+ * add/sub (VSCR.SAT), vaddfp/vsubfp/vmaddfp/vnmsubfp/vmaxfp/vminfp,
+ * vmsumubm/vmsummbm/vmladduhm, vcmpeq/vcmpgt/vcmpge/vcmpbfp (Rc -> CR6),
+ * vsl/vsr/vslo/vsro, mtvscr/mfvscr, dcbz zeroing, dcbf/dcbst/dcbt/
+ * dcbtst/dst/dss/icbi/isync no-ops (decoded to SYNC/DCBT).
  *
  * vr[r][0] is the most significant byte (big-endian lane order).
  * Loads/stores use the BE ld/st helpers so Soft-TLB, COW promotion,
  * reservation invalidation, and fault reporting match the integer
- * path exactly. Vector EA for lvx/stvx is aligned down (EA & ~15U).
+ * path exactly. Vector EA for lvx/stvx is aligned down (EA & ~15U);
+ * lvehx/stvehx clear EA bit 0 and lvewx/stvewx clear EA bits 0..1
+ * before both the access and the lane index.
+ *
+ * Dispatch matches the full 11-bit XO exactly (never masked): unknown
+ * XOs set PPC32_EXIT_UNDEF. VXR-form compares arrive as base+1024
+ * (instruction bit 21 is the VXR Rc slot); Rc=1 updates CR6.
  */
 
-#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "interp/altivec.h"
 #include "interp/interp.h"
-
-static uint16_t vr_be16(const ppc32_ctx_t *ctx, uint32_t r, uint32_t lane)
-{
-    const uint8_t *v = ctx->vr[r & 31U];
-
-    return (uint16_t)(((uint16_t)v[lane * 2U] << 8) | v[lane * 2U + 1U]);
-}
-
-static void vr_set_be16(ppc32_ctx_t *ctx, uint32_t r, uint32_t lane,
-    uint16_t w)
-{
-    uint8_t *v = ctx->vr[r & 31U];
-
-    v[lane * 2U] = (uint8_t)(w >> 8);
-    v[lane * 2U + 1U] = (uint8_t)w;
-}
-
-static uint32_t vr_be32(const ppc32_ctx_t *ctx, uint32_t r, uint32_t lane)
-{
-    const uint8_t *v = ctx->vr[r & 31U];
-
-    return ((uint32_t)v[lane * 4U] << 24) | ((uint32_t)v[lane * 4U + 1U] << 16) |
-        ((uint32_t)v[lane * 4U + 2U] << 8) | v[lane * 4U + 3U];
-}
-
-static void vr_set_be32(ppc32_ctx_t *ctx, uint32_t r, uint32_t lane,
-    uint32_t w)
-{
-    uint8_t *v = ctx->vr[r & 31U];
-
-    v[lane * 4U] = (uint8_t)(w >> 24);
-    v[lane * 4U + 1U] = (uint8_t)(w >> 16);
-    v[lane * 4U + 2U] = (uint8_t)(w >> 8);
-    v[lane * 4U + 3U] = (uint8_t)w;
-}
-
-static float vr_f32(const ppc32_ctx_t *ctx, uint32_t r, uint32_t lane)
-{
-    uint32_t w = vr_be32(ctx, r, lane);
-    float f;
-
-    memcpy(&f, &w, 4);
-    return f;
-}
-
-static void vr_set_f32(ppc32_ctx_t *ctx, uint32_t r, uint32_t lane, float f)
-{
-    uint32_t w;
-
-    memcpy(&w, &f, 4);
-    vr_set_be32(ctx, r, lane, w);
-}
-
-/* CR6 for Rc=1 compares: EQ bit set when every result byte is 0xFF
- * (all lanes true), else zero; SO copied live from XER.SO. */
-static void vr_set_cr6(ppc32_ctx_t *ctx, bool all_true)
-{
-    uint32_t v = 0U;
-
-    if (all_true) {
-        v |= 2U;
-    }
-    v |= (ctx->xer >> 31U) & 1U;
-    ctx->cr = (ctx->cr & ~(0xFU << 4)) | (v << 4);
-}
 
 void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 {
@@ -125,7 +68,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
             return;
         }
         for (i = 0U; i < 16U; i++) {
-            st8(ctx, base + i, ctx->vr[insn->rt & 31U][i]);
+            st8(ctx, base + i, ctx->vr[insn->rs & 31U][i]);
             if (ctx->exit_reason != PPC32_EXIT_NONE) {
                 return;
             }
@@ -148,39 +91,41 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         ctx->nip += 4U;
         return;
     }
-    case 39u: { /* lvehx */
+    case 39u: { /* lvehx: EA bit 0 cleared first */
+        uint32_t ae = ea & ~1U;
         uint16_t h;
 
-        if (!interp_mem_ok(ea, 2U)) {
-            fault(ctx, ea);
+        if (!interp_mem_ok(ae, 2U)) {
+            fault(ctx, ae);
             return;
         }
-        h = ld16(ctx, ea);
+        h = ld16(ctx, ae);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
         }
-        ctx->vr[insn->rt & 31U][ea & 15U] = (uint8_t)(h >> 8);
-        ctx->vr[insn->rt & 31U][((ea & 15U) + 1U) & 15U] = (uint8_t)h;
+        ctx->vr[insn->rt & 31U][ae & 15U] = (uint8_t)(h >> 8);
+        ctx->vr[insn->rt & 31U][(ae & 15U) + 1U] = (uint8_t)h;
         ctx->nip += 4U;
         return;
     }
-    case 71u: { /* lvewx */
+    case 71u: { /* lvewx: EA bits 0..1 cleared first */
+        uint32_t ae = ea & ~3U;
         uint32_t w;
 
-        if (!interp_mem_ok(ea, 4U)) {
-            fault(ctx, ea);
+        if (!interp_mem_ok(ae, 4U)) {
+            fault(ctx, ae);
             return;
         }
-        w = ld32(ctx, ea);
+        w = ld32(ctx, ae);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
         }
-        ctx->vr[insn->rt & 31U][ea & 15U] = (uint8_t)(w >> 24);
-        ctx->vr[insn->rt & 31U][((ea & 15U) + 1U) & 15U] =
+        ctx->vr[insn->rt & 31U][ae & 15U] = (uint8_t)(w >> 24);
+        ctx->vr[insn->rt & 31U][((ae & 15U) + 1U) & 15U] =
             (uint8_t)(w >> 16);
-        ctx->vr[insn->rt & 31U][((ea & 15U) + 2U) & 15U] =
+        ctx->vr[insn->rt & 31U][((ae & 15U) + 2U) & 15U] =
             (uint8_t)(w >> 8);
-        ctx->vr[insn->rt & 31U][((ea & 15U) + 3U) & 15U] = (uint8_t)w;
+        ctx->vr[insn->rt & 31U][((ae & 15U) + 3U) & 15U] = (uint8_t)w;
         ctx->nip += 4U;
         return;
     }
@@ -197,34 +142,37 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         ctx->nip += 4U;
         return;
     }
-    case 167u: { /* stvehx */
-        uint16_t h = (uint16_t)(((uint16_t)ctx->vr[insn->rs & 31U][ea & 15U] << 8) |
-            ctx->vr[insn->rs & 31U][((ea & 15U) + 1U) & 15U]);
+    case 167u: { /* stvehx: EA bit 0 cleared first */
+        uint32_t ae = ea & ~1U;
+        uint16_t h = (uint16_t)(((uint16_t)ctx->vr[insn->rs & 31U][ae & 15U]
+            << 8) | ctx->vr[insn->rs & 31U][(ae & 15U) + 1U]);
 
-        if (!interp_mem_ok(ea, 2U)) {
-            fault(ctx, ea);
+        if (!interp_mem_ok(ae, 2U)) {
+            fault(ctx, ae);
             ctx->fault_is_store = 1U;
             return;
         }
-        st16(ctx, ea, h);
+        st16(ctx, ae, h);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
         }
         ctx->nip += 4U;
         return;
     }
-    case 199u: { /* stvewx */
-        uint32_t w = ((uint32_t)ctx->vr[insn->rs & 31U][ea & 15U] << 24) |
-            ((uint32_t)ctx->vr[insn->rs & 31U][((ea & 15U) + 1U) & 15U] << 16) |
-            ((uint32_t)ctx->vr[insn->rs & 31U][((ea & 15U) + 2U) & 15U] << 8) |
-            ctx->vr[insn->rs & 31U][((ea & 15U) + 3U) & 15U];
+    case 199u: { /* stvewx: EA bits 0..1 cleared first */
+        uint32_t ae = ea & ~3U;
+        uint32_t off = ae & 15U;
+        uint32_t w = ((uint32_t)ctx->vr[insn->rs & 31U][off] << 24) |
+            ((uint32_t)ctx->vr[insn->rs & 31U][(off + 1U) & 15U] << 16) |
+            ((uint32_t)ctx->vr[insn->rs & 31U][(off + 2U) & 15U] << 8) |
+            ctx->vr[insn->rs & 31U][(off + 3U) & 15U];
 
-        if (!interp_mem_ok(ea, 4U)) {
-            fault(ctx, ea);
+        if (!interp_mem_ok(ae, 4U)) {
+            fault(ctx, ae);
             ctx->fault_is_store = 1U;
             return;
         }
-        st32(ctx, ea, w);
+        st32(ctx, ae, w);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
         }
@@ -233,13 +181,13 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     }
     case 6u: /* lvsl */
         for (i = 0U; i < 16U; i++) {
-            ctx->vr[insn->rt & 31U][i] = (uint8_t)((ea + i) & 15U);
+            ctx->vr[insn->rt & 31U][i] = (uint8_t)((ea & 15U) + i);
         }
         ctx->nip += 4U;
         return;
-    case 38u: /* lvsr */
+    case 38u: /* lvsr: bytes 16-sh .. 31-sh (values 0x10..0x1F legal) */
         for (i = 0U; i < 16U; i++) {
-            ctx->vr[insn->rt & 31U][i] = (uint8_t)((ea + i) & 15U);
+            ctx->vr[insn->rt & 31U][i] = (uint8_t)(16U - (ea & 15U) + i);
         }
         ctx->nip += 4U;
         return;
@@ -250,7 +198,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 }
 
 static void vmx_logic(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
+    uint32_t x)
 {
     uint32_t i;
     uint8_t *vd = ctx->vr[insn->rt & 31U];
@@ -258,7 +206,7 @@ static void vmx_logic(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
     const uint8_t *vb = ctx->vr[insn->rb & 31U];
 
     for (i = 0U; i < 16U; i++) {
-        switch (base) {
+        switch (x) {
         case 1028u:
             vd[i] = va[i] & vb[i];
             break;
@@ -268,425 +216,323 @@ static void vmx_logic(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
         case 1156u:
             vd[i] = va[i] | vb[i];
             break;
-        case 1188u:
-            vd[i] = va[i] | (uint8_t)~vb[i];
-            break;
         case 1220u:
             vd[i] = va[i] ^ vb[i];
             break;
-        default:
+        case 1284u:
             vd[i] = (uint8_t)~(va[i] | vb[i]);
             break;
+        default:
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+            return;
         }
-    }
-    ctx->nip += 4U;
-}
-
-static void vmx_add_sub(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
-{
-    uint32_t lane;
-
-    if (base == 0u || base == 1024u) {
-        for (lane = 0U; lane < 16U; lane++) {
-            uint32_t a = ctx->vr[insn->ra & 31U][lane];
-            uint32_t b = ctx->vr[insn->rb & 31U][lane];
-
-            if (base == 0u) {
-                ctx->vr[insn->rt & 31U][lane] = (uint8_t)(a + b);
-            } else {
-                ctx->vr[insn->rt & 31U][lane] = (uint8_t)(a - b);
-            }
-        }
-    } else if (base == 64u || base == 1088u) {
-        for (lane = 0U; lane < 8U; lane++) {
-            uint32_t a = vr_be16(ctx, insn->ra, lane);
-            uint32_t b = vr_be16(ctx, insn->rb, lane);
-
-            if (base == 64u) {
-                vr_set_be16(ctx, insn->rt, lane, (uint16_t)(a + b));
-            } else {
-                vr_set_be16(ctx, insn->rt, lane, (uint16_t)(a - b));
-            }
-        }
-    } else {
-        for (lane = 0U; lane < 4U; lane++) {
-            uint32_t a = vr_be32(ctx, insn->ra, lane);
-            uint32_t b = vr_be32(ctx, insn->rb, lane);
-
-            if (base == 128u) {
-                vr_set_be32(ctx, insn->rt, lane, a + b);
-            } else {
-                vr_set_be32(ctx, insn->rt, lane, a - b);
-            }
-        }
-    }
-    ctx->nip += 4U;
-}
-
-static void vmx_fp_arith(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
-{
-    uint32_t lane;
-
-    if (base == 10u || base == 74u) {
-        for (lane = 0U; lane < 4U; lane++) {
-            float a = vr_f32(ctx, insn->ra, lane);
-            float b = vr_f32(ctx, insn->rb, lane);
-
-            if (base == 10u) {
-                vr_set_f32(ctx, insn->rt, lane, a + b);
-            } else {
-                vr_set_f32(ctx, insn->rt, lane, a - b);
-            }
-        }
-        ctx->nip += 4U;
-        return;
-    }
-    {
-        uint32_t vc = insn->bi & 31U;
-
-        for (lane = 0U; lane < 4U; lane++) {
-            float a = vr_f32(ctx, insn->ra, lane);
-            float b = vr_f32(ctx, insn->rb, lane);
-            float c = vr_f32(ctx, vc, lane);
-
-            if (base == 46u) {
-                vr_set_f32(ctx, insn->rt, lane, a * b + c);
-            } else {
-                vr_set_f32(ctx, insn->rt, lane, -(a * b + c));
-            }
-        }
-        ctx->nip += 4U;
-    }
-}
-
-static void vmx_compare(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
-{
-    bool all_true = true;
-    uint32_t lane;
-
-    if (base == 6u || base == 518u || base == 774u) {
-        for (lane = 0U; lane < 16U; lane++) {
-            uint32_t a = ctx->vr[insn->ra & 31U][lane];
-            uint32_t b = ctx->vr[insn->rb & 31U][lane];
-            bool t;
-
-            if (base == 6u) {
-                t = (a == b);
-            } else if (base == 518u) {
-                t = (a > b);
-            } else {
-                t = ((int8_t)a > (int8_t)b);
-            }
-            ctx->vr[insn->rt & 31U][lane] = t ? 0xFFU : 0x00U;
-            if (!t) {
-                all_true = false;
-            }
-        }
-    } else if (base == 70u || base == 582u || base == 838u) {
-        for (lane = 0U; lane < 8U; lane++) {
-            uint32_t a = vr_be16(ctx, insn->ra, lane);
-            uint32_t b = vr_be16(ctx, insn->rb, lane);
-            bool t;
-
-            if (base == 70u) {
-                t = (a == b);
-            } else if (base == 582u) {
-                t = (a > b);
-            } else {
-                t = ((int16_t)a > (int16_t)b);
-            }
-            vr_set_be16(ctx, insn->rt, lane, t ? 0xFFFFU : 0U);
-            if (!t) {
-                all_true = false;
-            }
-        }
-    } else {
-        for (lane = 0U; lane < 4U; lane++) {
-            uint32_t a = vr_be32(ctx, insn->ra, lane);
-            uint32_t b = vr_be32(ctx, insn->rb, lane);
-            bool t;
-
-            if (base == 134u) {
-                t = (a == b);
-            } else if (base == 646u) {
-                t = (a > b);
-            } else {
-                t = ((int32_t)a > (int32_t)b);
-            }
-            vr_set_be32(ctx, insn->rt, lane, t ? 0xFFFFFFFFU : 0U);
-            if (!t) {
-                all_true = false;
-            }
-        }
-    }
-    if (insn->rc != 0U) {
-        vr_set_cr6(ctx, all_true);
     }
     ctx->nip += 4U;
 }
 
 static void vmx_splat(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
+    uint32_t x)
 {
     uint32_t u = insn->ra & 31U;
     uint32_t i;
 
-    if (base == 524u) {
+    switch (x) {
+    case 524u: {
         uint8_t b = ctx->vr[insn->rb & 31U][u & 15U];
 
         for (i = 0U; i < 16U; i++) {
             ctx->vr[insn->rt & 31U][i] = b;
         }
-    } else if (base == 588u) {
+        break;
+    }
+    case 588u: {
         uint16_t h = vr_be16(ctx, insn->rb, u & 7U);
 
         for (i = 0U; i < 8U; i++) {
             vr_set_be16(ctx, insn->rt, i, h);
         }
-    } else if (base == 652u) {
+        break;
+    }
+    case 652u: {
         uint32_t w = vr_be32(ctx, insn->rb, u & 3U);
 
         for (i = 0U; i < 4U; i++) {
             vr_set_be32(ctx, insn->rt, i, w);
         }
-    } else if (base == 780u) {
-        int8_t s = (int8_t)((u & 16U) != 0U ? (u | 0xE0U) : u);
+        break;
+    }
+    case 780u: {
+        int32_t s = (u & 16U) != 0U ? (int32_t)u - 32 : (int32_t)u;
 
         for (i = 0U; i < 16U; i++) {
             ctx->vr[insn->rt & 31U][i] = (uint8_t)s;
         }
-    } else if (base == 844u) {
-        int16_t s = (int16_t)((u & 16U) != 0U ? (u | 0xFFE0U) : u);
+        break;
+    }
+    case 844u: {
+        int32_t s = (u & 16U) != 0U ? (int32_t)u - 32 : (int32_t)u;
 
         for (i = 0U; i < 8U; i++) {
-            vr_set_be16(ctx, insn->rt, i, (uint16_t)s);
+            vr_set_be16(ctx, insn->rt, i, (uint16_t)(int16_t)s);
         }
-    } else {
-        int32_t s = (int32_t)((u & 16U) != 0U ? (u | 0xFFFFFFE0U) : u);
+        break;
+    }
+    case 908u: {
+        int32_t s = (u & 16U) != 0U ? (int32_t)u - 32 : (int32_t)u;
 
         for (i = 0U; i < 4U; i++) {
             vr_set_be32(ctx, insn->rt, i, (uint32_t)s);
         }
+        break;
+    }
+    default:
+        ctx->exit_reason = PPC32_EXIT_UNDEF;
+        return;
     }
     ctx->nip += 4U;
 }
 
 static void vmx_merge(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
+    uint32_t x)
 {
     uint32_t i;
+    uint8_t tmp[16];
 
-    if (base == 12u || base == 268u) {
+    switch (x) {
+    case 12u:
+    case 268u: {
+        uint32_t base = (x == 12u) ? 0U : 8U;
+
         for (i = 0U; i < 8U; i++) {
-            uint32_t hi = (base == 12u) ? i : 8U + i;
-
-            ctx->vr[insn->rt & 31U][2U * i] =
-                ctx->vr[insn->ra & 31U][hi];
-            ctx->vr[insn->rt & 31U][2U * i + 1U] =
-                ctx->vr[insn->rb & 31U][hi];
+            tmp[2U * i] = ctx->vr[insn->ra & 31U][base + i];
+            tmp[2U * i + 1U] = ctx->vr[insn->rb & 31U][base + i];
         }
-    } else if (base == 76u || base == 332u) {
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
+        break;
+    }
+    case 76u:
+    case 332u: {
+        uint32_t base = (x == 76u) ? 0U : 4U;
+
         for (i = 0U; i < 4U; i++) {
-            uint32_t hi = (base == 76u) ? i : 4U + i;
+            uint32_t a = vr_be16(ctx, insn->ra, base + i);
+            uint32_t b = vr_be16(ctx, insn->rb, base + i);
 
-            vr_set_be16(ctx, insn->rt, 2U * i,
-                vr_be16(ctx, insn->ra, hi));
-            vr_set_be16(ctx, insn->rt, 2U * i + 1U,
-                vr_be16(ctx, insn->rb, hi));
+            tmp[4U * i] = (uint8_t)(a >> 8);
+            tmp[4U * i + 1U] = (uint8_t)a;
+            tmp[4U * i + 2U] = (uint8_t)(b >> 8);
+            tmp[4U * i + 3U] = (uint8_t)b;
         }
-    } else {
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
+        break;
+    }
+    case 140u:
+    case 396u: {
+        uint32_t base = (x == 140u) ? 0U : 2U;
+
         for (i = 0U; i < 2U; i++) {
-            uint32_t hi = (base == 140u) ? i : 2U + i;
+            uint32_t a = vr_be32(ctx, insn->ra, base + i);
+            uint32_t b = vr_be32(ctx, insn->rb, base + i);
 
-            vr_set_be32(ctx, insn->rt, 2U * i,
-                vr_be32(ctx, insn->ra, hi));
-            vr_set_be32(ctx, insn->rt, 2U * i + 1U,
-                vr_be32(ctx, insn->rb, hi));
+            tmp[8U * i] = (uint8_t)(a >> 24);
+            tmp[8U * i + 1U] = (uint8_t)(a >> 16);
+            tmp[8U * i + 2U] = (uint8_t)(a >> 8);
+            tmp[8U * i + 3U] = (uint8_t)a;
+            tmp[8U * i + 4U] = (uint8_t)(b >> 24);
+            tmp[8U * i + 5U] = (uint8_t)(b >> 16);
+            tmp[8U * i + 6U] = (uint8_t)(b >> 8);
+            tmp[8U * i + 7U] = (uint8_t)b;
         }
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
+        break;
+    }
+    default:
+        ctx->exit_reason = PPC32_EXIT_UNDEF;
+        return;
     }
     ctx->nip += 4U;
 }
 
-static void vmx_pack(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
-{
-    uint32_t i;
-
-    if (base == 14u || base == 270u) {
-        for (i = 0U; i < 8U; i++) {
-            uint32_t a = vr_be16(ctx, insn->ra, i);
-            uint32_t b = vr_be16(ctx, insn->rb, i);
-
-            ctx->vr[insn->rt & 31U][i] = (uint8_t)a;
-            ctx->vr[insn->rt & 31U][8U + i] = (uint8_t)b;
-        }
-    } else if (base == 78u || base == 334u) {
-        for (i = 0U; i < 4U; i++) {
-            uint32_t a = vr_be32(ctx, insn->ra, i);
-            uint32_t b = vr_be32(ctx, insn->rb, i);
-
-            vr_set_be16(ctx, insn->rt, i, (uint16_t)a);
-            vr_set_be16(ctx, insn->rt, 4U + i, (uint16_t)b);
-        }
-    } else if (base == 142u || base == 206u) {
-        for (i = 0U; i < 8U; i++) {
-            uint32_t a = vr_be16(ctx, insn->ra, i);
-            uint32_t b = vr_be16(ctx, insn->rb, i);
-            int32_t sa = (int16_t)a;
-            int32_t sb = (int16_t)b;
-
-            if (sa > 127) {
-                sa = 127;
-            } else if (sa < -128) {
-                sa = -128;
-            }
-            if (sb > 127) {
-                sb = 127;
-            } else if (sb < -128) {
-                sb = -128;
-            }
-            ctx->vr[insn->rt & 31U][i] = (uint8_t)sa;
-            ctx->vr[insn->rt & 31U][8U + i] = (uint8_t)sb;
-        }
-    } else {
-        for (i = 0U; i < 16U; i++) {
-            uint32_t src = (i < 8U) ? insn->ra : insn->rb;
-            uint32_t lane = (i < 8U) ? i : i - 8U;
-
-            if ((base & 64U) != 0U) {
-                vr_set_be16(ctx, insn->rt, i,
-                    (uint16_t)ctx->vr[src & 31U][lane]);
-            } else {
-                vr_set_be32(ctx, insn->rt, i / 4U,
-                    ((uint32_t)ctx->vr[src & 31U][lane * 2U] << 24) |
-                    ((uint32_t)ctx->vr[src & 31U][lane * 2U + 1U] << 16));
-                i += 3U;
-            }
-        }
-    }
-    ctx->nip += 4U;
-}
-
-static void vmx_unpack(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
-{
-    uint32_t i;
-
-    if (base == 398u || base == 526u) {
-        uint32_t half = (base == 398u) ? 0U : 8U;
-
-        for (i = 0U; i < 8U; i++) {
-            int8_t s =
-                (int8_t)ctx->vr[insn->rb & 31U][half + i];
-
-            vr_set_be16(ctx, insn->rt, i, (uint16_t)(int16_t)s);
-        }
-    } else {
-        uint32_t half = (base == 462u) ? 0U : 4U;
-
-        for (i = 0U; i < 4U; i++) {
-            int16_t s = (int16_t)vr_be16(ctx, insn->rb, half + i);
-
-            vr_set_be32(ctx, insn->rt, i, (uint32_t)(int32_t)s);
-        }
-    }
-    ctx->nip += 4U;
-}
-
+/* Per-element shifts/rotates: the count comes from the matching lane
+ * of vB (& 7 / & 15 / & 31); rotates guard n == 0 (shifting a
+ * 32-bit word by 32 is UB). vsl/vsr shift the whole 128-bit quadword
+ * by 0..7 bits; vslo/vsro shift by 0..15 whole bytes. */
 static void vmx_shift(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
-    uint32_t base)
+    uint32_t x)
 {
     uint32_t lane;
 
-    if (base == 196u || base == 198u || base == 200u) {
-        uint32_t n = ctx->vr[insn->rb & 31U][15] & 7U;
+    switch (x) {
+    case 260u:
+        for (lane = 0U; lane < 16U; lane++) {
+            uint32_t n = ctx->vr[insn->rb & 31U][lane] & 7U;
 
-        if (base == 196u) {
-            for (lane = 0U; lane < 16U; lane++) {
-                ctx->vr[insn->rt & 31U][lane] =
-                    (uint8_t)(ctx->vr[insn->ra & 31U][lane] << n);
-            }
-        } else if (base == 198u) {
-            for (lane = 0U; lane < 8U; lane++) {
-                vr_set_be16(ctx, insn->rt, lane,
-                    (uint16_t)(vr_be16(ctx, insn->ra, lane) << n));
-            }
-        } else {
-            for (lane = 0U; lane < 4U; lane++) {
-                vr_set_be32(ctx, insn->rt, lane,
-                    vr_be32(ctx, insn->ra, lane) << n);
-            }
+            ctx->vr[insn->rt & 31U][lane] =
+                (uint8_t)(ctx->vr[insn->ra & 31U][lane] << n);
         }
-    } else if (base == 202u || base == 204u || base == 262u) {
-        uint32_t n = ctx->vr[insn->rb & 31U][15] & 7U;
+        break;
+    case 324u:
+        for (lane = 0U; lane < 8U; lane++) {
+            uint32_t n = vr_be16(ctx, insn->rb, lane) & 15U;
 
-        if (base == 202u) {
-            for (lane = 0U; lane < 16U; lane++) {
-                ctx->vr[insn->rt & 31U][lane] =
-                    (uint8_t)(ctx->vr[insn->ra & 31U][lane] >> n);
-            }
-        } else if (base == 204u) {
-            for (lane = 0U; lane < 8U; lane++) {
-                vr_set_be16(ctx, insn->rt, lane,
-                    (uint16_t)(vr_be16(ctx, insn->ra, lane) >> n));
-            }
-        } else {
-            for (lane = 0U; lane < 4U; lane++) {
-                vr_set_be32(ctx, insn->rt, lane,
-                    vr_be32(ctx, insn->ra, lane) >> n);
-            }
+            vr_set_be16(ctx, insn->rt, lane,
+                (uint16_t)(vr_be16(ctx, insn->ra, lane) << n));
         }
-    } else if (base == 264u || base == 266u || base == 272u) {
-        uint32_t n = ctx->vr[insn->rb & 31U][15] & 7U;
+        break;
+    case 388u:
+        for (lane = 0U; lane < 4U; lane++) {
+            uint32_t n = vr_be32(ctx, insn->rb, lane) & 31U;
 
-        if (base == 264u) {
-            for (lane = 0U; lane < 16U; lane++) {
-                ctx->vr[insn->rt & 31U][lane] = (uint8_t)
-                    ((int8_t)ctx->vr[insn->ra & 31U][lane] >> n);
-            }
-        } else if (base == 266u) {
-            for (lane = 0U; lane < 8U; lane++) {
-                vr_set_be16(ctx, insn->rt, lane,
-                    (uint16_t)((int16_t)vr_be16(ctx, insn->ra,
-                    lane) >> n));
-            }
-        } else {
-            for (lane = 0U; lane < 4U; lane++) {
-                vr_set_be32(ctx, insn->rt, lane,
-                    (uint32_t)((int32_t)vr_be32(ctx, insn->ra,
-                    lane) >> n));
-            }
+            vr_set_be32(ctx, insn->rt, lane,
+                vr_be32(ctx, insn->ra, lane) << n);
         }
-    } else {
-        uint32_t n = ctx->vr[insn->rb & 31U][15] & 7U;
+        break;
+    case 516u:
+        for (lane = 0U; lane < 16U; lane++) {
+            uint32_t n = ctx->vr[insn->rb & 31U][lane] & 7U;
 
-        if (base == 274u) {
-            for (lane = 0U; lane < 16U; lane++) {
-                uint32_t v = ctx->vr[insn->ra & 31U][lane];
-
-                ctx->vr[insn->rt & 31U][lane] =
-                    (uint8_t)((v << n) | (v >> (8U - n)));
-            }
-        } else if (base == 276u) {
-            for (lane = 0U; lane < 8U; lane++) {
-                uint32_t v = vr_be16(ctx, insn->ra, lane);
-
-                n &= 15U;
-                vr_set_be16(ctx, insn->rt, lane,
-                    (uint16_t)((v << n) | (v >> (16U - n))));
-            }
-        } else {
-            for (lane = 0U; lane < 4U; lane++) {
-                uint32_t v = vr_be32(ctx, insn->ra, lane);
-
-                n &= 31U;
-                vr_set_be32(ctx, insn->rt, lane,
-                    (v << n) | (v >> (32U - n)));
-            }
+            ctx->vr[insn->rt & 31U][lane] =
+                (uint8_t)(ctx->vr[insn->ra & 31U][lane] >> n);
         }
+        break;
+    case 580u:
+        for (lane = 0U; lane < 8U; lane++) {
+            uint32_t n = vr_be16(ctx, insn->rb, lane) & 15U;
+
+            vr_set_be16(ctx, insn->rt, lane,
+                (uint16_t)(vr_be16(ctx, insn->ra, lane) >> n));
+        }
+        break;
+    case 644u:
+        for (lane = 0U; lane < 4U; lane++) {
+            uint32_t n = vr_be32(ctx, insn->rb, lane) & 31U;
+
+            vr_set_be32(ctx, insn->rt, lane,
+                vr_be32(ctx, insn->ra, lane) >> n);
+        }
+        break;
+    case 772u:
+        for (lane = 0U; lane < 16U; lane++) {
+            uint32_t n = ctx->vr[insn->rb & 31U][lane] & 7U;
+            uint32_t v = ctx->vr[insn->ra & 31U][lane];
+
+            if ((v & 0x80U) != 0U) {
+                v |= ~0xFFU;
+            }
+            ctx->vr[insn->rt & 31U][lane] =
+                (uint8_t)((int32_t)v >> n);
+        }
+        break;
+    case 836u:
+        for (lane = 0U; lane < 8U; lane++) {
+            uint32_t n = vr_be16(ctx, insn->rb, lane) & 15U;
+            uint32_t v = vr_be16(ctx, insn->ra, lane);
+            int32_t s = (v & 0x8000U) != 0U ? (int32_t)v - 65536 :
+                (int32_t)v;
+
+            vr_set_be16(ctx, insn->rt, lane, (uint16_t)(s >> n));
+        }
+        break;
+    case 900u:
+        for (lane = 0U; lane < 4U; lane++) {
+            uint32_t n = vr_be32(ctx, insn->rb, lane) & 31U;
+
+            vr_set_be32(ctx, insn->rt, lane,
+                (uint32_t)((int32_t)vr_be32(ctx, insn->ra, lane) >>
+                n));
+        }
+        break;
+    case 4u:
+        for (lane = 0U; lane < 16U; lane++) {
+            uint32_t n = ctx->vr[insn->rb & 31U][lane] & 7U;
+            uint32_t v = ctx->vr[insn->ra & 31U][lane];
+
+            ctx->vr[insn->rt & 31U][lane] = (n == 0U) ? (uint8_t)v :
+                (uint8_t)((v << n) | (v >> (8U - n)));
+        }
+        break;
+    case 68u:
+        for (lane = 0U; lane < 8U; lane++) {
+            uint32_t n = vr_be16(ctx, insn->rb, lane) & 15U;
+            uint32_t v = vr_be16(ctx, insn->ra, lane);
+
+            vr_set_be16(ctx, insn->rt, lane, (n == 0U) ? (uint16_t)v :
+                (uint16_t)((v << n) | (v >> (16U - n))));
+        }
+        break;
+    case 132u:
+        for (lane = 0U; lane < 4U; lane++) {
+            uint32_t n = vr_be32(ctx, insn->rb, lane) & 31U;
+            uint32_t v = vr_be32(ctx, insn->ra, lane);
+
+            vr_set_be32(ctx, insn->rt, lane, (n == 0U) ? v :
+                (v << n) | (v >> (32U - n)));
+        }
+        break;
+    case 452u: {
+        /* vsl: 128-bit quadword shifted left by (vB[15] & 7) bits. */
+        uint32_t n = ctx->vr[insn->rb & 31U][15] & 7U;
+        uint8_t tmp[16];
+        uint32_t carry = 0U;
+
+        for (lane = 0U; lane < 16U; lane++) {
+            uint32_t idx = 15U - lane;
+            uint32_t v = ((uint32_t)ctx->vr[insn->ra & 31U][idx] << n) |
+                carry;
+
+            tmp[idx] = (uint8_t)v;
+            carry = (n == 0U) ? 0U :
+                ((uint32_t)ctx->vr[insn->ra & 31U][idx] >>
+                (8U - n)) & ((1U << n) - 1U);
+        }
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
+        break;
+    }
+    case 708u: {
+        /* vsr: 128-bit quadword shifted right by (vB[15] & 7) bits. */
+        uint32_t n = ctx->vr[insn->rb & 31U][15] & 7U;
+        uint8_t tmp[16];
+        uint32_t carry = 0U;
+
+        for (lane = 0U; lane < 16U; lane++) {
+            uint32_t v = ((uint32_t)ctx->vr[insn->ra & 31U][lane] >>
+                n) | carry;
+
+            tmp[lane] = (uint8_t)v;
+            carry = (n == 0U) ? 0U :
+                (((uint32_t)ctx->vr[insn->ra & 31U][lane] <<
+                (8U - n)) & 0xFFU);
+        }
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
+        break;
+    }
+    case 1036u: {
+        /* vslo: shift left by (vB[15] & 15) whole bytes. */
+        uint32_t n = ctx->vr[insn->rb & 31U][15] & 15U;
+        uint8_t tmp[16];
+
+        for (lane = 0U; lane < 16U; lane++) {
+            tmp[lane] = (lane + n < 16U) ?
+                ctx->vr[insn->ra & 31U][lane + n] : 0U;
+        }
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
+        break;
+    }
+    case 1100u: {
+        /* vsro: shift right by (vB[15] & 15) whole bytes. */
+        uint32_t n = ctx->vr[insn->rb & 31U][15] & 15U;
+        uint8_t tmp[16];
+
+        for (lane = 0U; lane < 16U; lane++) {
+            tmp[lane] = (lane < n) ? 0U :
+                ctx->vr[insn->ra & 31U][lane - n];
+        }
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
+        break;
+    }
+    default:
+        ctx->exit_reason = PPC32_EXIT_UNDEF;
+        return;
     }
     ctx->nip += 4U;
 }
@@ -694,7 +540,6 @@ static void vmx_shift(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
 void ppc32_altivec_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
 {
     uint32_t x = insn->xo;
-    uint32_t base = x & ~1u;
     uint32_t i;
 
     if ((x & 63u) == 42u) { /* vsel */
@@ -746,62 +591,80 @@ void ppc32_altivec_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         return;
     }
     if ((x & 63u) == 46u || (x & 63u) == 47u) {
-        vmx_fp_arith(ctx, insn, (x & 63u) == 46u ? 46u : 110u);
+        /* vmaddfp (vA * vC + vB) / vnmsubfp (-((vA * vC) - vB)). */
+        ppc32_vmx_fp(ctx, insn, (x & 63u) == 46u ? 46u : 47u);
         return;
     }
-    if (base == 10u || base == 74u) {
-        vmx_fp_arith(ctx, insn, base);
+    if ((x & 63u) == 32u || (x & 63u) == 40u || (x & 63u) == 41u) {
+        ppc32_vmx_sum(ctx, insn, x & 63u);
         return;
     }
-    if (base == 0u || base == 64u || base == 128u || base == 1024u ||
-        base == 1088u || base == 1152u) {
-        vmx_add_sub(ctx, insn, base);
+    {
+        /* VXR-form compares: bit 10 of the 11-bit XO is Rc. */
+        uint32_t base = x & 0x3FFu;
+
+        if (base == 6u || base == 70u || base == 134u ||
+            base == 198u || base == 518u || base == 582u ||
+            base == 646u || base == 710u || base == 774u ||
+            base == 838u || base == 902u || base == 454u ||
+            base == 966u) {
+            ppc32_vmx_cmp(ctx, insn, base, (x & 0x400u) != 0U);
+            return;
+        }
+    }
+    if (x == 10u || x == 74u || x == 1034u || x == 1098u) {
+        ppc32_vmx_fp(ctx, insn, x);
         return;
     }
-    if (base == 1028u || base == 1092u || base == 1156u ||
-        base == 1188u || base == 1220u || base == 1284u) {
-        vmx_logic(ctx, insn, base);
+    if (x == 0u || x == 64u || x == 128u || x == 1024u ||
+        x == 1088u || x == 1152u || x == 512u || x == 576u ||
+        x == 640u || x == 704u || x == 768u || x == 832u ||
+        x == 1536u || x == 1600u || x == 1664u || x == 1728u ||
+        x == 1792u || x == 1856u) {
+        ppc32_vmx_addsub(ctx, insn, x);
         return;
     }
-    if (base == 6u || base == 70u || base == 134u || base == 518u ||
-        base == 582u || base == 646u || base == 774u || base == 838u ||
-        base == 902u) {
-        vmx_compare(ctx, insn, base);
+    if (x == 1028u || x == 1092u || x == 1156u || x == 1220u ||
+        x == 1284u) {
+        vmx_logic(ctx, insn, x);
         return;
     }
-    if (base == 524u || base == 588u || base == 652u || base == 780u ||
-        base == 844u || base == 908u) {
-        vmx_splat(ctx, insn, base);
+    if (x == 524u || x == 588u || x == 652u || x == 780u ||
+        x == 844u || x == 908u) {
+        vmx_splat(ctx, insn, x);
         return;
     }
-    if (base == 12u || base == 76u || base == 140u || base == 268u ||
-        base == 332u || base == 396u) {
-        vmx_merge(ctx, insn, base);
+    if (x == 12u || x == 76u || x == 140u || x == 268u ||
+        x == 332u || x == 396u) {
+        vmx_merge(ctx, insn, x);
         return;
     }
-    if (base == 14u || base == 78u || base == 142u || base == 206u ||
-        base == 270u || base == 334u) {
-        vmx_pack(ctx, insn, base);
+    if (x == 14u || x == 78u || x == 142u || x == 206u ||
+        x == 270u || x == 334u || x == 398u || x == 462u ||
+        x == 782u) {
+        ppc32_vmx_pack(ctx, insn, x);
         return;
     }
-    if (base == 398u || base == 462u || base == 526u || base == 590u) {
-        vmx_unpack(ctx, insn, base);
+    if (x == 526u || x == 590u || x == 654u || x == 718u ||
+        x == 846u || x == 974u) {
+        ppc32_vmx_unpack(ctx, insn, x);
         return;
     }
-    if (base == 196u || base == 198u || base == 200u || base == 202u ||
-        base == 204u || base == 262u || base == 264u || base == 266u ||
-        base == 272u || base == 274u || base == 276u || base == 278u) {
-        vmx_shift(ctx, insn, base);
+    if (x == 4u || x == 68u || x == 132u || x == 260u ||
+        x == 324u || x == 388u || x == 452u || x == 516u ||
+        x == 580u || x == 644u || x == 708u || x == 772u ||
+        x == 836u || x == 900u || x == 1036u || x == 1100u) {
+        vmx_shift(ctx, insn, x);
         return;
     }
-    if (base == 1540u) { /* mfvscr */
+    if (x == 1540u) { /* mfvscr */
         memset(ctx->vr[insn->rt & 31U], 0, 12);
         vr_set_be32(ctx, insn->rt, 3, ctx->vscr);
         ctx->nip += 4U;
         return;
     }
-    if (base == 1604u) { /* mtvscr */
-        ctx->vscr = vr_be32(ctx, insn->rb, 3);
+    if (x == 1604u) { /* mtvscr: only NJ and SAT are architected */
+        ctx->vscr = vr_be32(ctx, insn->rb, 3) & 0x00010001U;
         ctx->nip += 4U;
         return;
     }
