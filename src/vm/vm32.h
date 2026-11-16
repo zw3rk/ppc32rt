@@ -219,6 +219,10 @@ void vm32_ll_unlock(void);
  * (which never carries PROT_EXEC). Instruction fetch requires it. */
 bool vm32_page_is_exec(uint32_t gva);
 
+/* Query exact 4 KiB page mapping and guest prot (R=1, W=2, X=4).
+ * Returns true when mapped (ANON/COW/SHARED), false on UNMAPPED/EOF_TRAP. */
+bool vm32_page_query(uint32_t gva, uint8_t *prot_out);
+
 /* Mark mapped guest pages guest-executable (page-granular) without
  * touching the host data mapping. The signal layer marks the
  * on-stack sigreturn trampoline page so returning from a handler

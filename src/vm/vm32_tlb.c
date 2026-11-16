@@ -174,10 +174,13 @@ int vm32_tlb_miss(ppc32_ctx_t *ctx, uint32_t gva, bool is_store,
     uintptr_t base;
     bool ok;
 
+    uint32_t low_guard = (ctx != NULL && ctx->is_darwin) ?
+        VM32_GUEST_PAGE_SIZE : PPC32_LOW_GUARD_SIZE;
+
     if (hva_out == NULL) {
         return -EINVAL;
     }
-    if (gva < PPC32_LOW_GUARD_SIZE) {
+    if (gva < low_guard) {
         return -EACCES;
     }
     if (vpn >= VM32_PAGE_COUNT) {
@@ -504,6 +507,29 @@ bool vm32_page_is_exec(uint32_t gva)
     exec = g_page_exec[vpn] != 0U;
     tlb_unlock();
     return exec;
+}
+
+bool vm32_page_query(uint32_t gva, uint8_t *prot_out)
+{
+    uint32_t vpn = gva >> 12U;
+    uint8_t st;
+    uint8_t pr;
+
+    if (vpn >= VM32_PAGE_COUNT) {
+        return false;
+    }
+    tlb_lock();
+    st = g_page_state[vpn];
+    pr = (uint8_t)((g_page_prot[vpn] & 3U) |
+        (g_page_exec[vpn] != 0U ? 4U : 0U));
+    tlb_unlock();
+    if (st == VM32_PAGE_UNMAPPED || st == (uint8_t)VM32_PAGE_EOF_TRAP) {
+        return false;
+    }
+    if (prot_out != NULL) {
+        *prot_out = pr;
+    }
+    return true;
 }
 
 void vm32_record_unmap(uint32_t start_gva, uint32_t end_gva)

@@ -458,14 +458,17 @@ static inline void fault(ppc32_ctx_t *ctx, uint32_t ea)
  * anything below the 64 KiB guard (or past 4 GiB) faults with EA
  * recorded, and the driver delivers SIGSEGV to an installed guest
  * handler. Mapped-region misses keep their historical behavior. */
-static inline bool interp_mem_ok(uint32_t ea, uint32_t len)
+static inline bool interp_mem_ok(const ppc32_ctx_t *ctx, uint32_t ea,
+    uint32_t len)
 {
+    uint32_t guard = (ctx != NULL && ctx->is_darwin) ?
+        0x1000U : PPC32_LOW_GUARD_SIZE;
     uint64_t end;
 
     if (len == 0U) {
         return true;
     }
-    if (ea < PPC32_LOW_GUARD_SIZE) {
+    if (ea < guard) {
         return false;
     }
     end = (uint64_t)ea + (uint64_t)len;
@@ -527,27 +530,27 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
     switch (insn->op) {
     case PPC32_OP_LBZ:
     case PPC32_OP_LBZU:
-        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 1U)) { fault(ctx, ea); return; }
         loaded = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZ:
     case PPC32_OP_LHZU:
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = ld16(ctx, ea);
         break;
     case PPC32_OP_LHA:
     case PPC32_OP_LHAU:
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZ:
     case PPC32_OP_LWZU:
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); return; }
         loaded = ld32(ctx, ea);
         break;
     case PPC32_OP_STB:
     case PPC32_OP_STBU:
-        if (!interp_mem_ok(ea, 1U)) {
+        if (!interp_mem_ok(ctx, ea, 1U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -556,7 +559,7 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
         break;
     case PPC32_OP_STH:
     case PPC32_OP_STHU:
-        if (!interp_mem_ok(ea, 2U)) {
+        if (!interp_mem_ok(ctx, ea, 2U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -564,7 +567,7 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
-        if (!interp_mem_ok(ea, 4U)) {
+        if (!interp_mem_ok(ctx, ea, 4U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -629,30 +632,30 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
     case PPC32_OP_LBZX:
     case PPC32_OP_LBZUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 1U)) { fault(ctx, ea); return; }
         loaded = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZX:
     case PPC32_OP_LHZUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = ld16(ctx, ea);
         break;
     case PPC32_OP_LHAX:
     case PPC32_OP_LHAUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZX:
     case PPC32_OP_LWZUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); return; }
         loaded = ld32(ctx, ea);
         break;
     case PPC32_OP_STBX:
     case PPC32_OP_STBUX:
-        if (!interp_mem_ok(ea, 1U)) {
+        if (!interp_mem_ok(ctx, ea, 1U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -661,7 +664,7 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         break;
     case PPC32_OP_STHX:
     case PPC32_OP_STHUX:
-        if (!interp_mem_ok(ea, 2U)) {
+        if (!interp_mem_ok(ctx, ea, 2U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -669,7 +672,7 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
-        if (!interp_mem_ok(ea, 4U)) {
+        if (!interp_mem_ok(ctx, ea, 4U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -693,11 +696,21 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
 
 /* P32-R7-24: coherent guest time-base. TB/TBU expose one 64-bit
  * microsecond (1 MHz) counter sampled from the host monotonic clock;
- * each mftb/mfspr read samples once so TBU:TB never tears. */
+ * each mftb/mfspr read samples once so TBU:TB never tears.
+ * Deterministic mode: while ppc32_tb_lockstep_on is set (--difftest
+ * and the G02 bridge lockstep runner), tb_now returns the frozen
+ * ppc32_tb_lockstep_val so interp and dbt observe identical values
+ * (0 divergences) and mftb/mftbu poll loops still terminate. */
+extern bool ppc32_tb_lockstep_on;
+extern uint64_t ppc32_tb_lockstep_val;
+
 static inline uint64_t ppc32_tb_now(void)
 {
     struct timespec ts;
 
+    if (ppc32_tb_lockstep_on) {
+        return ppc32_tb_lockstep_val;
+    }
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL +
         (uint64_t)ts.tv_nsec / 1000ULL;
@@ -798,6 +811,21 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
                 ctx->gpr[insn->rt] = (ctx->profile == PPC32_PROFILE_SPE) ?
                     PPC32_PVR_E500V2 : PPC32_PVR_750;
                 break;
+            case PPC32_SPR_VRSAVE:
+                /* G04: VRSAVE is user-accessible on the Darwin G4
+                 * profile (every 10.4/10.5 prologue uses it). */
+                ctx->gpr[insn->rt] = ctx->vrsave;
+                break;
+            case PPC32_SPR_SPRG3_TLS:
+                /* G02: user-readable SPRG3 thread pointer. Served
+                 * only on Darwin personalities; r2 is never touched
+                 * (r2/r13 stay ordinary GPRs on 32-bit Darwin PPC). */
+                if (!ctx->is_darwin) {
+                    ctx->exit_reason = PPC32_EXIT_UNDEF;
+                    break;
+                }
+                ctx->gpr[insn->rt] = ctx->darwin_tls_tp;
+                break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
             }
         } else {
@@ -812,6 +840,16 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
                     break;
                 }
                 ctx->spefscr = ctx->gpr[insn->rs] & SPE_WRITABLE;
+                break;
+            case PPC32_SPR_VRSAVE:
+                ctx->vrsave = ctx->gpr[insn->rs];
+                break;
+            case PPC32_SPR_SPRG3_TLS:
+                if (!ctx->is_darwin) {
+                    ctx->exit_reason = PPC32_EXIT_UNDEF;
+                    break;
+                }
+                ctx->darwin_tls_tp = ctx->gpr[insn->rs];
                 break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
             }

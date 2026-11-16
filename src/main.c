@@ -13,6 +13,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +33,7 @@
 #include "rt32/ppc32.h"
 #include "interp/interp.h"
 #include "os/convert.h"
+#include "os/darwin_host_bridge.h"
 #include "os/hostfault.h"
 #include "os/proc.h"
 #include "os/signals.h"
@@ -61,9 +63,15 @@ static void usage(FILE *out)
         "  ppc32rt [--interp | --dbt] [--difftest] [--trace]\n"
         "          [--profile classic|spe] [--sysroot DIR] [--window HEX]\n"
         "          [--cache DIR | --aot-cache FILE]\n"
-        "          [--execfn PATH] [--image-fd FD] [--no-host] -- PATH [ARGS...]\n"
+        "          [--execfn PATH] [--image-fd FD] [--no-host]\n"
+        "          [--personality darwin-host|hl-darwin|linux] [--darwin-boot]\n"
+        "          -- PATH [ARGS...]\n"
         "  ppc32rt --help\n"
         "  ppc32rt --version\n"
+        "\n"
+        "Darwin G02: --personality darwin-host (or hl-darwin) runs a 32-bit\n"
+        "  Mach-O/FAT binary over /dev/a32host (hl); a Mach-O PATH with a\n"
+        "  DARWIN-capable host auto-selects the bridge.\n"
         "\n"
         "Environment: PPC32RT_ENGINE, PPC32RT_PROFILE\n";
     fputs(msg, out);
@@ -75,6 +83,7 @@ static void usage(FILE *out)
  * contract G order (PPC32RT_WINDOW → host hint → G=0 → scan). */
 static uint64_t g_requested_window = UINT64_MAX;
 static const char *g_execfn = NULL;
+static const char *g_cli_personality = NULL;
 static int g_image_fd = -1;
 static bool g_no_host = false;
 
@@ -168,6 +177,17 @@ static int parse_args(ppc32_ctx_t *ctx, int argc, char **argv)
             i++;
             continue;
         }
+        if (strcmp(argv[i], "--darwin-boot") == 0) {
+            ppc32_darwin_set_cli(NULL, true);
+            i++;
+            continue;
+        }
+        if (strncmp(argv[i], "--personality=", 14) == 0) {
+            g_cli_personality = argv[i] + 14;
+            ppc32_darwin_set_cli(g_cli_personality, false);
+            i++;
+            continue;
+        }
         if (argv[i][0] != '-') {
             return i;
         }
@@ -178,6 +198,9 @@ static int parse_args(ppc32_ctx_t *ctx, int argc, char **argv)
             if (ppc32_parse_profile(argv[i + 1], &ctx->profile) != 0) {
                 return -1;
             }
+        } else if (strcmp(argv[i], "--personality") == 0) {
+            g_cli_personality = argv[i + 1];
+            ppc32_darwin_set_cli(g_cli_personality, false);
         } else {
             return -1;
         }
@@ -294,6 +317,12 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
+    if (g_cli_personality != NULL &&
+        !ppc32_darwin_personality_known(g_cli_personality)) {
+        fprintf(stderr, "ppc32rt: unknown --personality '%s'\n",
+            g_cli_personality);
+        return 1;
+    }
     apply_env(&ctx);
     /* Host protection-fault translation (hostfault.h): guest accesses
      * that violate page permissions revive at the engine checkpoints
@@ -314,6 +343,34 @@ int main(int argc, char **argv)
     ctx.guest_argc = argc - path_idx;
     ctx.guest_argv = &argv[path_idx];
     ctx.host_envp = environ;
+
+    /* G02 Darwin bridge: explicit --personality darwin-host|hl-darwin
+     * (or --darwin-boot), or a 32-bit BE Mach-O / FAT PATH on a
+     * DARWIN-capable host, runs the image over /dev/a32host and
+     * returns the guest's exit status. */
+    ppc32_host_probe(&ctx);
+    {
+        bool want_bridge = ppc32_darwin_personality_active();
+
+        if (!want_bridge && ctx.has_host_info &&
+            (ctx.host_info.caps &
+                (uint64_t)A32H_CAP_DARWIN_PERSONALITY) != 0ULL &&
+            ctx.exec_path != NULL) {
+            int fd = open(ctx.exec_path, O_RDONLY | O_CLOEXEC);
+
+            if (fd >= 0) {
+                want_bridge = ppc32_darwin_is_macho_fd(fd);
+                close(fd);
+            }
+        }
+        if (want_bridge) {
+            int eng = (ctx.engine == PPC32_ENGINE_INTERP) ?
+                PPC32_ENGINE_INTERP : PPC32_ENGINE_DBT;
+
+            return ppc32_run_darwin_host(ctx.exec_path, eng,
+                ctx.difftest);
+        }
+    }
 
     /* RC2: interp + dbt engines live; --difftest runs dbt-vs-interp. */
     if (getenv("PPC32RT_ENGINE") == NULL && ctx.engine < 0) {
@@ -614,128 +671,8 @@ static int run_dbt(ppc32_ctx_t *ctx)
     }
 }
 
-/* Snapshot of one initially-writable guest region for difftest reset. */
-typedef struct {
-    uint32_t start;
-    uint32_t len;
-    uint8_t *bytes;
-} difftest_snap_t;
-
-/* Per-segment snapshot of every writable tracked region (stack, heap,
- * image data). The two engines share one window and the oracle runs
- * ahead, so without a restore the DUT would read the oracle's later
- * writes (RC2: glibc reused an LR save slot across a segment boundary
- * and the DUT returned into __tls_init_tp instead of its caller).
- * The snapshot is refreshed after load and after every syscall dispatch
- * (brk/mmap can reshape the region table); restoring before each DUT
- * segment reverts exactly the oracle's segment writes. Any writable
- * region that cannot be captured (cap or 16 MiB limit) aborts loudly
- * via *incomplete instead of silently mis-comparing. */
-#define DIFFTEST_SNAP_CAP 64U
-static size_t difftest_snapshot(ppc32_ctx_t *ctx, difftest_snap_t *segs,
-    size_t cap, bool *incomplete)
-{
-    size_t n = 0U;
-    size_t i;
-
-    if (incomplete != NULL) {
-        *incomplete = false;
-    }
-    for (i = 0U; i < ctx->region_count; i++) {
-        uint32_t start = ctx->regions[i].start;
-        uint32_t end = ctx->regions[i].end;
-
-        if (end <= start || (ctx->regions[i].prot & 0x2U) == 0U) {
-            continue;
-        }
-        if (n >= cap ||
-            (uint64_t)end - (uint64_t)start > 16ULL * 1024ULL * 1024ULL) {
-            if (incomplete != NULL) {
-                *incomplete = true;
-            }
-            break;
-        }
-        segs[n].start = start;
-        segs[n].len = end - start;
-        segs[n].bytes = malloc(segs[n].len);
-        if (segs[n].bytes == NULL) {
-            if (incomplete != NULL) {
-                *incomplete = true;
-            }
-            break;
-        }
-        memcpy(segs[n].bytes, ppc32_guest_ptr(ctx, start), segs[n].len);
-        n++;
-    }
-    return n;
-}
-
-static void difftest_snap_free(difftest_snap_t *segs, size_t n)
-{
-    size_t i;
-
-    for (i = 0U; i < n; i++) {
-        free(segs[i].bytes);
-        segs[i].bytes = NULL;
-        segs[i].len = 0U;
-    }
-}
-
-static void difftest_restore(ppc32_ctx_t *ctx, difftest_snap_t *segs,
-    size_t n)
-{
-    size_t i;
-
-    for (i = 0U; i < n; i++) {
-        memcpy(ppc32_guest_ptr(ctx, segs[i].start), segs[i].bytes,
-            segs[i].len);
-    }
-}
-
-/* Copy the dispatched-syscall outcome (and VM mirrors) from the oracle
- * ctx to the DUT ctx after a shared dispatch. */
-static void difftest_sync_dut(ppc32_ctx_t *dut, const ppc32_ctx_t *ref)
-{
-    size_t i;
-
-    for (i = 0U; i < 32U; i++) {
-        dut->gpr[i] = ref->gpr[i];
-    }
-    dut->nip = ref->nip;
-    dut->lr = ref->lr;
-    dut->ctr = ref->ctr;
-    dut->cr = ref->cr;
-    dut->xer = ref->xer;
-    dut->exit_arg = ref->exit_arg;
-    dut->brk_base = ref->brk_base;
-    dut->brk_curr = ref->brk_curr;
-    dut->mmap_cursor = ref->mmap_cursor;
-    dut->region_count = ref->region_count;
-    if (ref->region_count > 0U) {
-        memcpy(dut->regions, ref->regions,
-            ref->region_count * sizeof(dut->regions[0]));
-    }
-    dut->exit_reason = PPC32_EXIT_NONE;
-}
-
-/* Refresh the difftest snapshot after state-changing work on ref
- * (syscall dispatch or signal-frame delivery): free the old segments
- * and re-snapshot the post-change writable state. Returns 0, or 2 with
- * an INCONCLUSIVE report when the snapshot has a gap. */
-static int difftest_refresh(ppc32_ctx_t *ctx, difftest_snap_t *snap,
-    size_t *n)
-{
-    bool incomplete = false;
-
-    difftest_snap_free(snap, *n);
-    *n = difftest_snapshot(ctx, snap, DIFFTEST_SNAP_CAP, &incomplete);
-    if (incomplete) {
-        printf("DIFFTEST: INCONCLUSIVE (snapshot gap)\n");
-        difftest_snap_free(snap, *n);
-        return 2;
-    }
-    return 0;
-}
+/* Snapshot helpers (capture/restore/sync/refresh) live in
+ * src/dbt/difftest.c under the file-size discipline. */
 
 /*
  * RC2 differential driver: the interp oracle (ref) and the dbt DUT share
@@ -789,13 +726,18 @@ static int run_difftest(ppc32_ctx_t *ctx)
         memcpy(ref.regions, ctx->regions,
             ctx->region_count * sizeof(ref.regions[0]));
     }
-    difftest_snap_t snap[DIFFTEST_SNAP_CAP];
+    ppc32_difftest_snap_t snap[PPC32_DIFFTEST_SNAP_CAP];
     bool incomplete = false;
-    size_t snap_n = difftest_snapshot(ctx, snap, DIFFTEST_SNAP_CAP,
+    int status = 1;
+    /* Freeze the timebase: interp and dbt must observe identical TB
+     * values at every compare point (0 divergences). */
+    ppc32_tb_lockstep_on = true;
+    size_t snap_n = ppc32_difftest_snapshot(ctx, snap, PPC32_DIFFTEST_SNAP_CAP,
         &incomplete);
     if (incomplete) {
         printf("DIFFTEST: INCONCLUSIVE (snapshot gap at load)\n");
-        difftest_snap_free(snap, snap_n);
+        ppc32_difftest_snap_free(snap, snap_n);
+        ppc32_tb_lockstep_on = false;
         return 2;
     }
     for (;;) {
@@ -803,27 +745,27 @@ static int run_difftest(ppc32_ctx_t *ctx)
 
         if (bounds-- == 0ULL) {
             printf("DIFFTEST: INCONCLUSIVE (driver bound)\n");
-            difftest_snap_free(snap, snap_n);
-            return 2;
+            status = 2;
+            break;
         }
         (void)ppc32_hostfault_run(&ref, run_interp_stop);
         /* Revert the oracle's segment writes so the DUT starts the
          * segment from the exact post-boundary state (see
-         * difftest_snapshot). */
-        difftest_restore(ctx, snap, snap_n);
+         * ppc32_difftest_snapshot). */
+        ppc32_difftest_restore(ctx, snap, snap_n);
         (void)ppc32_hostfault_run(ctx, run_dbt_stop);
         if (ref.exit_reason != ctx->exit_reason) {
             printf("DIFFTEST: DIVERGENCE stop-reason interp=%u dbt=%u\n",
                 ref.exit_reason, ctx->exit_reason);
-            difftest_snap_free(snap, snap_n);
-            return 1;
+            status = 1;
+            break;
         }
         stop_pc = ref.nip;
         difftest_check(&ref, ctx, stop_pc, &mismatches);
         if (mismatches != 0) {
             printf("DIFFTEST: DIVERGENCE mismatches=%d\n", mismatches);
-            difftest_snap_free(snap, snap_n);
-            return 1;
+            status = 1;
+            break;
         }
         if (ref.exit_reason == PPC32_EXIT_SYSCALL) {
             uint32_t nr = ref.gpr[0];
@@ -831,8 +773,8 @@ static int run_difftest(ppc32_ctx_t *ctx)
             if (nr != ctx->gpr[0]) {
                 printf("DIFFTEST: DIVERGENCE syscall-nr interp=%u dbt=%u\n",
                     nr, ctx->gpr[0]);
-                difftest_snap_free(snap, snap_n);
-                return 1;
+                status = 1;
+                break;
             }
             if (ppc32_syscall_is_exit(nr)) {
                 int rst;
@@ -840,19 +782,20 @@ static int run_difftest(ppc32_ctx_t *ctx)
                 ppc32_syscall(&ref);
                 rst = (int)(ref.exit_arg & 0xFFU);
                 printf("DIFFTEST: EQUAL exit=%d\n", rst);
-                difftest_snap_free(snap, snap_n);
-                return rst;
+                status = rst;
+                break;
             }
             ppc32_syscall(&ref);
-            difftest_sync_dut(ctx, &ref);
+            ppc32_difftest_sync_dut(ctx, &ref);
             /* Dispatch can reshape memory (brk/mmap/mprotect): refresh
              * the snapshot so the next restore reverts the oracle's
              * next-segment writes against the true post-dispatch state. */
             {
-                int rc = difftest_refresh(ctx, snap, &snap_n);
+                int rc = ppc32_difftest_refresh(ctx, snap, &snap_n);
 
                 if (rc != 0) {
-                    return rc;
+                    status = rc;
+                    break;
                 }
             }
             ref.exit_reason = PPC32_EXIT_NONE;
@@ -866,15 +809,16 @@ static int run_difftest(ppc32_ctx_t *ctx)
             if (!deliver_sync(&ref)) {
                 printf("DIFFTEST: DIVERGENCE fatal stop %u at nip 0x%08X\n",
                     ref.exit_reason, ref.nip);
-                difftest_snap_free(snap, snap_n);
-                return 1;
+                status = 1;
+                break;
             }
-            difftest_sync_dut(ctx, &ref);
+            ppc32_difftest_sync_dut(ctx, &ref);
             {
-                int rc = difftest_refresh(ctx, snap, &snap_n);
+                int rc = ppc32_difftest_refresh(ctx, snap, &snap_n);
 
                 if (rc != 0) {
-                    return rc;
+                    status = rc;
+                    break;
                 }
             }
             ref.exit_reason = PPC32_EXIT_NONE;
@@ -882,7 +826,10 @@ static int run_difftest(ppc32_ctx_t *ctx)
         }
         printf("DIFFTEST: DIVERGENCE stop-reason %u at nip 0x%08X\n",
             ref.exit_reason, ref.nip);
-        difftest_snap_free(snap, snap_n);
-        return 1;
+        status = 1;
+        break;
     }
+    ppc32_tb_lockstep_on = false;
+    ppc32_difftest_snap_free(snap, snap_n);
+    return status;
 }

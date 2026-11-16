@@ -20,6 +20,8 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "dbt/difftest.h"
 
@@ -87,6 +89,33 @@ void difftest_check(ppc32_ctx_t *interp_ctx, ppc32_ctx_t *dbt_ctx,
             dbt_ctx->fpscr);
         (*mismatches)++;
     }
+    if (interp_ctx->vscr != dbt_ctx->vscr) {
+        printf("difftest: MISMATCH pc=0x%08" PRIX32 " vscr interp=0x%08" PRIX32
+            " dbt=0x%08" PRIX32 "\n", pc, interp_ctx->vscr,
+            dbt_ctx->vscr);
+        (*mismatches)++;
+    }
+    if (interp_ctx->vrsave != dbt_ctx->vrsave) {
+        printf("difftest: MISMATCH pc=0x%08" PRIX32
+            " vrsave interp=0x%08" PRIX32 " dbt=0x%08" PRIX32 "\n",
+            pc, interp_ctx->vrsave, dbt_ctx->vrsave);
+        (*mismatches)++;
+    }
+    if (interp_ctx->darwin_tls_tp != dbt_ctx->darwin_tls_tp) {
+        printf("difftest: MISMATCH pc=0x%08" PRIX32
+            " tls_tp interp=0x%08" PRIX32 " dbt=0x%08" PRIX32 "\n",
+            pc, interp_ctx->darwin_tls_tp, dbt_ctx->darwin_tls_tp);
+        (*mismatches)++;
+    }
+    for (i = 0; i < 32; i++) {
+        if (memcmp(interp_ctx->vr[i], dbt_ctx->vr[i], 16) != 0) {
+            printf("difftest: MISMATCH pc=0x%08" PRIX32
+                " vr[%d] interp=%02X%02X.. dbt=%02X%02X..\n",
+                pc, i, interp_ctx->vr[i][0], interp_ctx->vr[i][1],
+                dbt_ctx->vr[i][0], dbt_ctx->vr[i][1]);
+            (*mismatches)++;
+        }
+    }
     for (i = 0; i < 32; i++) {
         if (interp_ctx->fpr[i] != dbt_ctx->fpr[i]) {
             printf("difftest: MISMATCH pc=0x%08" PRIX32
@@ -123,6 +152,127 @@ void difftest_check(ppc32_ctx_t *interp_ctx, ppc32_ctx_t *dbt_ctx,
         dump_side("interp", interp_ctx);
         dump_side("dbt   ", dbt_ctx);
     }
+}
+
+/* Per-segment snapshot of every writable tracked region (stack, heap,
+ * image data). The two engines share one window and the oracle runs
+ * ahead, so without a restore the DUT would read the oracle's later
+ * writes. The snapshot is refreshed after load and after every
+ * syscall dispatch (brk/mmap can reshape the region table); restoring
+ * before each DUT segment reverts exactly the oracle's segment writes.
+ * Any writable region that cannot be captured (cap or 16 MiB limit)
+ * aborts loudly via *incomplete instead of silently mis-comparing. */
+size_t ppc32_difftest_snapshot(ppc32_ctx_t *ctx, ppc32_difftest_snap_t *segs,
+    size_t cap, bool *incomplete)
+{
+    size_t n = 0U;
+    size_t i;
+
+    if (incomplete != NULL) {
+        *incomplete = false;
+    }
+    for (i = 0U; i < ctx->region_count; i++) {
+        uint32_t start = ctx->regions[i].start;
+        uint32_t end = ctx->regions[i].end;
+
+        if (end <= start || (ctx->regions[i].prot & 0x2U) == 0U) {
+            continue;
+        }
+        if (n >= cap ||
+            (uint64_t)end - (uint64_t)start > 16ULL * 1024ULL * 1024ULL) {
+            if (incomplete != NULL) {
+                *incomplete = true;
+            }
+            break;
+        }
+        segs[n].start = start;
+        segs[n].len = end - start;
+        segs[n].bytes = malloc(segs[n].len);
+        if (segs[n].bytes == NULL) {
+            if (incomplete != NULL) {
+                *incomplete = true;
+            }
+            break;
+        }
+        memcpy(segs[n].bytes, ppc32_guest_ptr(ctx, start), segs[n].len);
+        n++;
+    }
+    return n;
+}
+
+void ppc32_difftest_snap_free(ppc32_difftest_snap_t *segs, size_t n)
+{
+    size_t i;
+
+    for (i = 0U; i < n; i++) {
+        free(segs[i].bytes);
+        segs[i].bytes = NULL;
+        segs[i].len = 0U;
+    }
+}
+
+void ppc32_difftest_restore(ppc32_ctx_t *ctx, ppc32_difftest_snap_t *segs,
+    size_t n)
+{
+    size_t i;
+
+    for (i = 0U; i < n; i++) {
+        memcpy(ppc32_guest_ptr(ctx, segs[i].start), segs[i].bytes,
+            segs[i].len);
+    }
+}
+
+void ppc32_difftest_sync_dut(ppc32_ctx_t *dut, const ppc32_ctx_t *ref)
+{
+    size_t i;
+
+    for (i = 0U; i < 32U; i++) {
+        dut->gpr[i] = ref->gpr[i];
+        dut->fpr[i] = ref->fpr[i];
+    }
+    dut->nip = ref->nip;
+    dut->lr = ref->lr;
+    dut->ctr = ref->ctr;
+    dut->cr = ref->cr;
+    dut->xer = ref->xer;
+    dut->fpscr = ref->fpscr;
+    dut->darwin_tls_tp = ref->darwin_tls_tp;
+    memcpy(dut->vr, ref->vr, sizeof dut->vr);
+    dut->vscr = ref->vscr;
+    dut->vrsave = ref->vrsave;
+    if (ref->is_spe != 0U || dut->is_spe != 0U) {
+        for (i = 0U; i < 32U; i++) {
+            dut->gpr_hi[i] = ref->gpr_hi[i];
+        }
+        dut->acc = ref->acc;
+        dut->spefscr = ref->spefscr;
+    }
+    dut->exit_arg = ref->exit_arg;
+    dut->brk_base = ref->brk_base;
+    dut->brk_curr = ref->brk_curr;
+    dut->mmap_cursor = ref->mmap_cursor;
+    dut->region_count = ref->region_count;
+    if (ref->region_count > 0U) {
+        memcpy(dut->regions, ref->regions,
+            ref->region_count * sizeof(dut->regions[0]));
+    }
+    dut->exit_reason = PPC32_EXIT_NONE;
+}
+
+int ppc32_difftest_refresh(ppc32_ctx_t *ctx, ppc32_difftest_snap_t *snap,
+    size_t *n)
+{
+    bool incomplete = false;
+
+    ppc32_difftest_snap_free(snap, *n);
+    *n = ppc32_difftest_snapshot(ctx, snap, PPC32_DIFFTEST_SNAP_CAP,
+        &incomplete);
+    if (incomplete) {
+        printf("DIFFTEST: INCONCLUSIVE (snapshot gap)\n");
+        ppc32_difftest_snap_free(snap, *n);
+        return 2;
+    }
+    return 0;
 }
 
 /*

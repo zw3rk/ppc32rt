@@ -18,6 +18,125 @@
 /* Bit-field positions (PowerPC numbering: bit 0 = MSB). */
 #define PPC32_OP_SHIFT 26u
 
+/* Exact G4 AltiVec primary-4 XO matcher (full 11-bit XO, Rc slot
+ * included). VA-form ops (vsel/vperm/vsldoi/vmaddfp/vnmsubfp/
+ * vmladduhm/vmsumubm/vmsummbm) match on the low 6 bits since the VRC
+ * field occupies bits 6..10; VXR-form compares (bit 10 = Rc) match
+ * both the Rc=0 base and the Rc=1 base+1024 form. Anything else is
+ * not a G4 VMX encoding (falls through to SPE/UNDEF). */
+bool ppc32_is_vmx_xo(uint32_t x)
+{
+    uint32_t v = x & 63u;
+
+    if (v == 42u || v == 43u || v == 44u || v == 46u || v == 47u ||
+        v == 32u || v == 40u || v == 41u) {
+        return true;
+    }
+    switch (x) {
+    case 0u:
+    case 4u:
+    case 6u:
+    case 10u:
+    case 12u:
+    case 14u:
+    case 64u:
+    case 68u:
+    case 70u:
+    case 74u:
+    case 76u:
+    case 78u:
+    case 128u:
+    case 132u:
+    case 134u:
+    case 140u:
+    case 142u:
+    case 198u:
+    case 206u:
+    case 260u:
+    case 268u:
+    case 270u:
+    case 324u:
+    case 332u:
+    case 334u:
+    case 388u:
+    case 396u:
+    case 398u:
+    case 452u:
+    case 454u:
+    case 462u:
+    case 512u:
+    case 516u:
+    case 518u:
+    case 524u:
+    case 526u:
+    case 576u:
+    case 580u:
+    case 582u:
+    case 588u:
+    case 590u:
+    case 640u:
+    case 644u:
+    case 646u:
+    case 652u:
+    case 654u:
+    case 704u:
+    case 708u:
+    case 710u:
+    case 718u:
+    case 768u:
+    case 772u:
+    case 774u:
+    case 780u:
+    case 782u:
+    case 832u:
+    case 836u:
+    case 838u:
+    case 844u:
+    case 846u:
+    case 900u:
+    case 902u:
+    case 908u:
+    case 966u:
+    case 974u:
+    case 1024u:
+    case 1028u:
+    case 1030u:
+    case 1034u:
+    case 1036u:
+    case 1088u:
+    case 1092u:
+    case 1094u:
+    case 1098u:
+    case 1100u:
+    case 1152u:
+    case 1156u:
+    case 1158u:
+    case 1220u:
+    case 1222u:
+    case 1284u:
+    case 1478u:
+    case 1536u:
+    case 1540u:
+    case 1542u:
+    case 1600u:
+    case 1604u:
+    case 1606u:
+    case 1664u:
+    case 1670u:
+    case 1728u:
+    case 1734u:
+    case 1792u:
+    case 1798u:
+    case 1856u:
+    case 1862u:
+    case 1926u:
+    case 1990u:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* Primary 19 (XL) XO values. */
 #define PPC32_XL_MCRF 0u
 #define PPC32_XL_BCLR 16u
@@ -82,17 +201,27 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
     case 3u: /* twi */
         ppc_decode_dform(raw, (uint32_t)PPC32_OP_TWI, out);
         return 0;
-    case 4u: /* e500v2 SPE: full 11-bit XO incl. Rc slot (E03) */
-        out->op = (uint32_t)PPC32_OP_SPE;
+    case 4u: /* G4 VMX vs e500v2 SPE: full 11-bit XO incl. Rc (E03).
+        * VMX XOs decode to PPC32_OP_VMX (profile-dispatched in
+        * interp); all other primary-4 words stay SPE. bi carries the
+        * VA-form VRC field (bits 21-25) for 4-register VMX ops.
+        * Matching is exact (see ppc32_is_vmx_xo): no bit stripping,
+        * so odd non-instruction XOs fall through to SPE/UNDEF. */
         out->rt = (uint8_t)((raw >> 21u) & 31u);
         out->rs = out->rt;
         out->ra = (uint8_t)((raw >> 16u) & 31u);
         out->rb = (uint8_t)((raw >> 11u) & 31u);
         out->xo = raw & 0x7ffu;
         out->rc = (uint8_t)(raw & 1u);
+        out->bi = (uint8_t)((raw >> 6u) & 31u);
         out->si = (int32_t)(int16_t)(raw & 0xffffu);
         out->d = out->si;
         out->ui = raw & 0xffffu;
+        if (ppc32_is_vmx_xo(raw & 0x7ffu)) {
+            out->op = (uint32_t)PPC32_OP_VMX;
+            return 0;
+        }
+        out->op = (uint32_t)PPC32_OP_SPE;
         return 0;
     case 7u: /* mulli */
         ppc_decode_dform(raw, (uint32_t)PPC32_OP_MULLI, out);
@@ -458,7 +587,22 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
     case 246u: /* dcbtst (ANALYTICAL XO): cache-hint nop */
     case 278u: /* dcbt (ANALYTICAL XO): cache-hint nop */
     case 54u: /* dcbst: block store (write-back hint); nop in emulation */
+    case 86u: /* dcbf: flush hint; address-checked nop in emulation */
         out->op = (uint32_t)PPC32_OP_DCBT;
+        return 0;
+    case 6u: /* lvsl: permute control for alignment */
+    case 38u: /* lvsr: permute control for alignment */
+    case 7u: /* lvebx: vector load byte element */
+    case 39u: /* lvehx: vector load half element */
+    case 71u: /* lvewx: vector load word element */
+    case 103u: /* lvx: 16-byte aligned vector load */
+    case 135u: /* stvebx: vector store byte element */
+    case 167u: /* stvehx: vector store half element */
+    case 199u: /* stvewx: vector store word element */
+    case 231u: /* stvx: 16-byte aligned vector store */
+    case 359u: /* lvxl: locked vector load (hint ignored) */
+    case 487u: /* stvxl: locked vector store (hint ignored) */
+        out->op = (uint32_t)PPC32_OP_VMX_LDST;
         return 0;
     case 247u:
         out->op = (uint32_t)PPC32_OP_STBUX;
@@ -587,6 +731,18 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         return 0;
     case 1014u: /* dcbz: zero 32-byte block (user-mode, Book I) */
         out->op = (uint32_t)PPC32_OP_DCBZ;
+        return 0;
+    case 758u: /* dcba: allocate hint; a no-op (never a DSI fault, the
+        * PEM forbids faults on protection violation), so DCBT. */
+        out->op = (uint32_t)PPC32_OP_DCBT;
+        return 0;
+    case 342u: /* dst/dstt: data stream touch (transient/persistent) */
+    case 374u: /* dstst/dststt: stream touch for store */
+    case 822u: /* dss/dssall: stream stop (STRM field selects all) */
+        /* Data-stream hints inside libSystem memcpy loops: a dmb per
+         * iteration would be a barrier storm, so DCBT (nop). SYNC
+         * stays reserved for sync/lwsync/eieio. */
+        out->op = (uint32_t)PPC32_OP_DCBT;
         return 0;
     case 918u:
         out->op = (uint32_t)PPC32_OP_STHBRX;

@@ -66,9 +66,20 @@ help: ## Show available build and verification targets
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-all: build ## Build everything (currently just the ppc32rt binary)
+all: build ## Build everything (linux ppc32rt + darwin ppc32rt-darwin)
 
-build: $(PPC32RT_BIN) ## Build static-PIE aarch64-linux ppc32rt binary
+build: $(PPC32RT_BIN) $(BUILD_DIR)/ppc32rt-darwin ## Build static-PIE aarch64-linux ppc32rt + native macOS arm64 ppc32rt-darwin
+
+# Real file target so editing any source/header always rebuilds the
+# darwin objects: out-of-date sources delegate to the build-darwin
+# submake (which owns the darwin-obj pattern rules). Guarded off inside
+# that submake (where PPC32RT_BIN already names this file) so the
+# generic $(PPC32RT_BIN): $(OBJS) link rule owns it there instead of
+# recursing back here.
+ifneq ($(PPC32RT_BIN),$(BUILD_DIR)/ppc32rt-darwin)
+$(BUILD_DIR)/ppc32rt-darwin: $(SRCS) $(HDRS) $(ASMS)
+	$(MAKE) build-darwin
+endif
 
 build-darwin: ## Build native macOS arm64 ppc32rt-darwin binary
 	$(MAKE) $(BUILD_DIR)/ppc32rt-darwin \
@@ -115,7 +126,25 @@ test: check-abi-invariants build-darwin ## Run host ABI and P32 defect regressio
 		tests/check_p32_r13_defects.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_r13_defects && \
-	./$(BUILD_DIR)/check_p32_r13_defects
+	./$(BUILD_DIR)/check_p32_r13_defects && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_darwin_g02.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_darwin_g02 && \
+	./$(BUILD_DIR)/check_p32_darwin_g02 && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_altivec.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_altivec && \
+	./$(BUILD_DIR)/check_p32_altivec && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_darwin_tlsvm.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_darwin_tlsvm && \
+	./$(BUILD_DIR)/check_p32_darwin_tlsvm
 
 # macOS hides MAP_ANON (no MAP_ANONYMOUS) once _POSIX_C_SOURCE is
 # defined, which would break the host syntax check below; the Linux/musl
@@ -132,7 +161,7 @@ endif
 
 # syscall(2) is deprecated on macOS (the /dev/a32host probe only ever runs
 # on Linux); keep the deprecation visible but non-fatal for the host check.
-check: check-line-limits check-abi-invariants ## Host-cc syntax check of every src file (no link) + line limits + ABI invariants
+check: check-line-limits check-abi-invariants check-darwin-g02 ## Host-cc syntax check of every src file (no link) + line limits + ABI invariants + G02 Darwin bridge suite
 	@for f in $(SRCS); do \
 		$(CC) $(CHECK_STD) -Werror=vla -pedantic \
 			-Wall -Wextra -Werror -Wno-error=deprecated-declarations \
@@ -141,6 +170,26 @@ check: check-line-limits check-abi-invariants ## Host-cc syntax check of every s
 			-fsyntax-only "$$f" || exit 1; \
 	done
 	@echo "syntax check OK ($$(echo $(SRCS) | wc -w | tr -d ' ') files)"
+
+check-darwin-g02: build-darwin ## Build and run the G02 Darwin host-bridge suite (a, b, c, d, e + --difftest, interp + dbt) + AltiVec/thread/VM/TLS suites (f..j, k..o)
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_darwin_g02.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_darwin_g02 && \
+	./$(BUILD_DIR)/check_p32_darwin_g02 && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_altivec.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_altivec && \
+	./$(BUILD_DIR)/check_p32_altivec && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_darwin_tlsvm.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_darwin_tlsvm && \
+	./$(BUILD_DIR)/check_p32_darwin_tlsvm
 
 check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
 	@over=$$(for f in $$(find src include tests -name '*.c' -o -name '*.h' -o -name '*.S'); do \

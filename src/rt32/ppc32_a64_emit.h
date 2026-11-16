@@ -103,6 +103,7 @@ typedef struct a64_buf {
     uint8_t   gpr_cache_reg[8];
     uint8_t   fpr_cache_valid;
     uint8_t   fpr_cache_reg[8];
+    uint8_t   low_guard_pages;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
@@ -110,6 +111,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     memset(b, 0, sizeof(*b));
     b->words = storage;
     b->cap   = cap;
+    b->low_guard_pages = 16U;
 }
 
 /* The self-loop peeling hook returns with the Phase 2/3 DBT if needed. */

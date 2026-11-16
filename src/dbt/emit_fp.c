@@ -872,6 +872,12 @@ int ppc32_emit_fp(ppc32_emit_ctx_t *e, const ppc32_insn_t *insn,
         return fp_classic(b, insn, false);
     case PPC32_OP_FPU_DOUBLE:
         return fp_classic(b, insn, true);
+    case PPC32_OP_VMX:
+        if (e->ctx == NULL || (e->ctx->is_spe == 0U &&
+            e->ctx->profile != PPC32_PROFILE_SPE)) {
+            return PPC32_EMIT_FALLBACK;
+        }
+        /* fall through */
     case PPC32_OP_SPE:
         if (insn->xo == 768U || insn->xo == 770U || insn->xo == 800U ||
             insn->xo == 802U) {

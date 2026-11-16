@@ -112,7 +112,7 @@ static void fp_commit(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint64_t r,
 static void fp_memop(ppc32_ctx_t *ctx, uint32_t ea, unsigned rt, int is_ld,
     int is_dbl)
 {
-    if (!interp_mem_ok(ea, is_dbl ? 8U : 4U)) { fault(ctx, ea); return; }
+    if (!interp_mem_ok(ctx, ea, is_dbl ? 8U : 4U)) { fault(ctx, ea); return; }
     if (is_ld) {
         uint64_t v = is_dbl ? fp_ld64(ctx, ea) : fp_xtod(ld32(ctx, ea));
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
@@ -721,7 +721,7 @@ void ppc32_fp_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     int is_spe = (ctx->is_spe != 0U) ||
         (ctx->profile == PPC32_PROFILE_SPE);
 
-    if (insn->op == PPC32_OP_SPE) {
+    if (insn->op == PPC32_OP_SPE || insn->op == PPC32_OP_VMX) {
         if (!is_spe) {
             ctx->exit_reason = PPC32_EXIT_UNDEF;
             return;
@@ -755,6 +755,7 @@ void ppc32_fp_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         }
         break;
     case PPC32_OP_SPE:
+    case PPC32_OP_VMX:
         fp_spe(ctx, insn);
         break;
     default:

@@ -17,9 +17,15 @@
 #include <string.h>
 
 #include "ppc32rt.h"
+#include "interp/altivec.h"
 #include "interp/interp.h"
 #include "interp/fp.h"
 #include "vm/vm32.h"
+
+/* Deterministic timebase for --difftest / bridge lockstep (interp.h):
+ * frozen value observed identically by both engines. */
+bool ppc32_tb_lockstep_on = false;
+uint64_t ppc32_tb_lockstep_val = 0x123456789ABCULL;
 
 /* LL/SC reservation table, fork coordination, and the store
  * invalidation fan-out live in llsc.c (file-size discipline). */
@@ -89,7 +95,7 @@ void interp_step(ppc32_ctx_t *ctx)
         fault(ctx, ctx->nip);
         return;
     }
-    if (!interp_mem_ok(ctx->nip, 4U)) { fault(ctx, ctx->nip); return; }
+    if (!interp_mem_ok(ctx, ctx->nip, 4U)) { fault(ctx, ctx->nip); return; }
     raw = fetch_raw(ctx);
     /* P32-R7-2: a faulting fetch records FAULT; never decode the
      * placeholder word into a spurious UNDEF. */
@@ -622,7 +628,7 @@ void interp_step(ppc32_ctx_t *ctx)
             fault(ctx, ea);
             break;
         }
-        if (!interp_mem_ok(ea, (32U - rt) * 4U)) { fault(ctx, ea); break; }
+        if (!interp_mem_ok(ctx, ea, (32U - rt) * 4U)) { fault(ctx, ea); break; }
         /* P32-R7-1: stop at the first failed element; earlier
          * successful elements stay committed, NIP stays faulting. */
         for (idx = rt; idx < 32U; idx++) {
@@ -654,7 +660,7 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t n = (nb == 0U) ? 32U : nb;
         bool is_load = (insn.op == PPC32_OP_LSWI);
 
-        if (!interp_mem_ok(ea, n)) { fault(ctx, ea); break; }
+        if (!interp_mem_ok(ctx, ea, n)) { fault(ctx, ea); break; }
         exec_string_ldst(ctx, ea, n,
             is_load ? insn.rt : insn.rs, is_load);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
@@ -674,7 +680,7 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t n = ctx->xer & 0x7FU;
         bool is_load = (insn.op == PPC32_OP_LSWX);
 
-        if (!interp_mem_ok(ea, n)) { fault(ctx, ea); break; }
+        if (!interp_mem_ok(ctx, ea, n)) { fault(ctx, ea); break; }
         exec_string_ldst(ctx, ea, n,
             is_load ? insn.rt : insn.rs, is_load);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
@@ -695,21 +701,21 @@ void interp_step(ppc32_ctx_t *ctx)
 
         switch (insn.op) {
         case PPC32_OP_LWBRX:
-            if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+            if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); break; }
             loaded = ld32r(ctx, ea);
             is_load = true;
             break;
         case PPC32_OP_LHBRX:
-            if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); break; }
+            if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); break; }
             loaded = ld16r(ctx, ea);
             is_load = true;
             break;
         case PPC32_OP_STWBRX:
-            if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+            if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); break; }
             st32r(ctx, ea, ctx->gpr[insn.rs]);
             break;
         default:
-            if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); break; }
+            if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); break; }
             st16r(ctx, ea, (uint16_t)ctx->gpr[insn.rs]);
             break;
         }
@@ -730,7 +736,7 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t *hva;
         uint32_t val;
 
-        if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+        if (((ea & 3U) != 0U) || !interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); break; }
         ppc32_vm_lock();
         hva = (uint32_t *)ppc32_access_checked(ctx, al, 4U, false);
         if (hva == NULL) { ppc32_vm_unlock(); break; }
@@ -746,7 +752,7 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t al = ea & ~3U;
         bool ok;
 
-        if (((ea & 3U) != 0U) || !interp_mem_ok(ea, 4U)) { fault(ctx, ea); break; }
+        if (((ea & 3U) != 0U) || !interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); break; }
         ppc32_vm_lock();
         if (ppc32_access_checked(ctx, al, 4U, true) == NULL) { ppc32_vm_unlock(); break; }
         ok = vm32_sc_attempt(ctx, al, ctx->gpr[insn.rs]);
@@ -796,7 +802,7 @@ void interp_step(ppc32_ctx_t *ctx)
         uint32_t base = ea & ~31U;
         uint32_t i;
 
-        if (!interp_mem_ok(ea, 32U)) { fault(ctx, ea); break; }
+        if (!interp_mem_ok(ctx, ea, 32U)) { fault(ctx, ea); break; }
         for (i = 0U; i < 32U; i++) {
             st8(ctx, base + i, 0U);
             /* P32-R7-1: stop at the first failed byte. */
@@ -822,8 +828,29 @@ void interp_step(ppc32_ctx_t *ctx)
     case PPC32_OP_FPU_SINGLE:
     case PPC32_OP_FPU_DOUBLE:
     case PPC32_OP_FPU_X:
-    case PPC32_OP_SPE:
         ppc32_fp_step(ctx, &insn);
+        break;
+    case PPC32_OP_SPE:
+    case PPC32_OP_VMX:
+        /* Shared primary-4 encoding (e.g. XO 1220 is both vvxor and
+         * an SPE logical): SPE profile runs the SPE handler,
+         * otherwise the G4 VMX handler (which UNDEFs non-VMX XOs,
+         * preserving classic strictness). */
+        if (ctx->is_spe != 0U || ctx->profile == PPC32_PROFILE_SPE) {
+            ppc32_fp_step(ctx, &insn);
+        } else if (ctx->is_darwin) {
+            ppc32_altivec_step(ctx, &insn);
+        } else {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+        }
+        break;
+    case PPC32_OP_VMX_LDST:
+        if (!ctx->is_darwin || ctx->is_spe != 0U ||
+            ctx->profile == PPC32_PROFILE_SPE) {
+            ctx->exit_reason = PPC32_EXIT_UNDEF;
+            break;
+        }
+        ppc32_vmx_ldst_step(ctx, &insn);
         break;
     default:
         ctx->exit_reason = PPC32_EXIT_UNDEF;

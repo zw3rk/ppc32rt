@@ -13,7 +13,7 @@
  *
  * Layout (little-endian header, all offsets relative):
  *   file magic "PPC32AOT1" (8 bytes, no NUL)
- *   aot_file_hdr_t (version, block count, guest profile)
+ *   aot_file_hdr_t (version, block count, guest profile, personality)
  *   per block: aot_block_hdr_t + code bytes + vm32_mem_site_t[nsites]
  *
  * Position independence rule: no absolute host or guest addresses are
@@ -40,7 +40,11 @@ typedef struct {
     uint32_t version;
     uint32_t block_count;
     uint32_t profile;
-    uint32_t reserved;
+    /* Personality discriminator: folded boot.aot_personality_hash
+     * (0 for Linux ELF). A cache file written under one personality
+     * is re-initialized instead of read under another, so Darwin
+     * AOT caches never collide with Linux ELF AOT caches. */
+    uint32_t personality;
 } ppc32_aot_hdr_t;
 
 _Static_assert(sizeof(ppc32_aot_hdr_t) == 24,
@@ -72,5 +76,14 @@ int ppc32_aot_lookup(int cache_fd, uint32_t guest_pc_base, void *code_out,
 
 /* Validate a cache file header without loading blocks. */
 bool ppc32_aot_header_ok(const ppc32_aot_hdr_t *hdr);
+
+/* Fold a 64-bit personality hash (boot.aot_personality_hash, 0 for
+ * Linux ELF) into the 32-bit header discriminator. */
+uint32_t ppc32_aot_personality_tag(uint64_t personality_hash);
+
+/* True when hdr was written under personality_hash (magic/version
+ * still checked by ppc32_aot_header_ok; call both on open). */
+bool ppc32_aot_personality_ok(const ppc32_aot_hdr_t *hdr,
+    uint64_t personality_hash);
 
 #endif /* PPC32RT_DBT_AOT_H */

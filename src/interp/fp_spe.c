@@ -33,7 +33,7 @@ static void fp_spe_ldst(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     case PPC32_SPE_EVLDW: case PPC32_SPE_EVLDWX: {
         uint64_t v;
 
-        if (!interp_mem_ok(ea, 8U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 8U)) { fault(ctx, ea); return; }
         v = fp_ld64(ctx, ea);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
@@ -43,7 +43,7 @@ static void fp_spe_ldst(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     }
     case PPC32_SPE_EVSTDD: case PPC32_SPE_EVSTDDX:
     case PPC32_SPE_EVSTDW: case PPC32_SPE_EVSTDWX:
-        if (!interp_mem_ok(ea, 8U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 8U)) { fault(ctx, ea); return; }
         fp_st64(ctx, ea, fp_gpr64(ctx, insn->rt));
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
@@ -58,7 +58,7 @@ static void fp_spe_ldst(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         uint32_t w;
         uint64_t v;
 
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); return; }
         w = ld32(ctx, ea);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
@@ -80,7 +80,7 @@ static void fp_spe_ldst(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     }
     case PPC32_SPE_EVSTWWE:
     case PPC32_SPE_EVSTWWEX:
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); return; }
         st32(ctx, ea, ctx->gpr_hi[insn->rt & 31u]);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;
@@ -88,7 +88,7 @@ static void fp_spe_ldst(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         break;
     case PPC32_SPE_EVSTWWO:
     case PPC32_SPE_EVSTWWOX:
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); return; }
         st32(ctx, ea, ctx->gpr[insn->rt & 31u]);
         if (ctx->exit_reason != PPC32_EXIT_NONE) {
             return;

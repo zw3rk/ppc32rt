@@ -19,6 +19,7 @@
 #ifndef PPC32RT_INTERP_DECODE_H
 #define PPC32RT_INTERP_DECODE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -151,7 +152,9 @@ typedef enum ppc32_op {
     PPC32_OP_LSWI,  /* 597 */ PPC32_OP_LSWX,  /* 533 */
     PPC32_OP_STSWI, /* 725 */ PPC32_OP_STSWX, /* 661 */
     PPC32_OP_DCBT,  /* 278 dcbt / 246 dcbtst: cache-hint nop */
-    PPC32_OP_DCBZ   /* 1014 dcbz: zero 32-byte block at EA (user Book I) */
+    PPC32_OP_DCBZ,  /* 1014 dcbz: zero 32-byte block at EA (user Book I) */
+    PPC32_OP_VMX,   /* 4: G4 AltiVec vector arithmetic (XO-dispatched) */
+    PPC32_OP_VMX_LDST /* 31: G4 AltiVec vector loads/stores (XO-dispatched) */
 } ppc32_op_t;
 
 /* Decoded instruction. Only the fields meaningful to `op` (see above)
@@ -181,5 +184,10 @@ typedef struct ppc32_insn {
  * on success, -1 (leaving `*out` zeroed) when the word is not a known
  * 32-bit encoding or `out` is null. Never fails on any input word. */
 int ppc_decode(uint32_t raw, ppc32_insn_t *out);
+
+/* Exact G4 AltiVec primary-4 XO test (full 11-bit XO, Rc included;
+ * VA-form low-6 match, VXR compare base+1024). True when the word is
+ * a G4 VMX encoding (PPC32_OP_VMX), false for SPE/UNDEF. */
+bool ppc32_is_vmx_xo(uint32_t x);
 
 #endif /* PPC32RT_INTERP_DECODE_H */

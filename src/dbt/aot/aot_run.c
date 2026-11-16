@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,9 +27,10 @@
 #include "dbt/aot/aot.h"
 
 #define AOT_RUN_NAME "ppc32-aot.cache"
+#define AOT_RUN_NAME_FMT "ppc32-aot-d%08x.cache"
 #define AOT_RUN_CODE_CAP 65552U
 /* ppc32_aot_hdr_t layout: magic[8] version block_count profile
- * reserved (all u32 LE); block_count sits at byte offset 12. */
+ * personality (all u32 LE); block_count sits at byte offset 12. */
 #define AOT_RUN_COUNT_OFF 12U
 
 static int s_fd = -1;
@@ -51,7 +53,8 @@ static int run_pwrite_count(void)
     return 0;
 }
 
-static int run_init_file(const char *path, uint32_t profile)
+static int run_init_file(const char *path, uint32_t profile,
+    uint64_t personality_hash)
 {
     ppc32_aot_hdr_t hdr;
     ssize_t n;
@@ -65,18 +68,21 @@ static int run_init_file(const char *path, uint32_t profile)
     }
     n = read(s_fd, &hdr, sizeof hdr);
     if (n == (ssize_t)sizeof hdr && ppc32_aot_header_ok(&hdr) &&
-        hdr.profile == profile) {
+        hdr.profile == profile &&
+        ppc32_aot_personality_ok(&hdr, personality_hash)) {
         s_blocks = hdr.block_count;
         s_ready = true;
         return 0;
     }
-    /* Fresh or corrupt/profile-mismatched file: re-init in place
-     * (a directory path fails open() above, so no ISDIR case here). */
+    /* Fresh, corrupt, or profile/personality-mismatched file: re-init
+     * in place (a directory path fails open() above, so no ISDIR case
+     * here). A Darwin cache is never read as a Linux ELF cache. */
     (void)memset(&hdr, 0, sizeof hdr);
     (void)memcpy(hdr.magic, PPC32_AOT_MAGIC, PPC32_AOT_MAGIC_LEN);
     hdr.version = PPC32_AOT_VERSION;
     hdr.block_count = 0U;
     hdr.profile = profile;
+    hdr.personality = ppc32_aot_personality_tag(personality_hash);
     if (ftruncate(s_fd, 0) != 0 || lseek(s_fd, 0, SEEK_SET) == (off_t)-1) {
         close(s_fd);
         s_fd = -1;
@@ -113,13 +119,31 @@ static int run_ensure_open(ppc32_ctx_t *ctx)
     }
     if (stat(ctx->cache_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
         size_t n = strlen(ctx->cache_dir);
+        /* Linux (hash 0) keeps the historic file name; Darwin folds
+         * its personality tag into the name so alternating --cache
+         * runs on one DIR never thrash each other's files (the header
+         * personality check is the second line of defense). */
+        char leaf[64];
+        size_t ln;
 
-        if (n + 1U + sizeof AOT_RUN_NAME >= sizeof path) {
+        if (ctx->darwin_aot_hash == 0U) {
+            (void)memcpy(leaf, AOT_RUN_NAME, sizeof AOT_RUN_NAME);
+            ln = sizeof AOT_RUN_NAME;
+        } else {
+            int w = snprintf(leaf, sizeof leaf, AOT_RUN_NAME_FMT,
+                ppc32_aot_personality_tag(ctx->darwin_aot_hash));
+
+            if (w <= 0 || (size_t)w >= sizeof leaf) {
+                return -ENAMETOOLONG;
+            }
+            ln = (size_t)w + 1U;
+        }
+        if (n + 1U + ln >= sizeof path) {
             return -ENAMETOOLONG;
         }
         (void)memcpy(path, ctx->cache_dir, n);
         path[n] = '/';
-        (void)memcpy(path + n + 1U, AOT_RUN_NAME, sizeof AOT_RUN_NAME);
+        (void)memcpy(path + n + 1U, leaf, ln);
     } else {
         size_t n = strlen(ctx->cache_dir);
 
@@ -129,10 +153,12 @@ static int run_ensure_open(ppc32_ctx_t *ctx)
         (void)memcpy(path, ctx->cache_dir, n + 1U);
     }
     /* Effective profile: is_spe is authoritative post-load (unset
-     * --profile defaults to classic, matching the loader). */
+     * --profile defaults to classic, matching the loader). The Darwin
+     * personality hash isolates Darwin AOT caches from Linux ELF ones. */
     return run_init_file(path,
         ctx->is_spe ? (uint32_t)PPC32_PROFILE_SPE :
-            (uint32_t)PPC32_PROFILE_CLASSIC);
+            (uint32_t)PPC32_PROFILE_CLASSIC,
+        ctx->darwin_aot_hash);
 }
 
 void ppc32_aot_note_block(ppc32_ctx_t *ctx, uint32_t guest_pc,
