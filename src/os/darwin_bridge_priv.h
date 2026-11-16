@@ -21,11 +21,13 @@
 void bridge_lock(void);
 void bridge_unlock(void);
 
-/* One engine segment (bridge.c). The bridge mutex is taken inside. */
+/* One engine segment (bridge.c). */
 void bridge_run_stop(ppc32_ctx_t *ctx, int engine);
+void bridge_reset_emitter(void);
 
-/* Apply one trap reply (bridge.c): 0 EXIT_PROCESS, 1 EXIT_THREAD,
- * -1 resume, -2 fatal. Caller holds the bridge mutex. */
+/* Forward one trap unlocked and apply the reply (bridge.c):
+ * 0 EXIT_PROCESS, 1 EXIT_THREAD, -1 resume, -2 fatal.
+ * Caller MUST NOT hold g_bridge_mu (blocking host traps run unlocked). */
 int bridge_handle_exit(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
     void *opaque, int *status_out);
 

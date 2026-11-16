@@ -285,9 +285,10 @@ void ppc32_vmx_fp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint32_t x)
         for (lane = 0U; lane < 4U; lane++) {
             float a = vmx_nj_flush(ctx, vr_f32(ctx, insn->ra, lane));
             float b = vmx_nj_flush(ctx, vr_f32(ctx, insn->rb, lane));
+            float r = (isnan(a) || isnan(b)) ? (0.0f / 0.0f) :
+                (x == 1034u ? fmaxf(a, b) : fminf(a, b));
 
-            vr_set_f32(ctx, insn->rt, lane, vmx_nj_flush(ctx,
-                x == 1034u ? fmaxf(a, b) : fminf(a, b)));
+            vr_set_f32(ctx, insn->rt, lane, vmx_nj_flush(ctx, r));
         }
         ctx->nip += 4U;
         return;
@@ -378,27 +379,35 @@ void ppc32_vmx_cmp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
     } else {
         /* FP compares: vcmpeqfp 198, vcmpgefp 454, vcmpgtfp 710,
          * vcmpbfp 966. NaN is unordered (eq/gt/ge all false). vcmpbfp
-         * writes all-ones when vB escapes [-vA, +vA] (or either side
-         * is NaN), zeros when in bounds. */
+         * sets bit 0 (0x80000000) when vA > vB or unordered, and bit 1
+         * (0x40000000) when vA < -vB or unordered; CR6 bit 2 is set
+         * when all 4 lanes are in bounds (r == 0 in every lane). */
         for (lane = 0U; lane < 4U; lane++) {
             float a = vr_f32(ctx, insn->ra, lane);
             float b = vr_f32(ctx, insn->rb, lane);
-            bool t;
 
-            if (base == 198u) {
-                t = (a == b);
-            } else if (base == 710u) {
-                t = (a > b);
-            } else if (base == 454u) {
-                t = (a >= b);
+            if (base == 966u) {
+                /* Power ISA vcmpbfp vD,vA,vB: tests vA against [-vB, +vB].
+                 * Bit 0 (LE bit 31): vA > +vB (or unordered);
+                 * Bit 1 (LE bit 30): vA < -vB (or unordered).
+                 * Note: CR6 for vcmpbfp. only sets bit 2 (0x2, all in bounds,
+                 * i.e. all result words == 0) and clears bits 0,1,3. */
+                uint32_t r = ((isnan(a) || isnan(b) || (a > b)) ?
+                    0x80000000U : 0U) |
+                    ((isnan(a) || isnan(b) || (a < -b)) ?
+                    0x40000000U : 0U);
+
+                vr_set_be32(ctx, insn->rt, lane, r);
+                all_true = false;
+                all_false = all_false && (r == 0U);
             } else {
-                bool oob = isnan(a) || isnan(b) || (b < -a) || (b > a);
+                bool t = (base == 198u) ? (a == b) :
+                    ((base == 710u) ? (a > b) : (a >= b));
 
-                t = oob;
+                vr_set_be32(ctx, insn->rt, lane, t ? 0xFFFFFFFFU : 0U);
+                all_true = all_true && t;
+                all_false = all_false && !t;
             }
-            vr_set_be32(ctx, insn->rt, lane, t ? 0xFFFFFFFFU : 0U);
-            all_true = all_true && t;
-            all_false = all_false && !t;
         }
     }
     if (rc) {
@@ -594,14 +603,14 @@ void ppc32_vmx_pack(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
         break;
     }
     case 782u: {
-        /* vpkpx: words -> 1-5-5-5 pixels (sign bit as alpha). */
+        /* vpkpx: words -> 1-5-5-5 pixels (word bit 7, 0x01000000, as alpha). */
         for (i = 0U; i < 4U; i++) {
             uint32_t a = vr_be32(ctx, insn->ra, i);
             uint32_t b = vr_be32(ctx, insn->rb, i);
-            uint16_t pa = (uint16_t)(((a & 0x80000000U) != 0U ? 0x8000U :
+            uint16_t pa = (uint16_t)(((a & 0x01000000U) != 0U ? 0x8000U :
                 0U) | ((a >> 9) & 0x7C00U) | ((a >> 6) & 0x03E0U) |
                 ((a >> 3) & 0x001FU));
-            uint16_t pb = (uint16_t)(((b & 0x80000000U) != 0U ? 0x8000U :
+            uint16_t pb = (uint16_t)(((b & 0x01000000U) != 0U ? 0x8000U :
                 0U) | ((b >> 9) & 0x7C00U) | ((b >> 6) & 0x03E0U) |
                 ((b >> 3) & 0x001FU));
 
@@ -675,18 +684,15 @@ void ppc32_vmx_unpack(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
         break;
     case 846u:
     case 974u: {
-        /* vupkhpx/vupklpx: 1-5-5-5 pixels -> words (5-bit fields
-         * expanded to 8 bits, alpha bit replicated to the top byte). */
+        /* vupkhpx/vupklpx: 1-5-5-5 pixels -> words (alpha replicated to
+         * 0xFF/0x00, 5-bit channels zero-extended into low 5 bits of bytes). */
         uint32_t half = (x == 846u) ? 0U : 4U;
 
         for (i = 0U; i < 4U; i++) {
             uint32_t px = vr_be16(ctx, insn->rb, half + i);
-            uint32_t a = (px & 0x8000U) != 0U ? 0xFFU : 0U;
-            uint32_t r = (px >> 10) & 0x1FU;
-            uint32_t g = (px >> 5) & 0x1FU;
-            uint32_t b = px & 0x1FU;
-            uint32_t w = (a << 24) | ((r << 3 | r >> 2) << 16) |
-                ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
+            uint32_t a = (px & 0x8000U) != 0U ? 0xFF000000U : 0U;
+            uint32_t w = a | ((px & 0x7C00U) << 6) |
+                ((px & 0x03E0U) << 3) | (px & 0x001FU);
 
             tmp[i * 4U] = (uint8_t)(w >> 24);
             tmp[i * 4U + 1U] = (uint8_t)(w >> 16);
@@ -717,8 +723,9 @@ void ppc32_vmx_sum(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
         uint8_t tmp[16];
 
         for (j = 0U; j < 8U; j++) {
-            uint32_t p = vr_be16(ctx, insn->ra, j) *
-                vr_be16(ctx, insn->rb, j) + vr_be16(ctx, vc, j);
+            uint32_t p = (uint32_t)vr_be16(ctx, insn->ra, j) *
+                (uint32_t)vr_be16(ctx, insn->rb, j) +
+                (uint32_t)vr_be16(ctx, vc, j);
 
             tmp[j * 2U] = (uint8_t)(p >> 8);
             tmp[j * 2U + 1U] = (uint8_t)p;
@@ -729,7 +736,9 @@ void ppc32_vmx_sum(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
     }
     if (low6 == 40u || low6 == 41u) {
         /* vmsumubm/vmsummbm: d_w[j] = sum(a_b[4j+i] * b_b[4j+i]) + c_w[j];
-         * unsigned bytes for 40, sign-biased bytes for 41. */
+         * unsigned bytes for 40, signed vA * unsigned vB for 41. */
+        uint8_t tmp[16];
+
         for (j = 0U; j < 4U; j++) {
             uint32_t acc = vr_be32(ctx, vc, j);
 
@@ -738,13 +747,20 @@ void ppc32_vmx_sum(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
                 uint32_t b = ctx->vr[insn->rb & 31U][j * 4U + k];
 
                 if (low6 == 41u) {
-                    a ^= 0x80U;
-                    b ^= 0x80U;
+                    int32_t sa = (int32_t)a -
+                        (((a & 0x80U) != 0U) ? 256 : 0);
+
+                    acc += (uint32_t)(sa * (int32_t)b);
+                } else {
+                    acc += a * b;
                 }
-                acc += a * b;
             }
-            vr_set_be32(ctx, insn->rt, j, acc);
+            tmp[j * 4U] = (uint8_t)(acc >> 24);
+            tmp[j * 4U + 1U] = (uint8_t)(acc >> 16);
+            tmp[j * 4U + 2U] = (uint8_t)(acc >> 8);
+            tmp[j * 4U + 3U] = (uint8_t)acc;
         }
+        memcpy(ctx->vr[insn->rt & 31U], tmp, 16);
         ctx->nip += 4U;
         return;
     }

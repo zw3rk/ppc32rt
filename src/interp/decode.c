@@ -124,6 +124,7 @@ bool ppc32_is_vmx_xo(uint32_t x)
     case 1664u:
     case 1670u:
     case 1728u:
+    case 1734u:
     case 1792u:
     case 1798u:
     case 1856u:

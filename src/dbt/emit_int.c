@@ -23,6 +23,9 @@ void ppc32_emit_begin(ppc32_emit_ctx_t *e, ppc32_ctx_t *ctx, a64_buf_t *buf)
 {
     e->buf = buf;
     e->ctx = ctx;
+    if (buf != NULL) {
+        buf->low_guard_pages = (ctx != NULL && ctx->is_darwin) ? 1U : 16U;
+    }
 }
 
 void ppc32_emit_fallback(ppc32_emit_ctx_t *e, uint32_t pc)

@@ -112,7 +112,7 @@ static void fp_commit(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint64_t r,
 static void fp_memop(ppc32_ctx_t *ctx, uint32_t ea, unsigned rt, int is_ld,
     int is_dbl)
 {
-    if (!interp_mem_ok(ea, is_dbl ? 8U : 4U)) { fault(ctx, ea); return; }
+    if (!interp_mem_ok(ctx, ea, is_dbl ? 8U : 4U)) { fault(ctx, ea); return; }
     if (is_ld) {
         uint64_t v = is_dbl ? fp_ld64(ctx, ea) : fp_xtod(ld32(ctx, ea));
         if (ctx->exit_reason != PPC32_EXIT_NONE) {

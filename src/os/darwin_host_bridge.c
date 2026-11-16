@@ -12,14 +12,14 @@
  * and an in-process mock handler (host unit tests). No Mach-O, dyld,
  * BSD/Mach, libSystem, or UI code lives here.
  *
- * Threading model: one global bridge mutex serializes engine segments
- * and trap handling across the main and worker threads (translation,
- * invalidation, and VMA mirrors stay race-free without a
- * stop-the-world protocol). The VMA mirror is kept consistent on every
- * registered context (main + workers) under that mutex; the vm32 page
- * tables themselves are global (keyed by guest VA). The DBT emitter
- * owner is thread-local, so translations on one thread never run with
- * another thread's emit context.
+ * Threading model: guest segments and blocking host traps run unlocked
+ * across main and worker threads. DBT cache lookup/install/invalidation
+ * is serialized internally by cache.c (s_cache_lock + epoch-based
+ * quiescent reclamation), and per-page VM/Soft-TLB state is serialized
+ * by vm32's internal lock. g_bridge_mu serializes worker-slot/mirror
+ * bookkeeping and SYNC_VM_PROT / FLUSH_ICACHE / SPAWN_THREAD replies.
+ * The DBT emitter owner is _Thread_local, so translations on one thread
+ * never run with another thread's emit context.
  */
 
 #ifndef _GNU_SOURCE
@@ -233,8 +233,15 @@ void bridge_unlock(void)
 
 /* ---- DBT emitter with thread-local owner ---- */
 
-static __thread ppc32_ctx_t *t_emit_owner;
+static _Thread_local ppc32_ctx_t *t_emit_owner;
 static bool g_emitter_set;
+
+void bridge_reset_emitter(void)
+{
+    pthread_mutex_lock(&g_bridge_mu);
+    g_emitter_set = false;
+    pthread_mutex_unlock(&g_bridge_mu);
+}
 
 static int bridge_emit(a64_buf_t *b, const ppc32_insn_t *insn, uint32_t pc)
 {
@@ -354,31 +361,26 @@ static void state_to_ctx(ppc32_ctx_t *ctx,
     ctx->exit_reason = PPC32_EXIT_NONE;
 }
 
-static bool va_is_prot(ppc32_ctx_t *ctx, uint32_t va, uint32_t kind)
+static bool va_is_prot(uint32_t va, uint32_t kind)
 {
     uint32_t need = (kind == (uint32_t)A32H_DFAULT_WRITE) ? 2U :
         (kind == (uint32_t)A32H_DFAULT_EXEC) ? 4U : 1U;
-    size_t i;
+    uint8_t page_prot = 0U;
 
-    for (i = 0U; i < ctx->region_count; i++) {
-        if (va >= ctx->regions[i].start && va < ctx->regions[i].end) {
-            return (ctx->regions[i].prot & need) == 0U;
-        }
-    }
-    return false;
+    return vm32_page_query(va, &page_prot) &&
+        ((uint32_t)page_prot & need) == 0U;
 }
 
 static void forward_trap(a32h_darwin_handler_fn fn, void *opaque,
     a32h_darwin_trap_t *trap, a32h_darwin_cpu_state_t *st)
 {
     trap->cpu_state_ptr = (uint64_t)(uintptr_t)st;
-    (void)fn(opaque, (unsigned long)A32H_DARWIN_TRAP, trap);
+    (void)bridge_trap(fn, opaque, (unsigned long)A32H_DARWIN_TRAP, trap);
 }
 
-/* Apply one trap reply. Returns 0 on EXIT_PROCESS (status set), 1 on
- * EXIT_THREAD (worker rendezvous), -1 to resume, -2 on fatal (no
- * valid resume exists; the caller must stop, never spin). The bridge
- * mutex is held by every caller. */
+/* Forward one trap unlocked and apply its reply. Returns 0 on
+ * EXIT_PROCESS (status set), 1 on EXIT_THREAD (worker rendezvous),
+ * -1 to resume, -2 on fatal. Blocking host traps never hold g_bridge_mu. */
 int bridge_handle_exit(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
     void *opaque, int *status_out)
 {
@@ -401,7 +403,7 @@ int bridge_handle_exit(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
             (ctx->fault_is_store != 0U ? (uint32_t)A32H_DFAULT_WRITE :
             (uint32_t)A32H_DFAULT_READ);
 
-        prot = va_is_prot(ctx, ctx->fault_addr, kind);
+        prot = va_is_prot(ctx->fault_addr, kind);
         trap.exit_reason = (uint32_t)A32H_DEXIT_FAULT;
         trap.fault_va = ctx->fault_addr;
         trap.fault_kind = kind;
@@ -434,79 +436,88 @@ int bridge_handle_exit(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
         st.state_flags |= (uint32_t)(A32H_DSTATE_FP_DIRTY |
             A32H_DSTATE_VEC_DIRTY);
     }
-    /* The reply is now fully captured: publish it to the parent first
-     * so a spawned child inherits post-reply registers (never the
-     * pre-trap snapshot). */
+    /* Publish post-reply CPU state to this thread's ctx before taking
+     * g_bridge_mu for shared VM/cache/worker actions. */
     state_to_ctx(ctx, &st);
-    if ((trap.reply_action & (uint32_t)A32H_DACT_SYNC_VM_PROT) != 0U) {
-        bridge_apply_sync_prot(trap.prot_va, trap.prot_len,
-            trap.prot_flags);
-    }
-    if ((trap.reply_action & (uint32_t)A32H_DACT_FLUSH_ICACHE) != 0U &&
-        trap.flush_len != 0U) {
-        uint64_t end64 = (uint64_t)trap.flush_va + (uint64_t)trap.flush_len;
-
-        if (end64 > 0x100000000ULL) {
-            end64 = 0x100000000ULL;
+    if ((trap.reply_action & (uint32_t)(A32H_DACT_SYNC_VM_PROT |
+        A32H_DACT_FLUSH_ICACHE | A32H_DACT_SPAWN_THREAD)) != 0U) {
+        pthread_mutex_lock(&g_bridge_mu);
+        if ((trap.reply_action & (uint32_t)A32H_DACT_SYNC_VM_PROT) != 0U) {
+            bridge_apply_sync_prot(trap.prot_va, trap.prot_len,
+                trap.prot_flags);
         }
-        if (end64 > (uint64_t)trap.flush_va) {
-            uint32_t end = (end64 >= 0x100000000ULL) ? 0xFFFFFFFFU :
-                (uint32_t)end64;
+        if ((trap.reply_action & (uint32_t)A32H_DACT_FLUSH_ICACHE) != 0U &&
+            trap.flush_len != 0U) {
+            uint64_t end64 = (uint64_t)trap.flush_va +
+                (uint64_t)trap.flush_len;
 
-            vm32_tlb_invalidate_range(trap.flush_va, end);
-            ppc32_dbt_invalidate_range(ctx, trap.flush_va, end);
-            ctx->icache_flushes++;
-        }
-    }
-    if ((trap.reply_action & (uint32_t)A32H_DACT_SPAWN_THREAD) != 0U) {
-        size_t k;
+            if (end64 > 0x100000000ULL) {
+                end64 = 0x100000000ULL;
+            }
+            if (end64 > (uint64_t)trap.flush_va) {
+                uint32_t end = (end64 >= 0x100000000ULL) ? 0xFFFFFFFFU :
+                    (uint32_t)end64;
 
-        for (k = 0U; k < DARWIN_MAX_WORKERS; k++) {
-            if (!g_workers[k].live) {
-                ppc32_ctx_t *child = calloc(1, sizeof *child);
-                worker_arg_t *arg = calloc(1, sizeof *arg);
-                pthread_t th;
-
-                if (child == NULL || arg == NULL) {
-                    free(child);
-                    free(arg);
-                    break;
-                }
-                memcpy(child, ctx, sizeof *child);
-                memset(child->ras, 0, sizeof child->ras);
-                memset(child->ibtc, 0, sizeof child->ibtc);
-                child->ras_top = 0U;
-                child->ibtc_synced_epoch = 0U;
-                child->exit_reason = PPC32_EXIT_NONE;
-                child->nip = trap.spawn_pc;
-                child->gpr[PPC32_REG_SP] = trap.spawn_sp;
-                child->gpr[3] = trap.spawn_r0;
-                child->lr = 0U;
-                child->darwin_tls_tp = trap.spawn_tls;
-                child->darwin_tid = trap.spawn_tid;
-                child->res_valid = 0U;
-                child->reservation_epoch++;
-                arg->ctx = child;
-                arg->fn = fn;
-                arg->opaque = opaque;
-                arg->engine = ctx->engine;
-                arg->slot = (uint32_t)k;
-                if (pthread_create(&th, NULL, ppc32_darwin_worker_entry,
-                    arg) != 0) {
-                    free(arg);
-                    free(child);
-                    break;
-                }
-                (void)pthread_detach(th);
-                g_workers[k].live = true;
-                g_workers[k].tid = trap.spawn_tid;
-                g_workers[k].th = th;
-                g_workers[k].ctx = child;
-                g_live_workers++;
-                bridge_mirror_add(child);
-                break;
+                vm32_tlb_invalidate_range(trap.flush_va, end);
+                ppc32_dbt_invalidate_range(ctx, trap.flush_va, end);
+                ctx->icache_flushes++;
             }
         }
+        if ((trap.reply_action & (uint32_t)A32H_DACT_SPAWN_THREAD) != 0U) {
+            size_t k;
+
+            for (k = 0U; k < DARWIN_MAX_WORKERS; k++) {
+                if (!g_workers[k].live) {
+                    ppc32_ctx_t *child = calloc(1, sizeof *child);
+                    worker_arg_t *arg = calloc(1, sizeof *arg);
+                    pthread_t th;
+
+                    if (child == NULL || arg == NULL) {
+                        free(child);
+                        free(arg);
+                        break;
+                    }
+                    memcpy(child, ctx, sizeof *child);
+                    memset(child->ras, 0, sizeof child->ras);
+                    memset(child->ibtc, 0, sizeof child->ibtc);
+                    child->ras_top = 0U;
+                    child->ibtc_synced_epoch = 0U;
+                    child->exit_reason = PPC32_EXIT_NONE;
+                    child->nip = trap.spawn_pc;
+                    child->gpr[PPC32_REG_SP] = trap.spawn_sp;
+                    child->gpr[3] = trap.spawn_r0;
+                    child->lr = 0U;
+                    child->darwin_tls_tp = trap.spawn_tls;
+                    child->darwin_tid = trap.spawn_tid;
+                    child->res_valid = 0U;
+                    child->reservation_epoch++;
+                    arg->ctx = child;
+                    arg->fn = fn;
+                    arg->opaque = opaque;
+                    arg->engine = ctx->engine;
+                    arg->slot = (uint32_t)k;
+                    g_workers[k].live = true;
+                    g_workers[k].tid = trap.spawn_tid;
+                    g_workers[k].ctx = child;
+                    g_live_workers++;
+                    bridge_mirror_add(child);
+                    if (pthread_create(&th, NULL, ppc32_darwin_worker_entry,
+                        arg) != 0) {
+                        bridge_mirror_remove(child);
+                        g_workers[k].live = false;
+                        g_workers[k].ctx = NULL;
+                        g_live_workers--;
+                        free(arg);
+                        free(child);
+                        break;
+                    }
+                    (void)pthread_detach(th);
+                    g_workers[k].th = th;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&g_bridge_mu);
     }
     if ((trap.reply_action & (uint32_t)A32H_DACT_EXIT_THREAD) != 0U) {
         if (status_out != NULL) {
@@ -553,9 +564,7 @@ void *ppc32_darwin_worker_entry(void *a)
         if (arg->ctx->exit_reason == PPC32_EXIT_NONE) {
             continue;
         }
-        pthread_mutex_lock(&g_bridge_mu);
         rc = bridge_handle_exit(arg->ctx, arg->fn, arg->opaque, &status);
-        pthread_mutex_unlock(&g_bridge_mu);
         if (rc == 0) {
             /* EXIT_PROCESS from any thread ends the process. */
             worker_exit_process(status);
@@ -564,12 +573,14 @@ void *ppc32_darwin_worker_entry(void *a)
             break;
         }
     }
-    /* EXIT_THREAD (or fatal): rendezvous, reclaim the slot, leave. */
-    pthread_mutex_lock(&g_bridge_mu);
+    /* EXIT_THREAD (or fatal): rendezvous unlocked, then reclaim slot. */
     send_thread_exit(arg->ctx, arg->fn, arg->opaque);
+    ppc32_cache_forget_ctx(arg->ctx);
+    pthread_mutex_lock(&g_bridge_mu);
     bridge_mirror_remove(arg->ctx);
     if (arg->slot < DARWIN_MAX_WORKERS && g_workers[arg->slot].live) {
         g_workers[arg->slot].live = false;
+        g_workers[arg->slot].ctx = NULL;
         g_live_workers--;
     }
     pthread_mutex_unlock(&g_bridge_mu);
@@ -583,7 +594,7 @@ int ppc32_darwin_run_loop(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
 {
     int status = 0;
 
-    /* fn == NULL selects the real /dev/a32host transport (call_trap
+    /* fn == NULL selects the real /dev/a32host transport (bridge_trap
      * routes through the cached ioctl fd). */
     if (ctx == NULL) {
         return 1;
@@ -596,12 +607,17 @@ int ppc32_darwin_run_loop(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
         if (ctx->exit_reason == PPC32_EXIT_NONE) {
             continue;
         }
-        pthread_mutex_lock(&g_bridge_mu);
         rc = bridge_handle_exit(ctx, fn, opaque, &status);
-        pthread_mutex_unlock(&g_bridge_mu);
-        if (rc == 0 || rc == 1) {
-            /* EXIT_PROCESS, or EXIT_THREAD on the main thread: the
-             * process ends with the reported status. */
+        if (rc == 0) {
+            if (fn == NULL) {
+                /* Real /dev/a32host transport: terminate the whole
+                 * guest process immediately so parked workers never
+                 * race teardown/unreserve. */
+                _exit(status & 0xFF);
+            }
+            return status & 0xFF;
+        }
+        if (rc == 1) {
             return status & 0xFF;
         }
         if (rc == -2) {

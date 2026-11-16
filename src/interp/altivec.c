@@ -44,7 +44,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         uint32_t base = ea & ~15U;
         uint8_t tmp[16];
 
-        if (!interp_mem_ok(base, 16U)) {
+        if (!interp_mem_ok(ctx, base, 16U)) {
             fault(ctx, base);
             return;
         }
@@ -62,7 +62,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     case 487u: /* stvxl (lock hint ignored) */ {
         uint32_t base = ea & ~15U;
 
-        if (!interp_mem_ok(base, 16U)) {
+        if (!interp_mem_ok(ctx, base, 16U)) {
             fault(ctx, base);
             ctx->fault_is_store = 1U;
             return;
@@ -79,7 +79,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
     case 7u: /* lvebx */ {
         uint8_t b;
 
-        if (!interp_mem_ok(ea, 1U)) {
+        if (!interp_mem_ok(ctx, ea, 1U)) {
             fault(ctx, ea);
             return;
         }
@@ -95,7 +95,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         uint32_t ae = ea & ~1U;
         uint16_t h;
 
-        if (!interp_mem_ok(ae, 2U)) {
+        if (!interp_mem_ok(ctx, ae, 2U)) {
             fault(ctx, ae);
             return;
         }
@@ -112,7 +112,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         uint32_t ae = ea & ~3U;
         uint32_t w;
 
-        if (!interp_mem_ok(ae, 4U)) {
+        if (!interp_mem_ok(ctx, ae, 4U)) {
             fault(ctx, ae);
             return;
         }
@@ -130,7 +130,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         return;
     }
     case 135u: { /* stvebx */
-        if (!interp_mem_ok(ea, 1U)) {
+        if (!interp_mem_ok(ctx, ea, 1U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -147,7 +147,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
         uint16_t h = (uint16_t)(((uint16_t)ctx->vr[insn->rs & 31U][ae & 15U]
             << 8) | ctx->vr[insn->rs & 31U][(ae & 15U) + 1U]);
 
-        if (!interp_mem_ok(ae, 2U)) {
+        if (!interp_mem_ok(ctx, ae, 2U)) {
             fault(ctx, ae);
             ctx->fault_is_store = 1U;
             return;
@@ -167,7 +167,7 @@ void ppc32_vmx_ldst_step(ppc32_ctx_t *ctx, const ppc32_insn_t *insn)
             ((uint32_t)ctx->vr[insn->rs & 31U][(off + 2U) & 15U] << 8) |
             ctx->vr[insn->rs & 31U][(off + 3U) & 15U];
 
-        if (!interp_mem_ok(ae, 4U)) {
+        if (!interp_mem_ok(ctx, ae, 4U)) {
             fault(ctx, ae);
             ctx->fault_is_store = 1U;
             return;
@@ -507,8 +507,8 @@ static void vmx_shift(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
         break;
     }
     case 1036u: {
-        /* vslo: shift left by (vB[15] & 15) whole bytes. */
-        uint32_t n = ctx->vr[insn->rb & 31U][15] & 15U;
+        /* vslo: shift left by ((vB[15] >> 3) & 15) whole bytes (bits 121:124). */
+        uint32_t n = ((uint32_t)ctx->vr[insn->rb & 31U][15] >> 3) & 15U;
         uint8_t tmp[16];
 
         for (lane = 0U; lane < 16U; lane++) {
@@ -519,8 +519,8 @@ static void vmx_shift(ppc32_ctx_t *ctx, const ppc32_insn_t *insn,
         break;
     }
     case 1100u: {
-        /* vsro: shift right by (vB[15] & 15) whole bytes. */
-        uint32_t n = ctx->vr[insn->rb & 31U][15] & 15U;
+        /* vsro: shift right by ((vB[15] >> 3) & 15) whole bytes (bits 121:124). */
+        uint32_t n = ((uint32_t)ctx->vr[insn->rb & 31U][15] >> 3) & 15U;
         uint8_t tmp[16];
 
         for (lane = 0U; lane < 16U; lane++) {

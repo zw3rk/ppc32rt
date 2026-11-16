@@ -458,14 +458,17 @@ static inline void fault(ppc32_ctx_t *ctx, uint32_t ea)
  * anything below the 64 KiB guard (or past 4 GiB) faults with EA
  * recorded, and the driver delivers SIGSEGV to an installed guest
  * handler. Mapped-region misses keep their historical behavior. */
-static inline bool interp_mem_ok(uint32_t ea, uint32_t len)
+static inline bool interp_mem_ok(const ppc32_ctx_t *ctx, uint32_t ea,
+    uint32_t len)
 {
+    uint32_t guard = (ctx != NULL && ctx->is_darwin) ?
+        0x1000U : PPC32_LOW_GUARD_SIZE;
     uint64_t end;
 
     if (len == 0U) {
         return true;
     }
-    if (ea < PPC32_LOW_GUARD_SIZE) {
+    if (ea < guard) {
         return false;
     }
     end = (uint64_t)ea + (uint64_t)len;
@@ -527,27 +530,27 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
     switch (insn->op) {
     case PPC32_OP_LBZ:
     case PPC32_OP_LBZU:
-        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 1U)) { fault(ctx, ea); return; }
         loaded = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZ:
     case PPC32_OP_LHZU:
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = ld16(ctx, ea);
         break;
     case PPC32_OP_LHA:
     case PPC32_OP_LHAU:
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZ:
     case PPC32_OP_LWZU:
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); return; }
         loaded = ld32(ctx, ea);
         break;
     case PPC32_OP_STB:
     case PPC32_OP_STBU:
-        if (!interp_mem_ok(ea, 1U)) {
+        if (!interp_mem_ok(ctx, ea, 1U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -556,7 +559,7 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
         break;
     case PPC32_OP_STH:
     case PPC32_OP_STHU:
-        if (!interp_mem_ok(ea, 2U)) {
+        if (!interp_mem_ok(ctx, ea, 2U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -564,7 +567,7 @@ static inline void interp_exec_dform_mem(ppc32_ctx_t *ctx,
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
-        if (!interp_mem_ok(ea, 4U)) {
+        if (!interp_mem_ok(ctx, ea, 4U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -629,30 +632,30 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
     case PPC32_OP_LBZX:
     case PPC32_OP_LBZUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 1U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 1U)) { fault(ctx, ea); return; }
         loaded = ld8(ctx, ea);
         break;
     case PPC32_OP_LHZX:
     case PPC32_OP_LHZUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = ld16(ctx, ea);
         break;
     case PPC32_OP_LHAX:
     case PPC32_OP_LHAUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 2U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 2U)) { fault(ctx, ea); return; }
         loaded = (uint32_t)(int32_t)(int16_t)ld16(ctx, ea);
         break;
     case PPC32_OP_LWZX:
     case PPC32_OP_LWZUX:
         is_load = true;
-        if (!interp_mem_ok(ea, 4U)) { fault(ctx, ea); return; }
+        if (!interp_mem_ok(ctx, ea, 4U)) { fault(ctx, ea); return; }
         loaded = ld32(ctx, ea);
         break;
     case PPC32_OP_STBX:
     case PPC32_OP_STBUX:
-        if (!interp_mem_ok(ea, 1U)) {
+        if (!interp_mem_ok(ctx, ea, 1U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -661,7 +664,7 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         break;
     case PPC32_OP_STHX:
     case PPC32_OP_STHUX:
-        if (!interp_mem_ok(ea, 2U)) {
+        if (!interp_mem_ok(ctx, ea, 2U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;
@@ -669,7 +672,7 @@ static inline void interp_exec_xform_mem(ppc32_ctx_t *ctx,
         st16(ctx, ea, (uint16_t)ctx->gpr[insn->rs]);
         break;
     default:
-        if (!interp_mem_ok(ea, 4U)) {
+        if (!interp_mem_ok(ctx, ea, 4U)) {
             fault(ctx, ea);
             ctx->fault_is_store = 1U;
             return;

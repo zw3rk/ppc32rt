@@ -313,12 +313,13 @@ static inline void ei_ea_x(a64_buf_t *b, unsigned ra, unsigned rb)
  * and the oracle frame for frame. */
 static inline void ei_guard_low(a64_buf_t *b, uint32_t pc)
 {
+    uint32_t gp = (b->low_guard_pages != 0U) ? b->low_guard_pages : 16U;
     size_t to_ok;
 
     a64_emit_mov_pc32(b, A64_TMP0, pc);
     a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX,
         (uint32_t)offsetof(ppc32_ctx_t, nip));
-    a64_emit_sub_imm_w(b, true, A64_ZR, A64_ADDR, 16U, 1U);
+    a64_emit_sub_imm_w(b, true, A64_ZR, A64_ADDR, gp, 1U);
     to_ok = a64_emit_b_cond_placeholder(b, A64_COND_CS);
     a64_emit_exit_fault(b, pc, A64_ADDR);
     a64_patch_b_cond(b, to_ok, b->count);

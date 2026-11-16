@@ -130,8 +130,38 @@ void bridge_register_vma(uint32_t va, uint32_t end, uint8_t prot,
     bridge_protect_host(window_base, va, end - va, prot);
 }
 
+/* Sort and coalesce adjacent same-prot mirror regions so repeated
+ * mprotect calls cannot fragment a context past PPC32_MAX_REGIONS. */
+static void mirror_coalesce(ppc32_ctx_t *m)
+{
+    size_t i;
+    size_t j;
+    size_t out = 0U;
+
+    for (i = 1U; i < m->region_count; i++) {
+        ppc32_region_t cur = m->regions[i];
+
+        j = i;
+        while (j > 0U && m->regions[j - 1U].start > cur.start) {
+            m->regions[j] = m->regions[j - 1U];
+            j--;
+        }
+        m->regions[j] = cur;
+    }
+    for (i = 0U; i < m->region_count; i++) {
+        if (out > 0U &&
+            m->regions[out - 1U].end == m->regions[i].start &&
+            m->regions[out - 1U].prot == m->regions[i].prot) {
+            m->regions[out - 1U].end = m->regions[i].end;
+        } else {
+            m->regions[out++] = m->regions[i];
+        }
+    }
+    m->region_count = out;
+}
+
 /* Set [va, end) to prot p in one mirror: carve overlapping regions
- * into non-overlapping pieces, then append the exact range. */
+ * into non-overlapping pieces, append the exact range, and coalesce. */
 static void mirror_set_prot(ppc32_ctx_t *m, uint32_t va, uint32_t end,
     uint8_t p)
 {
@@ -173,6 +203,7 @@ static void mirror_set_prot(ppc32_ctx_t *m, uint32_t va, uint32_t end,
     }
     memcpy(m->regions, kept, n * sizeof kept[0]);
     m->region_count = n;
+    mirror_coalesce(m);
 }
 
 /* Remove [va, end) from one mirror (unmap path). */
@@ -207,30 +238,24 @@ static void mirror_carve_remove(ppc32_ctx_t *m, uint32_t va, uint32_t end)
     m->region_count = n;
 }
 
-/* Is [va, end) fully covered by tracked regions? 64-bit end math. */
-static bool bridge_range_mapped(ppc32_ctx_t *ctx, uint32_t va,
-    uint64_t end64)
+/* Is [va, end64) fully covered by mapped 4 KiB pages in vm32? */
+static bool bridge_range_mapped(uint32_t va, uint64_t end64)
 {
-    uint64_t cur = va;
+    uint64_t pg = (uint64_t)va & ~0xFFFULL;
+    uint64_t end_pg;
 
     if (end64 <= (uint64_t)va || end64 > 0x100000000ULL) {
         return end64 == (uint64_t)va;
     }
-    while (cur < end64) {
-        bool hit = false;
-        size_t k;
-
-        for (k = 0U; k < ctx->region_count; k++) {
-            if (cur >= ctx->regions[k].start &&
-                cur < ctx->regions[k].end) {
-                cur = ctx->regions[k].end;
-                hit = true;
-                break;
-            }
-        }
-        if (!hit) {
+    end_pg = (end64 + 0xFFFULL) & ~0xFFFULL;
+    if (end_pg > 0x100000000ULL) {
+        end_pg = 0x100000000ULL;
+    }
+    while (pg < end_pg) {
+        if (!vm32_page_query((uint32_t)pg, NULL)) {
             return false;
         }
+        pg += 0x1000ULL;
     }
     return true;
 }
@@ -239,74 +264,90 @@ void bridge_apply_sync_prot(uint32_t va, uint32_t len, uint32_t prot)
 {
     uint64_t end64 = (uint64_t)va + (uint64_t)len;
     uint8_t p = (uint8_t)(prot & 7U);
+    uint32_t end32;
     size_t m;
 
     if (len == 0U || end64 > 0x100000000ULL || g_mirror_n == 0U) {
         return;
     }
+    end32 = (end64 >= 0x100000000ULL) ? 0xFFFFFFFFU : (uint32_t)end64;
     if (p == 0U) {
-        /* munmap: fresh PROT_NONE anon over the range (stale bytes
-         * gone, later faults report unmapped), drop the vm32 record,
-         * carve every mirror, invalidate TLB + DBT. Later re-maps read
-         * fresh zeros. */
-        uint32_t s = va & ~0xFFFU;
-        uint32_t e = (uint32_t)((end64 + 0xFFFU) & ~0xFFFU);
-        void *at;
+        /* munmap: clear stale bytes, drop the vm32 record, recompute host
+         * protections (A2 sub-page union or A1 exact MAP_FIXED PROT_NONE),
+         * carve every mirror, and invalidate TLB + DBT across all mirrors. */
+        uint64_t s64 = (uint64_t)va & ~0xFFFULL;
+        uint64_t e64 = (end64 + 0xFFFULL) & ~0xFFFULL;
+        uint64_t gbase = g_mirrors[0]->guest_base;
+        uint32_t s32;
+        uint32_t e32;
 
-        if (e <= s) {
+        if (e64 > 0x100000000ULL) {
+            e64 = 0x100000000ULL;
+        }
+        if (e64 <= s64 || gbase == 0U) {
             return;
         }
-        at = mmap((void *)(uintptr_t)(g_mirrors[0]->guest_base +
-            (uint64_t)s), (size_t)(e - s), PROT_NONE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (at == MAP_FAILED) {
-            return;
+        s32 = (uint32_t)s64;
+        e32 = (e64 >= 0x100000000ULL) ? 0xFFFFFFFFU : (uint32_t)e64;
+        if (vm32_is_a2()) {
+            size_t hp = vm32_host_page_size();
+            uint64_t hs = s64 & ~(uint64_t)(hp - 1U);
+            uint64_t he = (e64 + (uint64_t)hp - 1ULL) & ~(uint64_t)(hp - 1U);
+
+            if (he > 0x100000000ULL) {
+                he = 0x100000000ULL;
+            }
+            if (mprotect((void *)(uintptr_t)(gbase + hs), (size_t)(he - hs),
+                PROT_READ | PROT_WRITE) != 0) {
+                return;
+            }
+            memset((void *)(uintptr_t)(gbase + s64), 0, (size_t)(e64 - s64));
+            vm32_record_unmap(s32, e32);
+            (void)vm32_sync_host_range(s32, e32);
+        } else {
+            void *at = mmap((void *)(uintptr_t)(gbase + s64),
+                (size_t)(e64 - s64), PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+            if (at == MAP_FAILED) {
+                return;
+            }
+            vm32_record_unmap(s32, e32);
         }
-        vm32_record_unmap(s, e);
         vm32_ll_note_remap();
         for (m = 0U; m < g_mirror_n; m++) {
-            mirror_carve_remove(g_mirrors[m], s, e);
+            mirror_carve_remove(g_mirrors[m], s32, e32);
         }
-        vm32_tlb_invalidate_range(s, e);
-        ppc32_dbt_invalidate_range(g_mirrors[0], s, e);
+        vm32_tlb_invalidate_range(s32, e32);
+        for (m = 0U; m < g_mirror_n; m++) {
+            ppc32_dbt_invalidate_range(g_mirrors[m], s32, e32);
+        }
         return;
     }
-    if (!bridge_range_mapped(g_mirrors[0], va, end64)) {
+    if (!bridge_range_mapped(va, end64)) {
         /* Fresh mapping (unmapped-fault recovery): publish the range
-         * before syncing host protections so the A2 union sees it.
-         * Recording ANON (not PROTECT) is what clears the UNMAPPED
-         * state that would otherwise re-fault forever. */
-        vm32_record_map(va, (uint32_t)end64, p, (uint8_t)VM32_PAGE_ANON);
+         * before syncing host protections so the A2 union sees it. */
+        vm32_record_map(va, end32, p, (uint8_t)VM32_PAGE_ANON);
         if ((p & 4U) != 0U) {
-            vm32_mark_guest_exec(va, (uint32_t)end64);
+            vm32_mark_guest_exec(va, end32);
         }
         for (m = 0U; m < g_mirror_n; m++) {
-            ppc32_ctx_t *c = g_mirrors[m];
-
-            if (c->region_count < PPC32_MAX_REGIONS) {
-                ppc32_region_t *r = &c->regions[c->region_count++];
-
-                r->start = va;
-                r->end = (uint32_t)end64;
-                r->prot = p;
-                r->flags = 0U;
-                r->fd = -1;
-                r->offset = 0U;
-                r->name[0] = '\0';
-            }
+            mirror_set_prot(g_mirrors[m], va, end32, p);
         }
     } else {
-        vm32_record_protect(va, (uint32_t)end64, p);
+        vm32_record_protect(va, end32, p);
         if ((p & 4U) != 0U) {
-            vm32_mark_guest_exec(va, (uint32_t)end64);
+            vm32_mark_guest_exec(va, end32);
         }
         for (m = 0U; m < g_mirror_n; m++) {
-            mirror_set_prot(g_mirrors[m], va, (uint32_t)end64, p);
+            mirror_set_prot(g_mirrors[m], va, end32, p);
         }
     }
     bridge_protect_host(g_mirrors[0]->guest_base, va, len, p);
-    vm32_tlb_invalidate_range(va, (uint32_t)end64);
-    ppc32_dbt_invalidate_range(g_mirrors[0], va, (uint32_t)end64);
+    vm32_tlb_invalidate_range(va, end32);
+    for (m = 0U; m < g_mirror_n; m++) {
+        ppc32_dbt_invalidate_range(g_mirrors[m], va, end32);
+    }
 }
 
 /* Handler code patch for G02 SMC (test_a stub rewrite): bytes written

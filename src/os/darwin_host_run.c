@@ -122,15 +122,24 @@ static int do_boot(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
         }
     }
     {
-        /* Seal unmapped gaps PROT_NONE, keeping handler-loaded bytes:
-         * mapping is already RW, so this only drops the gaps. Sealing
-         * rounds to host pages (16 KiB on Darwin): a rounded seal may
-         * cover a VMA edge, but the per-VMA union sync below restores
-         * every mapped sub-page right after. */
+        /* Sort vmaps[] by ascending VA before sealing unmapped gaps
+         * PROT_NONE so out-of-order segments (e.g. stack/heap appended
+         * after CommPage) never leave an intermediate gap unsealed. */
         size_t hp = vm32_host_page_size();
         uint64_t mask = (hp == 0U) ? 0ULL : (uint64_t)(hp - 1U);
         uint64_t cursor = 0ULL;
+        size_t j;
 
+        for (i = 1U; i < boot.vmap_count; i++) {
+            a32h_darwin_vmap_t cur = vmaps[i];
+
+            j = i;
+            while (j > 0U && vmaps[j - 1U].va > cur.va) {
+                vmaps[j] = vmaps[j - 1U];
+                j--;
+            }
+            vmaps[j] = cur;
+        }
         for (i = 0U; i < boot.vmap_count; i++) {
             uint64_t vs = (uint64_t)vmaps[i].va;
 
@@ -235,10 +244,13 @@ static void bridge_teardown(void)
     while (bridge_live_workers() > 0U && spin++ < DARWIN_QUIESCE_SPINS) {
         sched_yield();
     }
-    base = bridge_take_window();
-    unreserve_window((void *)(uintptr_t)base);
+    if (bridge_live_workers() == 0U) {
+        base = bridge_take_window();
+        unreserve_window((void *)(uintptr_t)base);
+    }
     vm32_tlb_invalidate_all();
     ppc32_dbt_set_emitter(NULL);
+    bridge_reset_emitter();
     bridge_lock();
     bridge_reset_workers();
     bridge_mirrors_reset();
@@ -312,9 +324,7 @@ static int run_darwin_difftest(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
             break;
         }
         memcpy(ctx, ref, sizeof *ctx);
-        bridge_lock();
         rc = bridge_handle_exit(ctx, fn, opaque, &status);
-        bridge_unlock();
         memcpy(ref, ctx, sizeof *ref);
         ppc32_difftest_sync_dut(dut, ref);
         {
@@ -335,8 +345,12 @@ static int run_darwin_difftest(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
     }
     ppc32_tb_lockstep_on = false;
     ppc32_difftest_snap_free(snap, snap_n);
+    ppc32_cache_forget_ctx(ref);
+    ppc32_cache_forget_ctx(dut);
+    bridge_lock();
     bridge_mirror_remove(ref);
     bridge_mirror_remove(dut);
+    bridge_unlock();
     if (mismatches != 0) {
         status = 1;
     }
@@ -367,6 +381,7 @@ int ppc32_run_darwin_with_handler(a32h_darwin_handler_fn fn, void *opaque,
     } else {
         status = run_darwin_difftest(ctx, fn, opaque);
     }
+    ppc32_cache_forget_ctx(ctx);
     bridge_teardown();
     free(ctx);
     return status & 0xFF;
