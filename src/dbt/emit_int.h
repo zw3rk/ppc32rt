@@ -526,6 +526,24 @@ static inline int ei_mtcrf(a64_buf_t *b, const ppc32_insn_t *in)
     return PPC32_EMIT_NEXT;
 }
 
+/* Far C-tail field (vrsave lives past the 12-bit imm12 reach of the
+ * ctx helpers): xTMP3 = xCTX + off, then a zero-offset ldr/str.
+ * Encodings match emit_ctx_mem_imm (0xB9400000 ldr / 0xB9000000 str). */
+static inline int ei_spr_far(a64_buf_t *b, const ppc32_insn_t *in,
+    uint32_t off)
+{
+    a64_emit_mov_imm32(b, A64_TMP3, off);
+    a64_emit_add_uxtw_x(b, A64_TMP3, A64_XCTX, A64_TMP3);
+    if (in->op == PPC32_OP_MFSPR) {
+        a64_emit(b, 0xB9400000U | ((uint32_t)A64_TMP3 << 5) | EI_A);
+        ei_st(b, EI_A, in->rt);
+    } else {
+        ei_ld(b, EI_A, in->rs);
+        a64_emit(b, 0xB9000000U | ((uint32_t)A64_TMP3 << 5) | EI_A);
+    }
+    return PPC32_EMIT_NEXT;
+}
+
 static inline int ei_spr(a64_buf_t *b, const ppc32_insn_t *in)
 {
     uint32_t off;
@@ -536,13 +554,16 @@ static inline int ei_spr(a64_buf_t *b, const ppc32_insn_t *in)
         off = (uint32_t)offsetof(ppc32_ctx_t, lr);
     } else if (in->ui == PPC32_SPR_CTR) {
         off = (uint32_t)offsetof(ppc32_ctx_t, ctr);
+    } else if (in->ui == PPC32_SPR_VRSAVE) {
+        /* G02: VRSAVE is a user SPR on the Darwin G4 profile: fast
+         * inline load/store, never a privileged trap (interp parity). */
+        return ei_spr_far(b, in,
+            (uint32_t)offsetof(ppc32_ctx_t, vrsave));
     } else if (in->ui == 268U || in->ui == 269U) {
-        if (in->op != PPC32_OP_MFSPR) {
-            return PPC32_EMIT_FALLBACK;
-        }
-        a64_emit_movz_w(b, EI_A, 0U, 0U); /* TB/TBU read as 0 (interp) */
-        ei_st(b, EI_A, in->rt);
-        return PPC32_EMIT_NEXT;
+        /* mftb/mftbu serve the host monotonic clock in interp
+         * (ppc32_tb_now): fall back to the single-step so DBT reads
+         * the identical value with 0 --difftest divergences. */
+        return PPC32_EMIT_FALLBACK;
     } else {
         return PPC32_EMIT_FALLBACK; /* privileged SPR: interp UNDEFs */
     }

@@ -138,7 +138,7 @@ endif
 
 # syscall(2) is deprecated on macOS (the /dev/a32host probe only ever runs
 # on Linux); keep the deprecation visible but non-fatal for the host check.
-check: check-line-limits check-abi-invariants ## Host-cc syntax check of every src file (no link) + line limits + ABI invariants
+check: check-line-limits check-abi-invariants check-darwin-g02 ## Host-cc syntax check of every src file (no link) + line limits + ABI invariants + G02 Darwin bridge suite
 	@for f in $(SRCS); do \
 		$(CC) $(CHECK_STD) -Werror=vla -pedantic \
 			-Wall -Wextra -Werror -Wno-error=deprecated-declarations \
@@ -147,6 +147,14 @@ check: check-line-limits check-abi-invariants ## Host-cc syntax check of every s
 			-fsyntax-only "$$f" || exit 1; \
 	done
 	@echo "syntax check OK ($$(echo $(SRCS) | wc -w | tr -d ' ') files)"
+
+check-darwin-g02: build-darwin ## Build and run the G02 Darwin host-bridge suite (a, b, c, d, e + --difftest, interp + dbt)
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_darwin_g02.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_darwin_g02 && \
+	./$(BUILD_DIR)/check_p32_darwin_g02
 
 check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
 	@over=$$(for f in $$(find src include tests -name '*.c' -o -name '*.h' -o -name '*.S'); do \

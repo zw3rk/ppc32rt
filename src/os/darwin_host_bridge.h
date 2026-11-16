@@ -16,6 +16,7 @@
 #define PPC32RT_OS_DARWIN_HOST_BRIDGE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "a32host.h"
@@ -43,6 +44,14 @@ int ppc32_darwin_run_loop(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
  * the process exit status (0..255). */
 int ppc32_run_darwin_with_handler(a32h_darwin_handler_fn fn, void *opaque,
     int engine, bool difftest);
+
+/* Handler code patch for G02 SMC: copy len bytes to [va, va+len)
+ * through the host mapping (temporary host-page widen + recorded
+ * protection restore) and return 0 (or -errno). The caller still
+ * replies FLUSH_ICACHE so translated blocks covering the range are
+ * dropped. Only for in-process handlers. */
+int ppc32_darwin_patch_code(uint64_t window_base, uint32_t va,
+    const void *src, size_t len, uint32_t restore_prot);
 
 /* AOT cache isolation key: Linux ELF uses 0 as the personality hash;
  * Darwin mixes boot.aot_personality_hash. Never collides across

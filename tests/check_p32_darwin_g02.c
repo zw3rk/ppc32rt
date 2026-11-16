@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "a32host.h"
+#include "dbt/aot/aot.h"
 #include "os/darwin_host_bridge.h"
 #include "ppc32rt.h"
 
@@ -41,94 +42,7 @@ static int g_fails = 0;
     } \
 } while (0)
 
-#define CODE_VA 0x100000U
-#define DATA_VA 0x200000U
-#define STACK_TOP 0x301000U
-#define RO_VA 0x400000U
-#define UNMAPPED_VA 0x500000U
-
-static void w32(uint64_t base, uint32_t va, uint32_t w)
-{
-    uint8_t *p = (uint8_t *)(uintptr_t)(base + (uint64_t)va);
-    p[0] = (uint8_t)(w >> 24);
-    p[1] = (uint8_t)(w >> 16);
-    p[2] = (uint8_t)(w >> 8);
-    p[3] = (uint8_t)w;
-}
-
-static uint32_t r32(uint64_t base, uint32_t va)
-{
-    const uint8_t *p = (const uint8_t *)(uintptr_t)(base + (uint64_t)va);
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-        ((uint32_t)p[2] << 8) | p[3];
-}
-
-static uint32_t w_dform(uint32_t op, uint32_t rt, uint32_t ra, uint32_t d)
-{
-    return (op << 26) | ((rt & 31U) << 21) | ((ra & 31U) << 16) |
-        (d & 0xffffU);
-}
-
-static uint32_t w_x31(uint32_t rt, uint32_t ra, uint32_t rb, uint32_t xo,
-    uint32_t rc)
-{
-    return (31U << 26) | ((rt & 31U) << 21) | ((ra & 31U) << 16) |
-        ((rb & 31U) << 11) | ((xo & 1023U) << 1) | (rc & 1U);
-}
-
-static uint32_t w_vx3(uint32_t vd, uint32_t va, uint32_t vb, uint32_t xo)
-{
-    return (4U << 26) | ((vd & 31U) << 21) | ((va & 31U) << 16) |
-        ((vb & 31U) << 11) | (xo & 0x7ffU);
-}
-
-static uint32_t w_va(uint32_t vd, uint32_t va, uint32_t vb, uint32_t vc,
-    uint32_t low6)
-{
-    return (4U << 26) | ((vd & 31U) << 21) | ((va & 31U) << 16) |
-        ((vb & 31U) << 11) | ((vc & 31U) << 6) | (low6 & 63U);
-}
-
-static uint32_t w_mtspr(uint32_t rs, uint32_t spr)
-{
-    return (31U << 26) | ((rs & 31U) << 21) | ((spr & 31U) << 16) |
-        (((spr >> 5) & 31U) << 11) | (467U << 1);
-}
-
-static uint32_t w_mfspr(uint32_t rt, uint32_t spr)
-{
-    return (31U << 26) | ((rt & 31U) << 21) | ((spr & 31U) << 16) |
-        (((spr >> 5) & 31U) << 11) | (339U << 1);
-}
-
-static uint32_t w_b(uint32_t pc, uint32_t target, uint32_t lk)
-{
-    uint32_t disp = target - pc;
-    return (18U << 26) | (disp & 0x03FFFFFCU) | (lk & 1U);
-}
-
-static uint32_t w_bc(uint32_t pc, uint32_t bo, uint32_t bi,
-    uint32_t target)
-{
-    uint32_t disp = target - pc;
-    return (16U << 26) | ((bo & 31U) << 21) | ((bi & 31U) << 16) |
-        (((disp >> 2) & 0x3fffU) << 2);
-}
-
-static uint32_t w_blr(void)
-{
-    return (19U << 26) | (20U << 21) | (16U << 1);
-}
-
-static uint32_t w_cmpi(uint32_t ra, uint32_t simm)
-{
-    return (11U << 26) | ((ra & 31U) << 16) | (simm & 0xFFFFU);
-}
-
-static uint32_t w_bne(uint32_t pc, uint32_t target)
-{
-    return w_bc(pc, 4, 2, target);
-}
+#include "check_p32_darwin_g02_enc.h"
 
 /* ---- subtest (a): VRSAVE + AltiVec + dcbz + icbi SMC ---- */
 
@@ -138,6 +52,7 @@ typedef struct {
     int saw_vrsave_ok;
     int saw_vec_ok;
     int saw_dcbz_ok;
+    int saw_patch_ok;
 } ta_t;
 
 static int handler_a(void *opaque, unsigned long req, void *arg)
@@ -238,7 +153,20 @@ static int handler_a(void *opaque, unsigned long req, void *arg)
                         t->saw_dcbz_ok = 1;
                     }
                 }
-                w32(t->window, 0x100800U, w_dform(14U, 10, 0, 2));
+                /* SMC stub rewrite through the host mapping: the
+                 * code page is host READ (RX guest), so widen, copy,
+                 * and restore, then FLUSH_ICACHE the translation. */
+                {
+                    uint32_t nw = w_dform(14U, 10, 0, 2);
+                    uint8_t pb[4];
+
+                    pb[0] = (uint8_t)(nw >> 24);
+                    pb[1] = (uint8_t)(nw >> 16);
+                    pb[2] = (uint8_t)(nw >> 8);
+                    pb[3] = (uint8_t)nw;
+                    t->saw_patch_ok = (ppc32_darwin_patch_code(t->window,
+                        0x100800U, pb, sizeof pb, 5U) == 0);
+                }
                 tr->reply_action = A32H_DACT_FLUSH_ICACHE;
                 tr->flush_va = 0x100800U;
                 tr->flush_len = 8U;
@@ -270,9 +198,10 @@ static int test_a(int engine)
     CHECK(t.saw_vrsave_ok, "a: VRSAVE mtspr/mfspr round-trip");
     CHECK(t.saw_vec_ok, "a: lvx/vaddubm/vperm/vcmpeq/stvx + CR6");
     CHECK(t.saw_dcbz_ok, "a: dcbz 32-byte zeroing");
+    CHECK(t.saw_patch_ok, "a: SMC host patch applied");
     CHECK(t.sc_count == 2, "a: SMC re-execution after FLUSH_ICACHE");
     if (rc == 0 && t.saw_vrsave_ok && t.saw_vec_ok && t.saw_dcbz_ok &&
-        t.sc_count == 2) {
+        t.saw_patch_ok && t.sc_count == 2) {
         printf("darwin-g02-a (engine %d): PASS\n", engine);
     }
     return rc;
@@ -508,8 +437,10 @@ static int handler_c(void *opaque, unsigned long req, void *arg)
             uint64_t fbits = ((uint64_t)r32(t->window, DATA_VA + 32U) << 32) |
                 r32(t->window, DATA_VA + 36U);
             uint8_t *vv = (uint8_t *)(uintptr_t)(t->window + DATA_VA);
+            /* Guest stores fr1, and the handler fills fpr[k] with
+             * BASE+k, so the double at DATA+32 is BASE+1. */
             if (g == 0xDEADBEEFU && vs == 0xFFFFFFFFU &&
-                fbits == 0x400921FB54442D18ULL && vv[0] == 0xA0 &&
+                fbits == 0x400921FB54442D19ULL && vv[0] == 0xA0 &&
                 st->vrsave == 0xFFFFFFFFU && st->fpscr == 0x12340000U &&
                 t->saw_unmapped && t->saw_prot) {
                 t->saw_signal = 1;
@@ -553,16 +484,6 @@ typedef struct {
     int thread_exits;
     uint32_t worker_va;
 } td_t;
-
-static uint32_t w_lwarx(uint32_t rt, uint32_t ra, uint32_t rb)
-{
-    return w_x31(rt, ra, rb, 20, 0);
-}
-
-static uint32_t w_stwcx(uint32_t rs, uint32_t ra, uint32_t rb)
-{
-    return w_x31(rs, ra, rb, 150, 1);
-}
 
 static int handler_d(void *opaque, unsigned long req, void *arg)
 {
@@ -715,29 +636,49 @@ static int handler_e(void *opaque, unsigned long req, void *arg)
         }
         w32(t->window, c + 0U, w_mtspr(3, 256));
         w32(t->window, c + 4U, w_mfspr(4, 256));
-        w32(t->window, c + 8U, w_dform(15U, 5, 0, 0x20));
-        w32(t->window, c + 12U, w_dform(36U, 4, 5, 256));
-        w32(t->window, c + 16U, w_x31(0, 0, 5, 103, 0));
-        w32(t->window, c + 20U, w_vx3(1, 0, 0, 0));
-        w32(t->window, c + 24U, w_vx3(10, 0, 0, 10));
-        w32(t->window, c + 28U, w_vx3(3, 3, 3, 1220));
-        w32(t->window, c + 32U, w_x31(4, 5, 0, 6, 0));
-        w32(t->window, c + 36U, w_va(2, 1, 10, 4, 43));
-        w32(t->window, c + 40U, w_va(6, 2, 2, 2, 44));
-        w32(t->window, c + 44U, w_vx3(7, 6, 6, 64));
-        w32(t->window, c + 48U, w_vx3(8, 6, 6, 196));
-        w32(t->window, c + 52U, w_vx3(9, 7, 8, 12));
-        w32(t->window, c + 56U, w_vx3(11, 9, 9, 14));
-        w32(t->window, c + 60U, w_vx3(12, 11, 11, 398));
-        w32(t->window, c + 64U, w_vx3(5, 2, 2, 7));
-        w32(t->window, c + 68U, w_dform(14U, 7, 5, 64));
-        w32(t->window, c + 72U, w_x31(2, 0, 7, 231, 0));
-        w32(t->window, c + 76U, w_dform(14U, 8, 5, 128));
-        w32(t->window, c + 80U, w_x31(0, 8, 0, 1014, 0));
-        w32(t->window, c + 84U, w_x31(0, 0, 0, 822, 0));
-        w32(t->window, c + 88U, w_x31(0, 8, 0, 982, 0));
-        w32(t->window, c + 92U, 0x4C00012CU);
-        w32(t->window, c + 96U, 0x44000002U);
+        /* Timebase sample 1 (hi/lo); monotonicity is checked below. */
+        w32(t->window, c + 8U, w_mftb(20, 268));
+        w32(t->window, c + 12U, w_mftb(21, 269));
+        w32(t->window, c + 16U, w_dform(15U, 5, 0, 0x20));
+        w32(t->window, c + 20U, w_dform(36U, 4, 5, 256));
+        w32(t->window, c + 24U, w_x31(0, 0, 5, 103, 0));
+        w32(t->window, c + 28U, w_vx3(1, 0, 0, 0));
+        w32(t->window, c + 32U, w_vx3(10, 0, 0, 10));
+        w32(t->window, c + 36U, w_vx3(3, 3, 3, 1220));
+        w32(t->window, c + 40U, w_x31(4, 5, 0, 6, 0));
+        w32(t->window, c + 44U, w_va(2, 1, 10, 4, 43));
+        w32(t->window, c + 48U, w_va(6, 2, 2, 2, 44));
+        w32(t->window, c + 52U, w_vx3(7, 6, 6, 64));
+        w32(t->window, c + 56U, w_vx3(8, 6, 6, 196));
+        w32(t->window, c + 60U, w_vx3(9, 7, 8, 12));
+        w32(t->window, c + 64U, w_vx3(11, 9, 9, 14));
+        w32(t->window, c + 68U, w_vx3(12, 11, 11, 398));
+        w32(t->window, c + 72U, w_vx3(5, 2, 2, 7));
+        w32(t->window, c + 76U, w_dform(14U, 7, 5, 64));
+        w32(t->window, c + 80U, w_x31(2, 0, 7, 231, 0));
+        w32(t->window, c + 84U, w_dform(14U, 8, 5, 128));
+        w32(t->window, c + 88U, w_x31(0, 8, 0, 1014, 0));
+        w32(t->window, c + 92U, w_x31(0, 0, 0, 822, 0));
+        w32(t->window, c + 96U, w_x31(0, 8, 0, 982, 0));
+        w32(t->window, c + 100U, 0x4C00012CU);
+        /* Sample 2; trap (BKPT) unless (hi2:lo2) >= (hi1:lo1). */
+        w32(t->window, c + 104U, w_mftb(22, 268));
+        w32(t->window, c + 108U, w_mftb(23, 269));
+        w32(t->window, c + 112U, w_subf(11, 21, 23));
+        w32(t->window, c + 116U, w_cmpi(11, 0));
+        w32(t->window, c + 120U, w_blt(c + 120U, c + 160U));
+        w32(t->window, c + 124U, w_subf(11, 20, 22));
+        w32(t->window, c + 128U, w_cmpi(11, 0));
+        w32(t->window, c + 132U, w_blt(c + 132U, c + 160U));
+        /* Clear the samples: TB varies per engine run, so it must not
+         * leak into the difftest architectural compare at the sc. */
+        w32(t->window, c + 136U, w_dform(14U, 20, 0, 0));
+        w32(t->window, c + 140U, w_dform(14U, 21, 0, 0));
+        w32(t->window, c + 144U, w_dform(14U, 22, 0, 0));
+        w32(t->window, c + 148U, w_dform(14U, 23, 0, 0));
+        w32(t->window, c + 152U, w_dform(14U, 11, 0, 0));
+        w32(t->window, c + 156U, 0x44000002U);
+        w32(t->window, c + 160U, w_dform(3U, 31, 0, 0));
         return 0;
     }
     if (req == (unsigned long)A32H_DARWIN_TRAP) {
@@ -785,6 +726,24 @@ static int test_e(void)
     kl = ppc32_darwin_cache_key(&la);
     CHECK(kd != kl, "e: Darwin vs Linux AOT cache keys differ");
     CHECK(ppc32_darwin_cache_key(&da) == kd, "e: AOT key deterministic");
+    {
+        ppc32_aot_hdr_t hdr;
+
+        memset(&hdr, 0, sizeof hdr);
+        memcpy(hdr.magic, PPC32_AOT_MAGIC, PPC32_AOT_MAGIC_LEN);
+        hdr.version = PPC32_AOT_VERSION;
+        hdr.profile = (uint32_t)PPC32_PROFILE_CLASSIC;
+        hdr.personality =
+            ppc32_aot_personality_tag(da.darwin_aot_hash);
+        CHECK(ppc32_aot_header_ok(&hdr), "e: AOT header valid");
+        CHECK(ppc32_aot_personality_ok(&hdr, da.darwin_aot_hash),
+            "e: AOT header accepts Darwin personality");
+        CHECK(!ppc32_aot_personality_ok(&hdr, la.darwin_aot_hash),
+            "e: AOT header rejects Linux personality");
+        CHECK(ppc32_aot_personality_tag(da.darwin_aot_hash) !=
+            ppc32_aot_personality_tag(la.darwin_aot_hash),
+            "e: AOT personality tags differ");
+    }
     if (rc == 0 && kd != kl) {
         printf("darwin-g02-e (difftest): PASS\n");
     }

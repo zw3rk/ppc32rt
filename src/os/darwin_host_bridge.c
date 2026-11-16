@@ -209,6 +209,76 @@ static bool va_is_prot(ppc32_ctx_t *ctx, uint32_t va, uint32_t kind)
     return false;
 }
 
+/* Guest->host protection for the [G, G+4GiB) window (W^X: guest EXEC
+ * never maps host EXEC; EXEC implies READ so code stays fetchable). */
+static int bridge_host_prot(uint32_t prot)
+{
+    uint32_t q = prot & 7U;
+    int hp = 0;
+
+    if ((q & 4U) != 0U) {
+        q |= 1U;
+    }
+    if ((q & 2U) != 0U) {
+        q &= ~4U;
+    }
+    if ((q & 1U) != 0U) {
+        hp |= PROT_READ;
+    }
+    if ((q & 2U) != 0U) {
+        hp |= PROT_WRITE;
+    }
+    return hp;
+}
+
+/* Push the recorded guest protections of [va, end) to the host:
+ * union sync on A2 (one 16K/64K host page spans several 4 KiB guest
+ * sub-pages), exact mprotect on A1 (4 KiB 1:1). Contents are kept. */
+static void bridge_protect_host(ppc32_ctx_t *ctx, uint32_t va, uint32_t len,
+    uint32_t prot)
+{
+    uint32_t end = va + len;
+
+    if (len == 0U || ctx->guest_base == 0U) {
+        return;
+    }
+    if (vm32_is_a2()) {
+        (void)vm32_sync_host_range(va, end);
+        return;
+    }
+    (void)mprotect((void *)(uintptr_t)(ctx->guest_base + (uint64_t)va),
+        (size_t)len, bridge_host_prot(prot));
+}
+
+/* Is [va, end) fully covered by tracked regions? (Bridge-owned mirror
+ * of the vm32 mapping state; boot and SYNC_VM_PROT keep both in sync.
+ * Tolerates unsorted tables; page-aligned ranges only.) */
+static bool bridge_range_mapped(ppc32_ctx_t *ctx, uint32_t va, uint32_t end)
+{
+    uint32_t cur = va;
+
+    if (end <= va) {
+        return true;
+    }
+    while (cur < end) {
+        bool hit = false;
+        size_t k;
+
+        for (k = 0U; k < ctx->region_count; k++) {
+            if (cur >= ctx->regions[k].start &&
+                cur < ctx->regions[k].end) {
+                cur = ctx->regions[k].end;
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void apply_sync_prot(ppc32_ctx_t *ctx, uint32_t va, uint32_t len,
     uint32_t prot)
 {
@@ -218,24 +288,80 @@ static void apply_sync_prot(ppc32_ctx_t *ctx, uint32_t va, uint32_t len,
     if (len == 0U) {
         return;
     }
-    if (ctx->guest_base != 0U) {
-        /* mprotect only: preserves live bytes on upgrades and faults
-         * fresh zeros on first touch of sealed gaps. */
-        void *hva = (void *)(uintptr_t)(ctx->guest_base + (uint64_t)va);
-        int hp = (p == 0U) ? PROT_NONE : (PROT_READ | PROT_WRITE);
-        (void)mprotect(hva, len, hp);
-    }
-    vm32_record_protect(va, end, p);
-    if ((p & 4U) != 0U) {
-        vm32_mark_guest_exec(va, end);
-    }
-    vm32_tlb_invalidate_range(va, end);
-    ppc32_dbt_invalidate_range(ctx, va, end);
-    for (i = 0U; i < ctx->region_count; i++) {
-        if (ctx->regions[i].start < end && va < ctx->regions[i].end) {
-            ctx->regions[i].prot = prot & 7U;
+    if (!bridge_range_mapped(ctx, va, end)) {
+        /* Fresh mapping (unmapped-fault recovery): publish the range
+         * before syncing host protections so the A2 union sees it.
+         * Recording ANON (not PROTECT) is what clears the UNMAPPED
+         * state that would otherwise re-fault forever. */
+        vm32_record_map(va, end, p, (uint8_t)VM32_PAGE_ANON);
+        if ((p & 4U) != 0U) {
+            vm32_mark_guest_exec(va, end);
+        }
+        if (ctx->region_count < PPC32_MAX_REGIONS) {
+            ppc32_region_t *r = &ctx->regions[ctx->region_count++];
+
+            r->start = va;
+            r->end = end;
+            r->prot = p;
+            r->flags = 0U;
+            r->fd = -1;
+            r->offset = 0U;
+            r->name[0] = '\0';
+        }
+    } else {
+        vm32_record_protect(va, end, p);
+        if ((p & 4U) != 0U) {
+            vm32_mark_guest_exec(va, end);
+        }
+        for (i = 0U; i < ctx->region_count; i++) {
+            if (ctx->regions[i].start < end && va < ctx->regions[i].end) {
+                ctx->regions[i].prot = p;
+            }
         }
     }
+    bridge_protect_host(ctx, va, len, p);
+    vm32_tlb_invalidate_range(va, end);
+    ppc32_dbt_invalidate_range(ctx, va, end);
+}
+
+/* Handler code patch for G02 SMC (test_a stub rewrite): bytes written
+ * straight through the host mapping bypass the guest store path (and
+ * the DBT SMC hook), so widen the covering host pages, copy, and
+ * restore the recorded protections (A2 union, A1 exact). The caller
+ * still replies FLUSH_ICACHE so translated blocks covering
+ * [va, va+len) are dropped. Only for in-process handlers. */
+int ppc32_darwin_patch_code(uint64_t window_base, uint32_t va,
+    const void *src, size_t len, uint32_t restore_prot)
+{
+    size_t hp;
+    uint64_t s;
+    uint64_t e;
+
+    if (src == NULL || len == 0U || window_base == 0U) {
+        return -EINVAL;
+    }
+    hp = vm32_host_page_size();
+    if (hp == 0U || (hp & (hp - 1U)) != 0U) {
+        return -ENOSYS;
+    }
+    s = (uint64_t)va & ~(uint64_t)(hp - 1U);
+    e = ((uint64_t)va + (uint64_t)len + (uint64_t)hp - 1U) &
+        ~(uint64_t)(hp - 1U);
+    if (e <= s || e > 0x100000000ULL) {
+        return -EINVAL;
+    }
+    if (mprotect((void *)(uintptr_t)(window_base + s), (size_t)(e - s),
+        PROT_READ | PROT_WRITE) != 0) {
+        return -errno;
+    }
+    memcpy((void *)(uintptr_t)(window_base + (uint64_t)va), src, len);
+    if (vm32_is_a2()) {
+        (void)vm32_sync_host_range((uint32_t)s, (uint32_t)e);
+    } else if (mprotect((void *)(uintptr_t)(window_base + s),
+        (size_t)(e - s), bridge_host_prot(restore_prot)) != 0) {
+        return -errno;
+    }
+    return 0;
 }
 
 static void forward_trap(a32h_darwin_handler_fn fn, void *opaque,
@@ -425,6 +551,10 @@ int ppc32_darwin_boot(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
     if (ctx == NULL || fn == NULL) {
         return -EINVAL;
     }
+    /* Host SIGSEGV/SIGBUS translation for DBT-emitted loads/stores
+     * (and any direct host touch of the window): idempotent, must be
+     * installed before the first engine run on any thread. */
+    ppc32_hostfault_install();
     memset(ctx, 0, sizeof *ctx);
     memset(&boot, 0, sizeof boot);
     memset(vmaps, 0, sizeof vmaps);
@@ -463,21 +593,34 @@ int ppc32_darwin_boot(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
     if (use_mmap) {
         /* Seal unmapped gaps PROT_NONE, keeping handler-loaded bytes:
          * VMAs arrive sorted by the mock/hl loader; seal [0,first),
-         * between consecutive VMAs, and [last,4GiB). */
+         * between consecutive VMAs, and [last,4GiB). Sealing rounds
+         * to host pages (16 KiB on Darwin): a rounded seal may cover
+         * a VMA edge, but the per-VMA union sync below restores every
+         * mapped sub-page right after. */
+        size_t hp = vm32_host_page_size();
+        uint64_t mask = (hp == 0U) ? 0ULL : (uint64_t)(hp - 1U);
         uint64_t cursor = 0ULL;
         for (i = 0U; i < boot.vmap_count; i++) {
             uint64_t vs = (uint64_t)vmaps[i].va;
             if (vs > cursor) {
-                (void)mprotect((void *)(uintptr_t)(base + cursor),
-                    (size_t)(vs - cursor), PROT_NONE);
+                uint64_t s = cursor & ~mask;
+                uint64_t e = (vs + mask) & ~mask;
+                if (e > s) {
+                    (void)mprotect((void *)(uintptr_t)(base + s),
+                        (size_t)(e - s), PROT_NONE);
+                }
             }
             if (vs + (uint64_t)vmaps[i].len > cursor) {
                 cursor = vs + (uint64_t)vmaps[i].len;
             }
         }
         if (cursor < 0x100000000ULL) {
-            (void)mprotect((void *)(uintptr_t)(base + cursor),
-                (size_t)(0x100000000ULL - cursor), PROT_NONE);
+            uint64_t s = cursor & ~mask;
+            uint64_t e = 0x100000000ULL;
+            if (e > s) {
+                (void)mprotect((void *)(uintptr_t)(base + s),
+                    (size_t)(e - s), PROT_NONE);
+            }
         }
     }
     for (i = 0U; i < boot.vmap_count; i++) {
@@ -488,17 +631,18 @@ int ppc32_darwin_boot(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
         if (len == 0U) {
             continue;
         }
-        if (use_mmap) {
-            /* mprotect (not remap) so BOOT-loaded bytes survive. Host
-             * stays RW so the loader/handler can patch code; guest
-             * RO/NX is enforced by the vm32 Soft-TLB, not the host. */
-            void *hva = (void *)(uintptr_t)(base + (uint64_t)va);
-            int hp = (prot != 0U) ? (PROT_READ | PROT_WRITE) : PROT_NONE;
-            (void)mprotect(hva, len, hp);
-        }
         vm32_record_map(va, end, (uint8_t)prot, (uint8_t)VM32_PAGE_ANON);
         if ((prot & 4U) != 0U) {
             vm32_mark_guest_exec(va, end);
+        }
+        if (use_mmap) {
+            /* mprotect (not remap) so BOOT-loaded bytes survive.
+             * Guest-faithful host protections (RX->R, W^X): DBT
+             * faults on RO/NONE through the host, the Soft-TLB
+             * enforces 4 KiB precision for the interpreter, and
+             * handler code patches go through ppc32_darwin_patch_code
+             * (temporary widen + union restore). */
+            bridge_protect_host(ctx, va, len, prot);
         }
         if (ctx->region_count < PPC32_MAX_REGIONS) {
             ppc32_region_t *r = &ctx->regions[ctx->region_count++];

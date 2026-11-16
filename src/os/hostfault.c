@@ -86,6 +86,11 @@ static void hf_handler(int signo, siginfo_t *si, void *uc)
     siglongjmp(hf_jb, 1);
 }
 
+void ppc32_hostfault_leave(void)
+{
+    hf_armed = 0;
+}
+
 void ppc32_hostfault_install(void)
 {
     struct sigaction sa;
@@ -148,7 +153,13 @@ int ppc32_hostfault_run(ppc32_ctx_t *ctx, ppc32_hostfault_fn_t run)
                  xo == 1014U)) {
                 rc->fault_is_store = 1U;
             } else if (opcd == 4U &&
-                ((w & 0x7FFU) == 800U || (w & 0x7FFU) == 802U)) {
+                ((w & 0x7FFU) == 800U || (w & 0x7FFU) == 802U ||
+                (w & 0x7FFU) == 135U || (w & 0x7FFU) == 167U ||
+                (w & 0x7FFU) == 199U || (w & 0x7FFU) == 231U ||
+                (w & 0x7FFU) == 487U)) {
+                /* SPE 64-bit indexed stores (800/802) and the G4 VMX
+                 * vector stores (stvebx/stvehx/stvewx/stvx/stvxl):
+                 * all primary-4 store shapes report WRITE. */
                 rc->fault_is_store = 1U;
             }
         }

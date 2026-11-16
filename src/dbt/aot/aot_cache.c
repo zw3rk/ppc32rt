@@ -79,6 +79,20 @@ bool ppc32_aot_header_ok(const ppc32_aot_hdr_t *hdr)
     return true;
 }
 
+uint32_t ppc32_aot_personality_tag(uint64_t personality_hash)
+{
+    return (uint32_t)(personality_hash ^ (personality_hash >> 32U));
+}
+
+bool ppc32_aot_personality_ok(const ppc32_aot_hdr_t *hdr,
+    uint64_t personality_hash)
+{
+    if (hdr == NULL) {
+        return false;
+    }
+    return hdr->personality == ppc32_aot_personality_tag(personality_hash);
+}
+
 int ppc32_aot_append(int cache_fd, uint32_t guest_pc_base,
     const void *code, uint32_t code_len, const vm32_mem_site_t *sites,
     uint32_t site_count)
