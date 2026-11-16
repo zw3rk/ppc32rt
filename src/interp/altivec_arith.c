@@ -285,7 +285,7 @@ void ppc32_vmx_fp(ppc32_ctx_t *ctx, const ppc32_insn_t *insn, uint32_t x)
         for (lane = 0U; lane < 4U; lane++) {
             float a = vmx_nj_flush(ctx, vr_f32(ctx, insn->ra, lane));
             float b = vmx_nj_flush(ctx, vr_f32(ctx, insn->rb, lane));
-            float r = (isnan(a) || isnan(b)) ? (0.0f / 0.0f) :
+            float r = (isnan(a) || isnan(b)) ? NAN :
                 (x == 1034u ? fmaxf(a, b) : fminf(a, b));
 
             vr_set_f32(ctx, insn->rt, lane, vmx_nj_flush(ctx, r));

@@ -55,6 +55,7 @@ void bridge_mirror_remove(ppc32_ctx_t *ctx);
 void bridge_mirrors_reset(void);
 void bridge_register_vma(uint32_t va, uint32_t end, uint8_t prot,
     uint64_t window_base);
-void bridge_apply_sync_prot(uint32_t va, uint32_t len, uint32_t prot);
+void bridge_apply_sync_prot(ppc32_ctx_t *caller_ctx, uint32_t va,
+    uint32_t len, uint32_t prot);
 
 #endif /* PPC32RT_OS_DARWIN_BRIDGE_PRIV_H */

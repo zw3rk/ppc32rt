@@ -111,6 +111,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     memset(b, 0, sizeof(*b));
     b->words = storage;
     b->cap   = cap;
+    b->low_guard_pages = 16U;
 }
 
 /* The self-loop peeling hook returns with the Phase 2/3 DBT if needed. */

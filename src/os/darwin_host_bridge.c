@@ -443,7 +443,7 @@ int bridge_handle_exit(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
         A32H_DACT_FLUSH_ICACHE | A32H_DACT_SPAWN_THREAD)) != 0U) {
         pthread_mutex_lock(&g_bridge_mu);
         if ((trap.reply_action & (uint32_t)A32H_DACT_SYNC_VM_PROT) != 0U) {
-            bridge_apply_sync_prot(trap.prot_va, trap.prot_len,
+            bridge_apply_sync_prot(ctx, trap.prot_va, trap.prot_len,
                 trap.prot_flags);
         }
         if ((trap.reply_action & (uint32_t)A32H_DACT_FLUSH_ICACHE) != 0U &&

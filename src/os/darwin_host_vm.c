@@ -260,7 +260,8 @@ static bool bridge_range_mapped(uint32_t va, uint64_t end64)
     return true;
 }
 
-void bridge_apply_sync_prot(uint32_t va, uint32_t len, uint32_t prot)
+void bridge_apply_sync_prot(ppc32_ctx_t *caller_ctx, uint32_t va,
+    uint32_t len, uint32_t prot)
 {
     uint64_t end64 = (uint64_t)va + (uint64_t)len;
     uint8_t p = (uint8_t)(prot & 7U);
@@ -274,7 +275,10 @@ void bridge_apply_sync_prot(uint32_t va, uint32_t len, uint32_t prot)
     if (p == 0U) {
         /* munmap: clear stale bytes, drop the vm32 record, recompute host
          * protections (A2 sub-page union or A1 exact MAP_FIXED PROT_NONE),
-         * carve every mirror, and invalidate TLB + DBT across all mirrors. */
+         * carve every mirror, and invalidate TLB + DBT (cache.c bumps
+         * g_cache_epoch globally under s_cache_lock; only caller_ctx's own
+         * IBTC/RAS is cleared synchronously so sibling threads are never
+         * poked cross-thread). */
         uint64_t s64 = (uint64_t)va & ~0xFFFULL;
         uint64_t e64 = (end64 + 0xFFFULL) & ~0xFFFULL;
         uint64_t gbase = g_mirrors[0]->guest_base;
@@ -319,9 +323,7 @@ void bridge_apply_sync_prot(uint32_t va, uint32_t len, uint32_t prot)
             mirror_carve_remove(g_mirrors[m], s32, e32);
         }
         vm32_tlb_invalidate_range(s32, e32);
-        for (m = 0U; m < g_mirror_n; m++) {
-            ppc32_dbt_invalidate_range(g_mirrors[m], s32, e32);
-        }
+        ppc32_dbt_invalidate_range(caller_ctx, s32, e32);
         return;
     }
     if (!bridge_range_mapped(va, end64)) {
@@ -345,9 +347,7 @@ void bridge_apply_sync_prot(uint32_t va, uint32_t len, uint32_t prot)
     }
     bridge_protect_host(g_mirrors[0]->guest_base, va, len, p);
     vm32_tlb_invalidate_range(va, end32);
-    for (m = 0U; m < g_mirror_n; m++) {
-        ppc32_dbt_invalidate_range(g_mirrors[m], va, end32);
-    }
+    ppc32_dbt_invalidate_range(caller_ctx, va, end32);
 }
 
 /* Handler code patch for G02 SMC (test_a stub rewrite): bytes written
