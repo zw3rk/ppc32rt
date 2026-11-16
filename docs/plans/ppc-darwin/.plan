@@ -1,0 +1,68 @@
+# PowerPC Darwin OS personality for hyper-linux.app — .plan
+
+Status: proposed / not executed. The 20 `.goal` cards are executable work items.
+
+## Scope
+PowerPC Mac OS X 10.4/10.5 32-bit guest applications through `hl`, with wine-style guest libraries and native user-provided historical system bundle modes. CLI and guest OS compatibility here; UI implementation tracked separately in `ppc-darwin-ui`.
+
+## Architectural placement
+Existing `ppc32rt` stays tiny; `hl` owns guest Mach-O, dyld, Mach/BSD personality, framework resolution and application lifecycle. Reuse iOS implementation after code inspection; never assume ABI identity.
+
+## Established inputs (user-reported; not independently verified)
+- `hyper-linux.app` (`hl`) already has Android APK graphics/input/audio (`hl Minecraft.apk`), iOS UI work, X11 (`hl XMMS` partially works), and iOS guest Mach-O/Mach facilities in wine-style and native-bundle modes.
+- Treat these as existing capabilities to inspect and reuse, not as verified guarantees for PowerPC Darwin.
+
+## Two compatibility modes
+- **Wine-style**: `hl` supplies guest ABI-compatible compatibility libraries, shims and stubs; explicit errors for unsupported APIs.
+- **Native**: user-supplied historical PPC Darwin system/framework bundle, dyld and frameworks executed as guest code where feasible; `hl` supplies kernel, service and presentation contracts.
+- Mixed resolution must be deterministic, auditable and avoid host/guest ABI confusion.
+
+## Ownership
+- `ppc32rt`: minimal guest execution engine, CPU/exception state, guest-memory operations and narrow trap callback ABI; no Mach-O framework policy, windowing or audio.
+- `hyper-linux.app`: app discovery, Mach-O loading, dyld/framework resolution, Mach/BSD personality, lifecycle, service bridge, graphics, input, audio, X11, testing and packaging.
+- Cross-repo interface must be versioned and independently testable; copy-first rt-series invariants remain intact.
+
+## Dependencies and work waves
+- G01 `baseline-and-target-matrix` [hl + ppc32rt]; depends on none
+- G02 `cross-repo-execution-contract` [cross-repo]; depends on G01
+- G03 `mach-o-fat-admission` [hl]; depends on G01–G02
+- G04 `ppc-darwin-cpu-profile` [ppc32rt]; depends on G02
+- G05 `process-stack-and-commpage` [hl]; depends on G03–G04
+- G06 `darwin-vm-and-fault-bridge` [hl + ppc32rt]; depends on G02–G05
+- G07 `wine-style-stub-library-runtime` [hl]; depends on G03–G06
+- G08 `native-framework-bundle-discovery` [hl]; depends on G03
+- G09 `dyld-and-macho-binding` [hl]; depends on G05,G07–G08
+- G10 `bsd-traps-and-posix` [hl]; depends on G04,G06
+- G11 `mach-traps-and-ipc` [hl]; depends on G04,G10
+- G12 `threads-tls-and-pthreads` [hl + ppc32rt]; depends on G06,G10–G11
+- G13 `signals-mach-exceptions-unwind` [hl + ppc32rt]; depends on G06,G11–G12
+- G14 `filesystem-bundles-and-resources` [hl]; depends on G03,G10
+- G15 `native-libsystem-corefoundation-bootstrap` [hl]; depends on G08–G14
+- G16 `dbt-parity-and-aot-isolation` [ppc32rt]; depends on G04,G06,G09–G13
+- G17 `hl-cli-and-app-launch` [hl]; depends on G03,G07–G09,G14
+- G18 `ui-contract-handoff` [hl]; depends on G11,G15,G17
+- G19 `security-and-differential-qualification` [QA]; depends on G01–G18
+- G20 `release-matrix-and-documentation` [QA + hl]; depends on G16–G19
+
+## Parallel lanes
+Lane A: ppc32rt CPU/trap; Lane B: hl Mach-O/dyld; Lane C: hl Mach/BSD/threads; Lane D: bundle and native libraries; Lane E: qualification and security.
+
+## Integration gates
+- Gate A: inventory current `hl`/iOS/Android/X11 functionality and preserve known-good behavior.
+- Gate B: minimal PowerPC Darwin static CLI under interpreter; malformed binaries rejected safely.
+- Gate C: wine-style dynamic CLI and native-bundle dynamic CLI independently verified.
+- Gate D: interpreter/DBT parity and Mach/BSD/thread/fault correctness under repeatable tests.
+- Gate E: UI tests include real windows, input, audio and lifecycle; X11, Carbon and Cocoa reported separately, not conflated.
+- Gate F: security, regressions, cold/warm AOT, licensing/provenance and release matrix reviewed.
+
+## Risk register
+Historical Darwin PPC trap and framework ABIs differ from iOS; guest kernel and service expectations remain difficult. System bundle licensing and provenance must be respected.
+
+## Qualification and reporting
+Use `rt-series` broad then subsystem-specific convergence audits; verify on actual supported host environments, record fixture hashes and commands, compare interpreter/DBT and external reference where available. Do not claim QEMU Linux user-mode is a Darwin OS oracle.
+
+## Out of scope
+Classic Mac OS 9, arbitrary macOS versions, unlicensed redistribution, guaranteed complete Carbon/Cocoa compatibility, and ppc64 Darwin without a separate feasibility gate.
+
+## Completion
+All 20 cards closed with reproducible evidence and no untriaged high-severity defects for the declared release profile.

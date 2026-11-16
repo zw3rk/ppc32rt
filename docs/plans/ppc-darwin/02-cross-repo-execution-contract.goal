@@ -1,0 +1,34 @@
+# G02 — Cross Repo Execution Contract
+
+Project: PowerPC Darwin OS personality for hyper-linux.app  
+Status: proposed; implementation and tests not yet performed  
+Owner: cross-repo  
+Dependencies: G01
+
+## Objective
+Define narrow versioned guest execution, memory, traps, exceptions, callbacks and cancellation between hl and ppc32rt.
+
+## Implementation contract
+- Existing `ppc32rt` stays tiny; `hl` owns guest Mach-O, dyld, Mach/BSD personality, framework resolution and application lifecycle. Reuse iOS implementation after code inspection; never assume ABI identity.
+- Preserve existing working Android, iOS, Linux/X11 and Linux PowerPC paths; establish baseline tests before editing shared code.
+- Treat guest pointers, strings, handles, Mach messages, files, graphics resources and executable metadata as untrusted; validate bounds, lifetime and ownership.
+- Keep `ppc32rt` small: ISA, CPU state, interpreter, AArch64 DBT, guest memory and narrow traps only; put Darwin OS and UI behavior in `hyper-linux.app` (`hl`).
+- Support both wine-style compatibility/stub-library mode and native mode using a user-supplied, legally obtained historical Mac OS X framework/system bundle; never ship proprietary system libraries.
+- Use real fixtures and distinguish observed behavior from unimplemented assumptions. Preserve host/guest page-size and endian separation.
+
+## Deliverables
+Versioned contract and small integration harness.
+
+## Acceptance gate
+Static PPC test executes via hl without OS code added to ppc32rt.
+- Add positive, negative, malformed-input, fault and regression coverage appropriate to this goal; include exact commands, fixture provenance, host/guest versions and observed results.
+- Record dependencies, blockers, reviewed code, and reproducible evidence in the goal closeout. No unsupported success claims.
+
+## Boundaries and risks
+Historical Darwin PPC trap and framework ABIs differ from iOS; guest kernel and service expectations remain difficult. System bundle licensing and provenance must be respected.
+
+## Closeout checklist
+- [ ] Implementation reviewed and committed
+- [ ] Focused tests and regressions executed with recorded results
+- [ ] Integration behavior verified in `hl` where applicable
+- [ ] Limitations, unsupported cases and security concerns documented
