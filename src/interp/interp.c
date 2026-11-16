@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "ppc32rt.h"
+#include "interp/altivec.h"
 #include "interp/interp.h"
 #include "interp/fp.h"
 #include "vm/vm32.h"
@@ -822,8 +823,29 @@ void interp_step(ppc32_ctx_t *ctx)
     case PPC32_OP_FPU_SINGLE:
     case PPC32_OP_FPU_DOUBLE:
     case PPC32_OP_FPU_X:
-    case PPC32_OP_SPE:
         ppc32_fp_step(ctx, &insn);
+        break;
+    case PPC32_OP_SPE:
+        /* Shared primary-4 encoding: SPE profile runs the SPE
+         * handler, otherwise the G4 VMX handler (which UNDEFs
+         * non-VMX XOs, preserving classic strictness). */
+        if (ctx->is_spe != 0U) {
+            ppc32_fp_step(ctx, &insn);
+        } else {
+            ppc32_altivec_step(ctx, &insn);
+        }
+        break;
+    case PPC32_OP_VMX:
+        /* Overlapping primary-4 XOs (e.g. 1220): SPE profile runs
+         * the SPE meaning, otherwise the VMX meaning. */
+        if (ctx->is_spe != 0U) {
+            ppc32_fp_step(ctx, &insn);
+        } else {
+            ppc32_altivec_step(ctx, &insn);
+        }
+        break;
+    case PPC32_OP_VMX_LDST:
+        ppc32_vmx_ldst_step(ctx, &insn);
         break;
     default:
         ctx->exit_reason = PPC32_EXIT_UNDEF;

@@ -151,7 +151,9 @@ typedef enum ppc32_op {
     PPC32_OP_LSWI,  /* 597 */ PPC32_OP_LSWX,  /* 533 */
     PPC32_OP_STSWI, /* 725 */ PPC32_OP_STSWX, /* 661 */
     PPC32_OP_DCBT,  /* 278 dcbt / 246 dcbtst: cache-hint nop */
-    PPC32_OP_DCBZ   /* 1014 dcbz: zero 32-byte block at EA (user Book I) */
+    PPC32_OP_DCBZ,  /* 1014 dcbz: zero 32-byte block at EA (user Book I) */
+    PPC32_OP_VMX,   /* 4: G4 AltiVec vector arithmetic (XO-dispatched) */
+    PPC32_OP_VMX_LDST /* 31: G4 AltiVec vector loads/stores (XO-dispatched) */
 } ppc32_op_t;
 
 /* Decoded instruction. Only the fields meaningful to `op` (see above)

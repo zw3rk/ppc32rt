@@ -82,17 +82,47 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
     case 3u: /* twi */
         ppc_decode_dform(raw, (uint32_t)PPC32_OP_TWI, out);
         return 0;
-    case 4u: /* e500v2 SPE: full 11-bit XO incl. Rc slot (E03) */
-        out->op = (uint32_t)PPC32_OP_SPE;
+    case 4u: /* G4 VMX vs e500v2 SPE: full 11-bit XO incl. Rc (E03).
+        * VMX XOs decode to PPC32_OP_VMX (profile-dispatched in
+        * interp); all other primary-4 words stay SPE. bi carries the
+        * VA-form VRC field (bits 21-25) for 4-register VMX ops. */
         out->rt = (uint8_t)((raw >> 21u) & 31u);
         out->rs = out->rt;
         out->ra = (uint8_t)((raw >> 16u) & 31u);
         out->rb = (uint8_t)((raw >> 11u) & 31u);
         out->xo = raw & 0x7ffu;
         out->rc = (uint8_t)(raw & 1u);
+        out->bi = (uint8_t)((raw >> 6u) & 31u);
         out->si = (int32_t)(int16_t)(raw & 0xffffu);
         out->d = out->si;
         out->ui = raw & 0xffffu;
+        {
+            uint32_t x = raw & 0x7ffu;
+            uint32_t b = x & ~1u;
+            uint32_t v = x & 63u;
+
+            if (v == 42u || v == 43u || v == 44u || v == 46u ||
+                v == 47u || b == 0u || b == 64u || b == 128u ||
+                b == 10u || b == 74u || b == 6u || b == 70u ||
+                b == 134u || b == 518u || b == 582u || b == 646u ||
+                b == 774u || b == 838u || b == 902u || b == 524u ||
+                b == 588u || b == 652u || b == 780u || b == 844u ||
+                b == 908u || b == 12u || b == 76u || b == 140u ||
+                b == 268u || b == 332u || b == 396u || b == 14u ||
+                b == 78u || b == 142u || b == 206u || b == 270u ||
+                b == 334u || b == 398u || b == 462u || b == 526u ||
+                b == 590u || b == 196u || b == 198u || b == 200u ||
+                b == 202u || b == 204u || b == 262u || b == 264u ||
+                b == 266u || b == 272u || b == 274u || b == 276u ||
+                b == 1024u || b == 1088u || b == 1152u ||
+                b == 1028u || b == 1092u || b == 1156u ||
+                b == 1188u || b == 1220u || b == 1284u ||
+                b == 1540u || b == 1604u) {
+                out->op = (uint32_t)PPC32_OP_VMX;
+                return 0;
+            }
+        }
+        out->op = (uint32_t)PPC32_OP_SPE;
         return 0;
     case 7u: /* mulli */
         ppc_decode_dform(raw, (uint32_t)PPC32_OP_MULLI, out);
@@ -458,7 +488,22 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
     case 246u: /* dcbtst (ANALYTICAL XO): cache-hint nop */
     case 278u: /* dcbt (ANALYTICAL XO): cache-hint nop */
     case 54u: /* dcbst: block store (write-back hint); nop in emulation */
+    case 86u: /* dcbf: flush hint; address-checked nop in emulation */
         out->op = (uint32_t)PPC32_OP_DCBT;
+        return 0;
+    case 6u: /* lvsl: permute control for alignment */
+    case 38u: /* lvsr: permute control for alignment */
+    case 7u: /* lvebx: vector load byte element */
+    case 39u: /* lvehx: vector load half element */
+    case 71u: /* lvewx: vector load word element */
+    case 103u: /* lvx: 16-byte aligned vector load */
+    case 135u: /* stvebx: vector store byte element */
+    case 167u: /* stvehx: vector store half element */
+    case 199u: /* stvewx: vector store word element */
+    case 231u: /* stvx: 16-byte aligned vector store */
+    case 359u: /* lvxl: locked vector load (hint ignored) */
+    case 487u: /* stvxl: locked vector store (hint ignored) */
+        out->op = (uint32_t)PPC32_OP_VMX_LDST;
         return 0;
     case 247u:
         out->op = (uint32_t)PPC32_OP_STBUX;
@@ -587,6 +632,14 @@ int ppc_decode(uint32_t raw, ppc32_insn_t *out)
         return 0;
     case 1014u: /* dcbz: zero 32-byte block (user-mode, Book I) */
         out->op = (uint32_t)PPC32_OP_DCBZ;
+        return 0;
+    case 758u: /* dcba: allocate zero block hint; same as dcbz here */
+        out->op = (uint32_t)PPC32_OP_DCBZ;
+        return 0;
+    case 342u: /* dst/dstt: data stream touch (transient/persistent) */
+    case 374u: /* dstst/dststt: stream touch for store */
+    case 822u: /* dss/dssall: stream stop (STRM field selects all) */
+        out->op = (uint32_t)PPC32_OP_SYNC;
         return 0;
     case 918u:
         out->op = (uint32_t)PPC32_OP_STHBRX;

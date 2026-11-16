@@ -61,7 +61,8 @@ static void usage(FILE *out)
         "  ppc32rt [--interp | --dbt] [--difftest] [--trace]\n"
         "          [--profile classic|spe] [--sysroot DIR] [--window HEX]\n"
         "          [--cache DIR | --aot-cache FILE]\n"
-        "          [--execfn PATH] [--image-fd FD] [--no-host] -- PATH [ARGS...]\n"
+        "          [--execfn PATH] [--image-fd FD] [--no-host]\n"
+        "          [--personality darwin-host] [--darwin-boot] -- PATH [ARGS...]\n"
         "  ppc32rt --help\n"
         "  ppc32rt --version\n"
         "\n"
@@ -168,6 +169,12 @@ static int parse_args(ppc32_ctx_t *ctx, int argc, char **argv)
             i++;
             continue;
         }
+        if (strcmp(argv[i], "--darwin-boot") == 0) {
+            extern void ppc32_darwin_set_cli(const char *p, bool b);
+            ppc32_darwin_set_cli(NULL, true);
+            i++;
+            continue;
+        }
         if (argv[i][0] != '-') {
             return i;
         }
@@ -178,6 +185,9 @@ static int parse_args(ppc32_ctx_t *ctx, int argc, char **argv)
             if (ppc32_parse_profile(argv[i + 1], &ctx->profile) != 0) {
                 return -1;
             }
+        } else if (strcmp(argv[i], "--personality") == 0) {
+            extern void ppc32_darwin_set_cli(const char *p, bool b);
+            ppc32_darwin_set_cli(argv[i + 1], false);
         } else {
             return -1;
         }
@@ -295,6 +305,15 @@ int main(int argc, char **argv)
         return 2;
     }
     apply_env(&ctx);
+    {
+        extern bool ppc32_darwin_personality_active(void);
+        if (ppc32_darwin_personality_active()) {
+            fputs("ppc32rt: darwin-host personality needs /dev/a32host"
+                " (hl); host unit tests use ppc32_run_darwin_with_handler\n",
+                stderr);
+            return 2;
+        }
+    }
     /* Host protection-fault translation (hostfault.h): guest accesses
      * that violate page permissions revive at the engine checkpoints
      * with FAULT recorded; anything else still crashes loudly. */

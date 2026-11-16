@@ -115,7 +115,13 @@ test: check-abi-invariants build-darwin ## Run host ABI and P32 defect regressio
 		tests/check_p32_r13_defects.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_r13_defects && \
-	./$(BUILD_DIR)/check_p32_r13_defects
+	./$(BUILD_DIR)/check_p32_r13_defects && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_darwin_g02.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_darwin_g02 && \
+	./$(BUILD_DIR)/check_p32_darwin_g02
 
 # macOS hides MAP_ANON (no MAP_ANONYMOUS) once _POSIX_C_SOURCE is
 # defined, which would break the host syntax check below; the Linux/musl

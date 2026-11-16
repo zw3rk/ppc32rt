@@ -798,6 +798,11 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
                 ctx->gpr[insn->rt] = (ctx->profile == PPC32_PROFILE_SPE) ?
                     PPC32_PVR_E500V2 : PPC32_PVR_750;
                 break;
+            case PPC32_SPR_VRSAVE:
+                /* G04: VRSAVE is user-accessible on the Darwin G4
+                 * profile (every 10.4/10.5 prologue uses it). */
+                ctx->gpr[insn->rt] = ctx->vrsave;
+                break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
             }
         } else {
@@ -812,6 +817,9 @@ static inline void interp_exec_cr_spr(ppc32_ctx_t *ctx,
                     break;
                 }
                 ctx->spefscr = ctx->gpr[insn->rs] & SPE_WRITABLE;
+                break;
+            case PPC32_SPR_VRSAVE:
+                ctx->vrsave = ctx->gpr[insn->rs];
                 break;
             default: ctx->exit_reason = PPC32_EXIT_UNDEF; break;
             }

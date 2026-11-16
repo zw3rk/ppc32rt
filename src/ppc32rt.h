@@ -31,6 +31,7 @@
 #define PPC32_SPR_XER 1U
 #define PPC32_SPR_LR  8U
 #define PPC32_SPR_CTR 9U
+#define PPC32_SPR_VRSAVE 256U
 #define PPC32_SPR_SPEFSCR 512U
 /* e500v2 SPEFSCR (P32-R7-13; EREF/SPEPEM Table 2-35, PSIM
  * e500_registers.h): sticky status, current-op status, enables, and the
@@ -286,6 +287,20 @@ typedef struct ppc32_ctx {
      * reclaimer frees a retired block only once every registered ctx
      * has synced past it, so threads inside chained code stay safe. */
     uint32_t ibtc_synced_epoch;
+
+    /* G04 Darwin G4 AltiVec (VMX) state: 32 x 128-bit big-endian
+     * vector registers plus VSCR and VRSAVE (SPR 256). C-only tail,
+     * outside the ABI-locked prefix; interp, DBT fallback, and the
+     * G02 bridge share these fields. vr[r][0] holds the most
+     * significant byte (big-endian lane order). */
+    uint8_t vr[32][16];
+    uint32_t vscr;
+    uint32_t vrsave;
+
+    /* G02 Darwin bridge per-thread state (C-only tail). */
+    uint32_t darwin_tls_tp;
+    uint32_t darwin_tid;
+    uint64_t darwin_aot_hash;
 
 } ppc32_ctx_t;
 
