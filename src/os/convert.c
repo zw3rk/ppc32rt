@@ -577,3 +577,139 @@ int ppc32_flock64_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
     hs->l_pid = (pid_t)(int32_t)ppc32_be32((uint32_t)gs.l_pid);
     return 0;
 }
+
+int ppc32_errno_map(int host_errno)
+{
+#ifdef __APPLE__
+    /* Darwin errno values match PowerPC Linux (asm-generic, which
+     * arch/powerpc follows except EDEADLK/EDEADLOCK = 58) only for
+     * codes 1..34. Every code above diverges (sockets 38..65 map to
+     * 88..113, ETIMEDOUT 60 to 110, ENOLCK 77 to 37, ...), so
+     * translate symbolically. Unknown codes degrade to EIO (5) so a
+     * raw Darwin code never leaks into the guest. */
+    if (host_errno == EDEADLK) {
+        return 58;
+    }
+    if (host_errno <= 34) {
+        return host_errno;
+    }
+    switch (host_errno) {
+    case EAGAIN: /* EWOULDBLOCK aliases EAGAIN on Darwin */
+        return 11;
+    case ENAMETOOLONG:
+        return 36;
+    case ENOLCK:
+        return 37;
+    case ENOSYS:
+        return 38;
+    case ENOTEMPTY:
+        return 39;
+    case ELOOP:
+        return 40;
+    case ENOMSG:
+        return 42;
+    case EIDRM:
+        return 43;
+    case ENOSTR:
+        return 60;
+    case ENODATA:
+        return 61;
+    case ETIME:
+        return 62;
+    case ENOSR:
+        return 63;
+    case EREMOTE:
+        return 66;
+    case ENOLINK:
+        return 67;
+    case EPROTO:
+        return 71;
+    case EMULTIHOP:
+        return 72;
+    case EBADMSG:
+        return 74;
+    case EOVERFLOW:
+        return 75;
+    case EILSEQ:
+        return 84;
+    case EUSERS:
+        return 87;
+    case ENOTSOCK:
+        return 88;
+    case EDESTADDRREQ:
+        return 89;
+    case EMSGSIZE:
+        return 90;
+    case EPROTOTYPE:
+        return 91;
+    case ENOPROTOOPT:
+        return 92;
+    case EPROTONOSUPPORT:
+        return 93;
+    case ESOCKTNOSUPPORT:
+        return 94;
+    case EOPNOTSUPP:
+    case ENOTSUP:
+        return 95;
+    case EPFNOSUPPORT:
+        return 96;
+    case EAFNOSUPPORT:
+        return 97;
+    case EADDRINUSE:
+        return 98;
+    case EADDRNOTAVAIL:
+        return 99;
+    case ENETDOWN:
+        return 100;
+    case ENETUNREACH:
+        return 101;
+    case ENETRESET:
+        return 102;
+    case ECONNABORTED:
+        return 103;
+    case ECONNRESET:
+        return 104;
+    case ENOBUFS:
+        return 105;
+    case EISCONN:
+        return 106;
+    case ENOTCONN:
+        return 107;
+    case ESHUTDOWN:
+        return 108;
+    case ETOOMANYREFS:
+        return 109;
+    case ETIMEDOUT:
+        return 110;
+    case ECONNREFUSED:
+        return 111;
+    case EHOSTDOWN:
+        return 112;
+    case EHOSTUNREACH:
+        return 113;
+    case EALREADY:
+        return 114;
+    case EINPROGRESS:
+        return 115;
+    case ESTALE:
+        return 116;
+    case EDQUOT:
+        return 122;
+    case ECANCELED:
+        return 125;
+    case EOWNERDEAD:
+        return 130;
+    case ENOTRECOVERABLE:
+        return 131;
+#ifdef ENOATTR
+    case ENOATTR:
+        return 61;
+#endif
+    default:
+        break;
+    }
+    return 5;
+#else
+    return host_errno;
+#endif
+}

@@ -54,10 +54,8 @@ static int dbt_fallback_emit(a64_buf_t *b, const ppc32_insn_t *insn,
 
 static ppc32_emit_fn s_user_emitter = dbt_fallback_emit;
 
-/* H1 SMC: snapshot recorder (defined in cache.c; the smc_store
- * hook and bitmap base now live in dbt.h for the syscall layer). */
-extern void ppc32_cache_record_guest(ppc32_ctx_t *ctx, ppc32_block_t *e,
-    uint32_t start, uint32_t end);
+/* H1 SMC: guest-range staging lives in cache.c (see dbt.h);
+ * ppc32_cache_install publishes the staged snapshot under lock. */
 
 /* H1 SMC: classify natively-emitted guest stores. Returns true with
  * *len_out = stored byte count and *back_out = how far w22 (the EA)
@@ -541,10 +539,11 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
                 b.guest_start_pc = pc;
                 a64_emit_exit_undef(&b, cur);
                 b.guest_end_pc = cur;
+                /* H1 SMC: stage the guest range so install
+                 * publishes pad0/edge under lock. */
+                ppc32_cache_stage_guest(ctx, pc, cur);
                 e = ppc32_cache_install(ctx, pc, staging, b.count,
                     NULL, 0U, false, 0U);
-                /* H1 SMC: empty guest range (fallback block). */
-                ppc32_cache_record_guest(ctx, e, pc, cur);
                 return e;
             }
             /* Partial block: valid fallthrough-chaining tail. */
@@ -576,10 +575,11 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
         b.guest_start_pc = pc;
         a64_emit_exit_undef(&b, pc);
         b.guest_end_pc = pc;
+        /* H1 SMC: stage the guest range so install
+         * publishes pad0/edge under lock. */
+        ppc32_cache_stage_guest(ctx, pc, pc);
         e = ppc32_cache_install(ctx, pc, staging, b.count, NULL, 0U,
             false, 0U);
-        /* H1 SMC: empty guest range (fallback block). */
-        ppc32_cache_record_guest(ctx, e, pc, pc);
         return e;
     }
     b.guest_end_pc = cur;
@@ -587,6 +587,10 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
      * for direct-chain backfill even while the TEMPORARY all-fallback
      * emitter is active (count is 0 then: harmless). */
     {
+        /* H1 SMC: stage the translated guest bytes for dispatch
+         * re-verification (covers interpreter stores and restores);
+         * install publishes the snapshot under lock. */
+        ppc32_cache_stage_guest(ctx, pc, cur);
         ppc32_block_t *e = ppc32_cache_install(ctx, pc, staging, b.count,
             b.exit_slot_pcs, b.exit_slot_count, b.is_call, cur);
 
@@ -595,9 +599,6 @@ static ppc32_block_t *dbt_translate(ppc32_ctx_t *ctx, uint32_t pc)
             ctx->exit_reason = PPC32_EXIT_FAULT;
             return NULL;
         }
-        /* H1 SMC: snapshot the translated guest bytes for dispatch
-         * re-verification (covers interpreter stores and restores). */
-        ppc32_cache_record_guest(ctx, e, pc, cur);
         return e;
     }
 }

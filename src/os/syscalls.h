@@ -62,6 +62,29 @@ int ppc32_dyn_dispatch(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
     uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5,
     long *out_ret);
 
+/* Path resolution shared by the dyn/fs layers: sysroot-mapped absolute
+ * paths with raw-path fallback. `out` must hold PPC32_PATH_MAX bytes.
+ * Returns 0 or a negative errno. */
+long ppc32_path_resolve(ppc32_ctx_t *ctx, uint32_t path_va, char *out);
+/* Mutation-side resolution shared by creating opens (O_CREAT/O_TMPFILE)
+ * and every filesystem mutation: an absolute guest path stays under the
+ * sysroot whenever its parent directory exists there, else the raw host
+ * path is used. Same buffer contract. */
+long ppc32_path_resolve_mut(ppc32_ctx_t *ctx, uint32_t path_va,
+    char *out);
+
+/* T1-T4 fs layer (syscalls_fs.c): chdir/fchdir, *at family, chmod/
+ * chown, link/rename/mkdir/rmdir/symlink, utimensat, truncate64,
+ * sync. Returns 1 with `*out_ret` set when owned. */
+int ppc32_fs_dispatch(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
+    uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5,
+    long *out_ret);
+
+/* T1-T4 select/poll/mknodat layer (syscalls_poll.c). */
+int ppc32_poll_dispatch(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
+    uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5,
+    long *out_ret);
+
 /* RC4 inline clone child (main.c): drive `child` to guest exit on the
  * calling host thread through the child's own engine loop (syscall
  * dispatch, fault/trap delivery, exit interception). Returns the guest

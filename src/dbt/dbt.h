@@ -66,8 +66,11 @@
  * block budget so --difftest compares equal-length chunks). */
 #define PPC32_DBT_BLOCK_BUDGET 64U
 
-/* Direct-mapped translation cache size (power of two). */
-#define PPC32_DBT_HT_BITS 10U
+/* Direct-mapped translation cache size (power of two). 2^18 slots
+ * (2 MiB of pointers): python3's ~4 MiB text thrashed the old 2^10
+ * table into a retranslate-every-dispatch crawl (>99% miss), and 2^16
+ * still conflict-missed ~40% of its startup translations. */
+#define PPC32_DBT_HT_BITS 18U
 #define PPC32_DBT_HT_SIZE (1U << PPC32_DBT_HT_BITS)
 
 /* Per-op emitter callback (lane L2c owns the implementation). */
@@ -138,12 +141,15 @@ void ppc32_smc_store(ppc32_ctx_t *ctx, uint32_t ea, uint32_t len,
 /* P1 inline-guard base: occupancy bitmap over guest 4 KiB pages. */
 const uint64_t *ppc32_code_pages_base(void);
 ppc32_block_t *ppc32_cache_lookup(ppc32_ctx_t *ctx, uint32_t pc);
+/* Stage the translated guest range snapshot (outside s_cache_lock);
+ * the next ppc32_cache_install publishes it before s_table[idx] = e. */
+void ppc32_cache_stage_guest(ppc32_ctx_t *ctx, uint32_t start, uint32_t end);
 ppc32_block_t *ppc32_cache_install(ppc32_ctx_t *ctx, uint32_t pc,
     const uint32_t *words, size_t nwords, const uint32_t *slot_pcs,
     unsigned nslots, bool is_call, uint32_t ret_pc);
-/* P32-R6-1: flush this ctx's IBTC/RAS when its entries predate the
- * current generation, and record ctx->ibtc_synced_epoch for the
- * quiescent reclaimer. The dispatch loop calls this before lookup. */
+/* Flush this ctx's IBTC/RAS when its entries predate the current
+ * generation, and record ctx->ibtc_synced_epoch plus the reclamation
+ * generation for the quiescent reclaimer. Called before lookup. */
 void ppc32_cache_sync_ctx(ppc32_ctx_t *ctx);
 /* P32-R6-1: fork protocol for s_cache_lock (wired into proc.c):
  * prepare holds it across the snapshot, parent releases, child drops
@@ -153,6 +159,9 @@ void ppc32_cache_fork_parent(void);
 void ppc32_cache_fork_child(void);
 /* Drop one ctx from the sync registry (call before freeing it). */
 void ppc32_cache_forget_ctx(const ppc32_ctx_t *ctx);
+/* Unregister a worker ctx after its run loop ends (never runs code
+ * again); lock-protected removal from the sync registry. */
+void ppc32_cache_unregister_ctx(ppc32_ctx_t *ctx);
 void ppc32_cache_invalidate_range(ppc32_ctx_t *ctx, uint32_t start,
     uint32_t end);
 void ppc32_cache_invalidate_all(ppc32_ctx_t *ctx);

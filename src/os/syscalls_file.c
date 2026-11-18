@@ -4,15 +4,18 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * PPC open-time flag bits (uapi/asm-powerpc/fcntl.h) differ from the
- * aarch64 host layout (arch/arm64 fcntl.h) in two positions: PPC
- * LARGEFILE is 0200000 where the host has DIRECT, and PPC DIRECT is
- * 0400000 where the host has LARGEFILE (DIRECTORY 040000 and NOFOLLOW
- * 0100000 match). Passing flags through untranslated makes BusyBox
- * `ls /` (which opens "/" with CLOEXEC|LARGEFILE|DIRECTORY|NONBLOCK)
- * fail with EINVAL on the host, where the oracle (qemu-ppc -cpu 750)
- * succeeds. Every open and file-status-flag crossing swaps those two
- * bits; all other bits are ABI-identical and pass through.
+ * PPC open-time flag bits (uapi/asm-powerpc/fcntl.h, verified against
+ * the powerpc sysroot bits/fcntl.h + bits/fcntl-linux.h AND the
+ * aarch64-musl bits/fcntl.h used to build this binary) differ from the
+ * aarch64 host layout in exactly two positions: PPC LARGEFILE is
+ * 0200000 (0x10000) where the host has DIRECT, and PPC DIRECT is
+ * 0400000 (0x20000) where the host has LARGEFILE (DIRECTORY 040000
+ * and NOFOLLOW 0100000 match). Passing flags through untranslated
+ * makes BusyBox `ls /` (which opens "/" with CLOEXEC|LARGEFILE|
+ * DIRECTORY|NONBLOCK) fail with EINVAL on the host, where the oracle
+ * (qemu-ppc -cpu 750) succeeds. Every open and file-status-flag
+ * crossing swaps those two bits; all other bits are ABI-identical
+ * and pass through.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -48,6 +51,11 @@
 #define PPC_O_DIRECT 0x20000U
 #define HOST_O_DIRECT 0x10000U
 #define HOST_O_LARGEFILE 0x20000U
+/* Creating-open detection (guest numbering, ABI-identical to the host
+ * for these two bits): O_CREAT 00000100, O_TMPFILE carries the
+ * __O_TMPFILE 020000000 bit. */
+#define PPC_O_CREAT 0x40U
+#define PPC_O_TMPFILE_BIT 0x400000U
 
 uint32_t ppc32_open_flags_ppc2host(uint32_t flags)
 {
@@ -96,29 +104,43 @@ long sys_openat(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
         return (long)ppc32_procfs_open(ctx, path);
     }
     host_flags = ppc32_open_flags_ppc2host(flags);
-    /* RC5 E2: absolute guest paths resolve against the sysroot so the
-     * sysroot's ld.so/libc are found; relative paths pass through
-     * (guest cwd == host cwd in the qualification setup). Missing
-     * sysroot entries fall back to the raw path (qemu -L parity: the
-     * sysroot holds libc, not coreutils, so `ls`/`wc` resolve to the
-     * host root and the shell uses its applets). */
+    /* Absolute guest paths resolve against the sysroot so the sysroot's
+     * ld.so/libc are found; relative paths pass through (guest cwd ==
+     * host cwd). /dev|/proc|/sys pin to raw (cmd > /dev/null must reach
+     * the host null, never sysroot/dev/null). Creating opens
+     * (O_CREAT/O_TMPFILE) use the shared mutation rule
+     * (ppc32_path_resolve_mut: parent-exists-in-sysroot stays); every
+     * other open is a plain read (exists-or-raw fallback). One rule per
+     * direction, so a created file is always reopened and unlinked at
+     * the exact same host location. */
     if (path[0] == '/') {
-        char host[PPC32_PATH_MAX];
+        int pinned = (strncmp(path, "/dev/", 5U) == 0 ||
+            strcmp(path, "/dev") == 0 ||
+            strncmp(path, "/proc/", 6U) == 0 || strcmp(path, "/proc") == 0 ||
+            strncmp(path, "/sys/", 5U) == 0 || strcmp(path, "/sys") == 0);
 
-        if (ppc32_sysroot_path(ctx, path, host, sizeof host) == 0) {
-            int saved;
+        if (!pinned) {
+            char host[PPC32_PATH_MAX];
+            long rc;
+            int creating = ((flags & (PPC_O_CREAT | PPC_O_TMPFILE_BIT)) !=
+                0U) ? 1 : 0;
 
-            host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? AT_FDCWD :
-                (int)dfd_va;
+            rc = (creating != 0) ?
+                ppc32_path_resolve_mut(ctx, path_va, host) :
+                ppc32_path_resolve(ctx, path_va, host);
+            if (rc != 0L) {
+                return rc;
+            }
+            host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ?
+                AT_FDCWD : (int)dfd_va;
             fd = openat(host_dfd, host, (int)host_flags,
                 (mode_t)(mode & 07777U));
             if (fd >= 0) {
                 return (long)fd;
             }
-            saved = errno;
-            if (saved != ENOENT && saved != ENOTDIR) {
-                return -(long)saved;
-            }
+            /* Stayed paths report the host error; never fall back to
+             * raw across sysroot/host (no cross-tree scatter). */
+            return -(long)errno;
         }
     }
     /* Guest AT_FDCWD (-100) maps to the host AT_FDCWD (-100 on Linux,
@@ -260,9 +282,14 @@ long sys_close(uint32_t fd)
 long sys_unlink(ppc32_ctx_t *ctx, uint32_t path_va)
 {
     char path[PPC32_PATH_MAX];
+    /* Same shared mutation rule as creating opens and unlinkat: a file
+     * created under the sysroot (sqlite's -journal, sort's temp files)
+     * is removed at the exact same host path (parent-exists stays,
+     * else raw). */
+    long rc = ppc32_path_resolve_mut(ctx, path_va, path);
 
-    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
-        return -EFAULT;
+    if (rc != 0) {
+        return rc;
     }
     if (unlink(path) != 0) {
         return -(long)errno;
@@ -303,9 +330,10 @@ long sys_stat_path(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
 {
     char path[PPC32_PATH_MAX];
     struct stat hs;
+    long rc = ppc32_path_resolve(ctx, path_va, path);
 
-    if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
-        return -EFAULT;
+    if (rc != 0L) {
+        return rc;
     }
     if ((nofollow ? lstat(path, &hs) : stat(path, &hs)) != 0) {
         return -(long)errno;

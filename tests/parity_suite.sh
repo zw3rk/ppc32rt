@@ -41,7 +41,7 @@ SYSROOT="$ROOT/tests/sysroot"
 GOLDEN="$ROOT/tests/golden"
 RT_DARWIN="$ROOT/_build/ppc32rt-darwin"
 RT="$ROOT/_build/ppc32rt"
-HL="$ROOT/../rt-series/_build/hl"
+HL="${HL:-$ROOT/../rt-series/_build/hl}"
 BENCH="$ROOT/../rt-series/_build/bench/bench-ppc32"
 B="$ROOT/_build/parity"
 

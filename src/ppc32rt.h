@@ -293,6 +293,12 @@ typedef struct ppc32_ctx {
      * has synced past it, so threads inside chained code stay safe. */
     uint32_t ibtc_synced_epoch;
 
+    /* T14 s1: last reclamation generation this ctx synced (set by
+     * ppc32_cache_sync_ctx / ppc32_cache_install alongside the scrub;
+     * 0 = never). Decoupled from ibtc_synced_epoch so reclaim pressure
+     * never bumps the semantic cache epoch. C-only tail. */
+    uint32_t reclaim_synced_gen;
+
     /* G04 Darwin G4 AltiVec (VMX) state: 32 x 128-bit big-endian
      * vector registers plus VSCR and VRSAVE (SPR 256). C-only tail,
      * outside the ABI-locked prefix; interp, DBT fallback, and the
@@ -312,6 +318,14 @@ typedef struct ppc32_ctx {
     uint32_t darwin_tls_tp;
     uint32_t darwin_tid;
     uint64_t darwin_aot_hash;
+
+    /* pselect6/ppoll temporary-mask deferral: when the wait exits with
+     * -EINTR (or ready with a tmp-deliverable signal), the tmp mask
+     * stays in force for the tail pump and the pre-wait mask waits
+     * here: the next pushed frame reports it in uc_sigmask, or the
+     * pump restores it when no handler runs. C-only tail. */
+    bool has_saved_sigmask;
+    uint64_t saved_sigmask;
 
 } ppc32_ctx_t;
 

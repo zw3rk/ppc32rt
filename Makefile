@@ -102,49 +102,56 @@ $(OBJ_DIR)/%.o: src/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+TIMEOUT_RUN := $(shell command -v timeout >/dev/null 2>&1 && echo "timeout --kill-after=10s 60s")
 test: check-abi-invariants build-darwin ## Run host ABI and P32 defect regression suites (incl. Round-7 ISA)
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_defects.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_defects && \
-	./$(BUILD_DIR)/check_p32_defects && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_defects && \
+	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
+		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
+		tests/check_p32_t14.c \
+		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
+		-lm -o $(BUILD_DIR)/check_p32_t14 && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_t14 && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_r7_defects.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_r7_defects && \
-	./$(BUILD_DIR)/check_p32_r7_defects && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_r7_defects && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_r7b_defects.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_r7b_defects && \
-	./$(BUILD_DIR)/check_p32_r7b_defects && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_r7b_defects && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_r13_defects.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_r13_defects && \
-	./$(BUILD_DIR)/check_p32_r13_defects && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_r13_defects && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_darwin_g02.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_darwin_g02 && \
-	./$(BUILD_DIR)/check_p32_darwin_g02 && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_darwin_g02 && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_altivec.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_altivec && \
-	./$(BUILD_DIR)/check_p32_altivec && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_altivec && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_darwin_tlsvm.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_darwin_tlsvm && \
-	./$(BUILD_DIR)/check_p32_darwin_tlsvm
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_darwin_tlsvm
 
 # macOS hides MAP_ANON (no MAP_ANONYMOUS) once _POSIX_C_SOURCE is
 # defined, which would break the host syntax check below; the Linux/musl
@@ -177,19 +184,19 @@ check-darwin-g02: build-darwin ## Build and run the G02 Darwin host-bridge suite
 		tests/check_p32_darwin_g02.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_darwin_g02 && \
-	./$(BUILD_DIR)/check_p32_darwin_g02 && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_darwin_g02 && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_altivec.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_altivec && \
-	./$(BUILD_DIR)/check_p32_altivec && \
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_altivec && \
 	$(HOST_CC) -std=c11 -D_DARWIN_C_SOURCE -Werror=vla -pedantic \
 		-Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 \
 		tests/check_p32_darwin_tlsvm.c \
 		$$(find $(BUILD_DIR)/darwin-obj -name '*.o' ! -name 'main.o') \
 		-lm -o $(BUILD_DIR)/check_p32_darwin_tlsvm && \
-	./$(BUILD_DIR)/check_p32_darwin_tlsvm
+	$(TIMEOUT_RUN) ./$(BUILD_DIR)/check_p32_darwin_tlsvm
 
 check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
 	@over=$$(for f in $$(find src include tests -name '*.c' -o -name '*.h' -o -name '*.S'); do \
