@@ -145,7 +145,9 @@ static long sys_read_at(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
     return host_ret(n, errno);
 }
 
-static long sys_write(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
+/* write/pwrite64 helper (pwrite leaves the fd offset untouched). */
+static long sys_write_at(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
+    uint32_t count, bool use_pwrite, int64_t off)
 {
     ssize_t n;
 
@@ -157,12 +159,15 @@ static long sys_write(ppc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t c
         !ppc32_vm_range_prot_ok(ctx, buf_va, count, 1U)) {
         return -EFAULT;
     }
-    n = write((int)fd, ppc32_guest_ptr(ctx, buf_va), (size_t)count);
+    n = use_pwrite ? pwrite((int)fd, ppc32_guest_ptr(ctx, buf_va),
+        (size_t)count, (off_t)off) :
+        write((int)fd, ppc32_guest_ptr(ctx, buf_va), (size_t)count);
     if (n > 0) {
         /* Provider-A hook: an extending write moves the inode EOF
          * forward (no-op until a file mapping registers the fd),
          * then overlapping staged aliases refresh from the file. */
-        off_t end = lseek((int)fd, 0, SEEK_CUR);
+        off_t end = use_pwrite ? (off_t)off + (off_t)n :
+            lseek((int)fd, 0, SEEK_CUR);
 
         if (end >= (off_t)0) {
             (void)vm_file_hook_write((int)fd, (uint64_t)end);
@@ -550,31 +555,52 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
             return;
         }
     }
+    {
+        long fsr = 0L;
+
+        if (ppc32_fs_dispatch(ctx, nr, a0, a1, a2, a3, a4, a5, &fsr) ||
+            ppc32_poll_dispatch(ctx, nr, a0, a1, a2, a3, a4, a5, &fsr)) {
+            sys_apply_ret(ctx, nr, fsr);
+            ctx->nip += 4U;
+            ctx->syscalls_executed++;
+            ppc32_sig_pump_pending(ctx);
+            return;
+        }
+    }
 
     switch (nr) {
     case PPC32_NR_EXIT:
         /* Thread exit: ends the calling thread only (main.c waits out
          * live siblings for the initial thread; workers return to the
-         * thread_entry teardown). */
+         * thread_entry teardown). A CLONE_VFORK child diffs its stack
+         * window back to the parent first (no-op otherwise). */
+        ppc32_proc_vfork_release(ctx);
         ctx->exit_arg = a0 & 0xFFU;
         ret = (long)(int32_t)ctx->exit_arg;
         break;
     case PPC32_NR_EXIT_GROUP:
         /* Group exit: ends every thread (main.c _exit(2)s from workers
-         * and returns the status from the initial thread). */
+         * and returns the status from the initial thread). VFORK
+         * children release the shared window first (no-op otherwise). */
+        ppc32_proc_vfork_release(ctx);
         ctx->exit_arg = a0 & 0xFFU;
         ret = (long)(int32_t)ctx->exit_arg;
         break;
     case PPC32_NR_READ:
         ret = sys_read_at(ctx, a0, a1, a2, false, 0);
         break;
-    case PPC32_NR_PREAD64: {
-        uint64_t uoff = ((uint64_t)a3 << 32U) | (uint64_t)a4;
-        ret = sys_read_at(ctx, a0, a1, a2, true, (off_t)(int64_t)uoff);
+    case PPC32_NR_PREAD64:
+    case PPC32_NR_PWRITE64: {
+        /* The 64-bit pos takes the aligned r7:r8 pair (r6 is pad). */
+        int64_t off = (int64_t)(((uint64_t)a4 << 32U) | (uint64_t)a5);
+
+        ret = (nr == PPC32_NR_PREAD64) ?
+            sys_read_at(ctx, a0, a1, a2, true, off) :
+            sys_write_at(ctx, a0, a1, a2, true, off);
         break;
     }
     case PPC32_NR_WRITE:
-        ret = sys_write(ctx, a0, a1, a2);
+        ret = sys_write_at(ctx, a0, a1, a2, false, 0);
         break;
     case PPC32_NR_READV:
         ret = sys_vec(ctx, a0, a1, a2, 0);
@@ -679,6 +705,16 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     case PPC32_NR_GETPID:
         ret = ppc32_proc_getpid();
         break;
+    case PPC32_NR_SETSID:
+        /* Session-leader creation (T4: git/sh probe it during session
+         * setup; the host call is trivial so wire it instead of
+         * leaving -ENOSYS noise). */
+        {
+            pid_t r = setsid();
+
+            ret = (r == (pid_t)-1) ? -(long)errno : (long)r;
+            break;
+        }
     case PPC32_NR_KILL:
     case PPC32_NR_GETTID:
     case PPC32_NR_TKILL:
@@ -690,51 +726,17 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
     case PPC32_NR_CLONE:
     {
         /* PPC clone arg order: flags, stack, parent_tid, tls,
-         * child_tid in r3..r7. P32-R5-1 runs the CLONE_VM child
-         * concurrently on a host pthread (threads.c runner) so
-         * parent/child handshakes never deadlock. */
-        /* Fork-style clone (no CLONE_VM): process semantics, e.g. the
-         * BusyBox posix_spawn idiom SIGCHLD|CHILD_CLEARTID|CHILD_SETTID.
-         * A host fork copies mm/files/fs exactly like fork(2); thread
-         * semantics w/o an address space stay -EINVAL (kernel parity).
-         * SETTID stores honored; CLEARTID clearing is best-effort. */
-        if ((a0 & PPC32_CLONE_VM) == 0U) {
-            long pid;
-
-            if ((a0 & (PPC32_CLONE_THREAD | PPC32_CLONE_SIGHAND)) != 0U) {
-                ret = -EINVAL;
-                break;
-            }
-            /* P32-R10-6: validate TID addresses before the fork side
-             * effect, mirroring the CLONE_VM path (write prot). */
-            if ((a0 & PPC32_CLONE_PARENT_SETTID) != 0U && a2 != 0U &&
-                !ppc32_vm_range_prot_ok(ctx, a2, 4U, 2U)) {
-                ret = -EFAULT;
-                break;
-            }
-            if ((a0 & PPC32_CLONE_CHILD_SETTID) != 0U && a4 != 0U &&
-                !ppc32_vm_range_prot_ok(ctx, a4, 4U, 2U)) {
-                ret = -EFAULT;
-                break;
-            }
-            pid = ppc32_proc_fork(ctx);
-            if (pid < 0L) {
-                ret = pid;
-                break;
-            }
-            if (pid == 0L) {
-                if ((a0 & PPC32_CLONE_CHILD_SETTID) != 0U &&
-                    a4 != 0U && ppc32_range_ok(a4, 4U)) {
-                    ppc32_st32be(ctx, a4, ctx->guest_pid);
-                }
-                ret = 0L;
-                break;
-            }
-            if ((a0 & PPC32_CLONE_PARENT_SETTID) != 0U &&
-                a2 != 0U && ppc32_range_ok(a2, 4U)) {
-                ppc32_st32be(ctx, a2, (uint32_t)pid);
-            }
-            ret = pid;
+         * child_tid in r3..r7. Only a true process fork reaches
+         * ppc32_clone_fork: no CLONE_VM at all, or CLONE_VFORK
+         * without CLONE_THREAD (posix_spawn's
+         * CLONE_VM|CLONE_VFORK|SIGCHLD rendezvous). CLONE_VM without
+         * CLONE_VFORK shares memory with the parent, so it runs on a
+         * host pthread even without CLONE_THREAD (p4_threads:
+         * CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|SIGCHLD). */
+        if ((a0 & PPC32_CLONE_VM) == 0U ||
+            (((a0 & PPC32_CLONE_VFORK) != 0U) &&
+                ((a0 & PPC32_CLONE_THREAD) == 0U))) {
+            ret = ppc32_clone_fork(ctx, a0, a1, a2, a3, a4);
             break;
         }
         ppc32_ctx_t *child = NULL;
@@ -764,6 +766,9 @@ void ppc32_syscall(ppc32_ctx_t *ctx)
         break;
     default:
         ret = -ENOSYS;
+        if (ctx->trace_syscalls) {
+            fprintf(stderr, "ppc32rt: unimplemented syscall %u\n", nr);
+        }
         break;
     }
 

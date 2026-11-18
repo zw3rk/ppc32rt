@@ -843,6 +843,26 @@ static void test_p32_r9_trap_and_spe(uint8_t *base)
         "r9-4 neighbor page still readable");
 }
 
+static void test_clone_fork_validation(void)
+{
+    ppc32_ctx_t ctx;
+
+    memset(&ctx, 0, sizeof ctx);
+    /* NULL ctx never forks. */
+    CHECK(ppc32_clone_fork(NULL, 0U, 0U, 0U, 0U, 0U) == -EFAULT,
+        "clone-fork NULL ctx faults");
+    /* Linux rule: SIGHAND without VM is EINVAL (no fork side effect). */
+    CHECK(ppc32_clone_fork(&ctx, PPC32_CLONE_SIGHAND, 0U, 0U, 0U, 0U) ==
+        -EINVAL, "clone-fork SIGHAND without VM is EINVAL");
+    /* Bad TID address fails before any fork. */
+    CHECK(ppc32_clone_fork(&ctx, PPC32_CLONE_PARENT_SETTID, 0U,
+            0xFFFFFFFCU, 0U, 0U) == -EFAULT,
+        "clone-fork bad parent TID faults");
+    CHECK(ppc32_clone_fork(&ctx, PPC32_CLONE_CHILD_SETTID, 0U, 0U, 0U,
+            0xFFFFFFFCU) == -EFAULT,
+        "clone-fork bad child TID faults");
+}
+
 int main(void)
 {
     uint8_t *base = (uint8_t *)mmap(NULL, 0x200000U, PROT_READ | PROT_WRITE,
@@ -862,6 +882,7 @@ int main(void)
     test_p32_5_6_11_vm_and_syscalls();
     test_p32_r3_3_subpage_shared();
     test_p32_r6_followups();
+    test_clone_fork_validation();
 
     if (g_fails != 0) {
         fprintf(stderr, "check_p32_defects: %d FAILURES\n", g_fails);

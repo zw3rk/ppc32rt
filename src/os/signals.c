@@ -199,6 +199,14 @@ int ppc32_sig_build_frame(ppc32_ctx_t *ctx, int sig,
     old_mask = ctx->sig_mask;
     old_lo = (uint32_t)(old_mask & 0xFFFFFFFFULL);
     old_hi = (uint32_t)((old_mask >> 32) & 0xFFFFFFFFULL);
+    if (ctx->has_saved_sigmask) {
+        /* pselect6/ppoll tmp mask in force: the frame reports the
+         * pre-wait mask (sigreturn restores it); the handler runs
+         * under tmp | act | sig. Consumed on entry. */
+        old_lo = (uint32_t)(ctx->saved_sigmask & 0xFFFFFFFFULL);
+        old_hi = (uint32_t)((ctx->saved_sigmask >> 32) & 0xFFFFFFFFULL);
+        ctx->has_saved_sigmask = false;
+    }
     SIG_MUST(sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_flags), 0U));
     SIG_MUST(sig_st32(ctx, uc_va + (uint32_t)offsetof(ppc32_ucontext_t, uc_link), 0U));
     SIG_MUST(sig_st32(ctx,
@@ -778,6 +786,12 @@ void ppc32_sig_pump_pending(ppc32_ctx_t *ctx)
         }
         (void)ppc32_sig_deliver_sync(ctx, (int)s, 0, 0U, 0U);
         return;
+    }
+    /* No frame pushed: a pselect6/ppoll tmp mask may still be in force
+     * (spurious wakeup path). Restore the pre-wait mask now. */
+    if (ctx->has_saved_sigmask) {
+        ctx->sig_mask = ctx->saved_sigmask;
+        ctx->has_saved_sigmask = false;
     }
 }
 

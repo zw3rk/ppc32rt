@@ -43,6 +43,21 @@ long ppc32_proc_fork(ppc32_ctx_t *ctx);
 /* vfork(190): same observable result as fork (no address-space sharing
  * fast path; the child is expected to execve or exit promptly). */
 long ppc32_proc_vfork(ppc32_ctx_t *ctx);
+/* vfork rendezvous (proc_fork.c): VFORK pipe parent wait. */
+long ppc32_proc_vfork_sync(ppc32_ctx_t *ctx);
+/* CLONE_VFORK shared-window channel (proc_fork.c): the child calls
+ * release on exit/exit_group (diffs the pre-fork stack snapshot into
+ * the vfork pipe) and drop on execve success (the new image discards
+ * the old stack). Both are no-ops outside a vfork child. */
+void ppc32_proc_vfork_release(ppc32_ctx_t *ctx);
+void ppc32_proc_vfork_drop(void);
+/* Clone-without-THREAD process fork (posix_spawn path). */
+long ppc32_clone_fork(ppc32_ctx_t *ctx, uint32_t flags, uint32_t stack_va,
+    uint32_t parent_tid_va, uint32_t tls_va, uint32_t child_tid_va);
+/* execve vector helpers (proc_fork.c owns the copies). */
+void ppc32_proc_free_vec(char **vec, uint32_t count);
+long ppc32_proc_copy_vec(ppc32_ctx_t *ctx, uint32_t vec_va, char ***out,
+    uint32_t *out_count);
 
 /* execve(11): replace the image. On success returns 0 with nip/sp and
  * the register file reparked on the new entry point (SPEC 1.1 ELF

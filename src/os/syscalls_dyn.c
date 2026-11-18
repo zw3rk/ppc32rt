@@ -55,6 +55,11 @@
 #endif
 
 #define DYN_PATH_MAX 4096U
+/* The dyn layer and the file layer share one buffer capacity: every
+ * host path buffer in syscalls_dyn.c/syscalls_file.c holds
+ * PPC32_PATH_MAX bytes (see syscalls.h). */
+_Static_assert(PPC32_PATH_MAX == DYN_PATH_MAX,
+    "dyn/file path buffers must share one capacity");
 #define DYN_RLIM_INFINITY 0xFFFFFFFFU
 /* Linux statx(2) guest struct is 256 B, fixed UAPI layout (all fields
  * scalar, converted member-wise below). */
@@ -63,30 +68,124 @@
 #define DYN_DENT_RECLEN_OFF 16U
 #define DYN_DENT_NAME_OFF 19U
 
+/* Device and kernel trees are host-owned: the dev, proc and sys trees
+ * never materialize under the sysroot (cmd to dev-null must reach the
+ * host null). proc-self synthetic paths are intercepted before this
+ * helper runs, so pinning them to raw is safe here too. */
+static int dyn_pinned_raw(const char *guest)
+{
+    if (guest == NULL || guest[0] != '/') {
+        return 0;
+    }
+    if (strncmp(guest, "/dev/", 5U) == 0 || strcmp(guest, "/dev") == 0) {
+        return 1;
+    }
+    if (strncmp(guest, "/proc/", 6U) == 0 || strcmp(guest, "/proc") == 0) {
+        return 1;
+    }
+    if (strncmp(guest, "/sys/", 5U) == 0 || strcmp(guest, "/sys") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static void dyn_copy_raw(const char *guest, char *out)
+{
+    size_t i;
+
+    for (i = 0U; guest[i] != '\0'; i++) {
+        out[i] = guest[i];
+    }
+    out[i] = '\0';
+}
+
+/* True when the parent directory of the sysroot candidate exists:
+ * /sysroot/a/b (missing) still stays under the sysroot when
+ * /sysroot/a exists (git index.lock, creating opens), so a file
+ * created in /var/tmp/x is unlinked/renamed at the same host path.
+ * Returns 1 to stay, 0 to fall back to raw. */
+static int dyn_parent_present(const char *sysroot_path)
+{
+    char parent[DYN_PATH_MAX];
+    size_t n;
+    size_t slash = 0U;
+    size_t i;
+
+    n = strlen(sysroot_path);
+    for (i = 0U; i < n; i++) {
+        if (sysroot_path[i] == '/') {
+            slash = i;
+        }
+    }
+    if (slash == 0U || slash + 1U >= sizeof parent) {
+        return 0;
+    }
+    memcpy(parent, sysroot_path, slash);
+    parent[slash] = '\0';
+    if (parent[0] == '\0') {
+        return 0;
+    }
+    return (access(parent, F_OK) == 0) ? 1 : 0;
+}
+
 /* Resolve a guest path VA to a host path (sysroot for absolute guest
- * paths, plain copy otherwise). Missing sysroot entries fall back to
- * the raw path (qemu -L parity). Returns 0 with `out` filled, or
- * a negative errno. */
-static long dyn_resolve(ppc32_ctx_t *ctx, uint32_t path_va,
-    char out[DYN_PATH_MAX])
+ * paths, plain copy otherwise). Plain reads keep exists-or-raw
+ * fallback: the sysroot candidate is used only when it exists
+ * (lstat, so dangling symlinks still resolve in place); otherwise the
+ * raw host path is used, so /etc/passwd, /usr/bin and
+ * /usr/share/zoneinfo resolve under partial sysroots (qemu -L
+ * parity). Pinned /dev|/proc|/sys always use raw. Returns 0 with
+ * `out` filled, or a negative errno. */
+long ppc32_path_resolve(ppc32_ctx_t *ctx, uint32_t path_va,
+    char *out)
 {
     char guest[DYN_PATH_MAX];
-    size_t i;
+    struct stat st;
 
     if (ppc32_copyin_str(ctx, path_va, guest, sizeof guest) != 0) {
         return -EFAULT;
     }
+    if (guest[0] != '/' || dyn_pinned_raw(guest)) {
+        dyn_copy_raw(guest, out);
+        return 0;
+    }
     if (ppc32_sysroot_path(ctx, guest, out, DYN_PATH_MAX) != 0) {
         return -ENAMETOOLONG;
     }
-    if (guest[0] == '/' && access(out, F_OK) != 0) {
-        for (i = 0U; guest[i] != '\0'; i++) {
-            if (i + 1U >= DYN_PATH_MAX) {
-                return -ENAMETOOLONG;
-            }
-            out[i] = guest[i];
-        }
-        out[i] = '\0';
+    if (lstat(out, &st) != 0) {
+        dyn_copy_raw(guest, out);
+    }
+    return 0;
+}
+
+/* Mutation-side resolution shared by creating opens (O_CREAT/O_TMPFILE)
+ * and every filesystem mutation (unlink*, rmdir, mkdir*, rename*,
+ * link*, symlink*, mknod*): the guest path stays under the sysroot
+ * whenever its parent directory exists there, else the raw host path
+ * is used. One rule for both directions, so a file created at
+ * /sysroot/... is always unlinked/renamed at the exact same host
+ * location. Pinned trees always go raw. */
+long ppc32_path_resolve_mut(ppc32_ctx_t *ctx, uint32_t path_va,
+    char *out)
+{
+    char guest[DYN_PATH_MAX];
+
+    if (ppc32_copyin_str(ctx, path_va, guest, sizeof guest) != 0) {
+        return -EFAULT;
+    }
+    if (guest[0] != '/' || dyn_pinned_raw(guest)) {
+        dyn_copy_raw(guest, out);
+        return 0;
+    }
+    if (ctx->sysroot == NULL || ctx->sysroot[0] == '\0') {
+        dyn_copy_raw(guest, out);
+        return 0;
+    }
+    if (ppc32_sysroot_path(ctx, guest, out, DYN_PATH_MAX) != 0) {
+        return -ENAMETOOLONG;
+    }
+    if (access(out, F_OK) != 0 && !dyn_parent_present(out)) {
+        dyn_copy_raw(guest, out);
     }
     return 0;
 }
@@ -94,7 +193,7 @@ static long dyn_resolve(ppc32_ctx_t *ctx, uint32_t path_va,
 static long dyn_access(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t mode)
 {
     char host[DYN_PATH_MAX];
-    long rc = dyn_resolve(ctx, path_va, host);
+    long rc = ppc32_path_resolve(ctx, path_va, host);
 
     if (rc != 0) {
         return rc;
@@ -200,14 +299,18 @@ static long dyn_statx(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
         if (ppc32_sysroot_path(ctx, guest, host, sizeof host) != 0) {
             return -ENAMETOOLONG;
         }
-        if (access(host, F_OK) != 0) {
-            for (i = 0U; guest[i] != '\0'; i++) {
-                if (i + 1U >= sizeof host) {
-                    return -ENAMETOOLONG;
+        {
+            struct stat stb;
+
+            if (lstat(host, &stb) != 0) {
+                for (i = 0U; guest[i] != '\0'; i++) {
+                    if (i + 1U >= sizeof host) {
+                        return -ENAMETOOLONG;
+                    }
+                    host[i] = guest[i];
                 }
-                host[i] = guest[i];
+                host[i] = '\0';
             }
-            host[i] = '\0';
         }
     }
     host_dfd = (dfd_va == (uint32_t)(int32_t)-100) ? -100 : (int)dfd_va;
@@ -426,7 +529,7 @@ static long dyn_statx(ppc32_ctx_t *ctx, uint32_t dfd_va, uint32_t path_va,
     /* Absolute guest paths resolve against the sysroot; missing
      * entries fall back to the raw path (qemu -L parity). */
     {
-        long rc = dyn_resolve(ctx, path_va, host);
+        long rc = ppc32_path_resolve(ctx, path_va, host);
 
         if (rc != 0) {
             return rc;
@@ -453,6 +556,7 @@ static long dyn_getdents64(ppc32_ctx_t *ctx, uint32_t fd, uint32_t dirp_va,
 static long dyn_getcwd(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t size)
 {
     char host[DYN_PATH_MAX];
+    const char *out = host;
 
     if (size == 0U || !ppc32_range_ok(buf_va, size)) {
         return -EFAULT;
@@ -463,13 +567,38 @@ static long dyn_getcwd(ppc32_ctx_t *ctx, uint32_t buf_va, uint32_t size)
     if (getcwd(host, sizeof host) == NULL) {
         return -(long)errno;
     }
+    /* The guest namespace roots at the sysroot: a host cwd beneath it
+     * is reported stripped ("/sysroot/tmp/x" -> "/tmp/x") so absolute
+     * path round-trips (git's $cwd/.git, make's $(CURDIR)) re-resolve
+     * under the sysroot instead of double-prefixing to
+     * "/sysroot/sysroot/...". A cwd outside the sysroot passes through
+     * (qemu -L parity for reads). The sysroot is canonicalized via
+     * realpath so relative/symlinked/trailing-slash forms still match;
+     * realpath failure falls back to the raw configured string. */
+    if (ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
+        char canon[DYN_PATH_MAX];
+        const char *root = ctx->sysroot;
+        size_t n;
+
+        if (realpath(ctx->sysroot, canon) != NULL) {
+            root = canon;
+        }
+        n = strlen(root);
+        while (n > 1U && root[n - 1U] == '/') {
+            n--;
+        }
+        if (strncmp(host, root, n) == 0 &&
+            (host[n] == '/' || host[n] == '\0')) {
+            out = (host[n] == '\0') ? "/" : host + n;
+        }
+    }
     {
-        size_t len = strlen(host) + 1U;
+        size_t len = strlen(out) + 1U;
 
         if (len > (size_t)size) {
             return -ERANGE;
         }
-        if (ppc32_vm_copyout_safe(ctx, buf_va, host, len) != 0) {
+        if (ppc32_vm_copyout_safe(ctx, buf_va, out, len) != 0) {
             return -EFAULT;
         }
         ppc32_smc_store(ctx, buf_va, len, NULL);

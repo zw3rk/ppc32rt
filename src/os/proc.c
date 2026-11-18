@@ -154,9 +154,8 @@ long ppc32_proc_fork(ppc32_ctx_t *ctx)
 
 long ppc32_proc_vfork(ppc32_ctx_t *ctx)
 {
-    /* No address-space sharing fast path: plain fork preserves the
-     * observable result and is safe when the child promptly execves. */
-    return ppc32_proc_fork(ctx);
+    /* VFORK rendezvous lives in proc_fork.c (pipe + parent wait). */
+    return ppc32_proc_vfork_sync(ctx);
 }
 
 /* Scan guest text for SPE vs Classic FPU opcodes (SPEC 2.2, P32-R9-7). */
@@ -202,75 +201,7 @@ void ppc32_proc_redetect_profile(ppc32_ctx_t *ctx, uint32_t text_start,
     ctx->is_spe = saw_spe ? 1U : 0U;
 }
 
-/* Free a partially built exec vector (count entries valid). */
-static void proc_free_vec(char **vec, uint32_t count)
-{
-    uint32_t i;
-
-    if (vec == NULL) {
-        return;
-    }
-    for (i = 0U; i < count; i++) {
-        free(vec[i]);
-    }
-    free(vec);
-}
-
-/* Copy a guest argv/envp vector (BE words, NUL-terminated) into a
- * host-side NULL-terminated array. envp_va == 0 yields an empty
- * environment (Linux execve semantics), never the host one. */
-static long proc_copy_vec(ppc32_ctx_t *ctx, uint32_t vec_va, char ***out,
-    uint32_t *out_count)
-{
-    char **vec;
-    uint32_t n = 0U;
-
-    vec = (char **)calloc((size_t)PROC_MAX_VEC + 1U, sizeof(char *));
-    if (vec == NULL) {
-        return -ENOMEM;
-    }
-    if (vec_va == 0U) {
-        *out = vec;
-        *out_count = 0U;
-        return 0;
-    }
-    for (;;) {
-        uint32_t str_va;
-        char *buf;
-
-        if (n >= PROC_MAX_VEC) {
-            proc_free_vec(vec, n);
-            return -E2BIG;
-        }
-        /* P32-R9-5: the vector slot needs a mapped, readable,
-         * untrapped page; a raw ld32be could crash the host. */
-        if (!ppc32_range_ok(vec_va + n * 4U, 4U) ||
-            !ppc32_vm_range_prot_ok(ctx, vec_va + n * 4U, 4U, 1U)) {
-            proc_free_vec(vec, n);
-            return -EFAULT;
-        }
-        str_va = ppc32_ld32be(ctx, vec_va + n * 4U);
-        if (str_va == 0U) {
-            break;
-        }
-        buf = (char *)malloc(PROC_ARG_MAX);
-        if (buf == NULL) {
-            proc_free_vec(vec, n);
-            return -ENOMEM;
-        }
-        if (ppc32_copyin_str(ctx, str_va, buf, PROC_ARG_MAX) != 0) {
-            free(buf);
-            proc_free_vec(vec, n);
-            return -EFAULT;
-        }
-        vec[n] = buf;
-        n++;
-    }
-    vec[n] = NULL;
-    *out = vec;
-    *out_count = n;
-    return 0;
-}
+/* execve vector copies live in proc_fork.c (line-budget split). */
 
 /* Header probe mirroring the loader's admission (ppc32_elf32.c):
  * magic, ELFCLASS32, ELFDATA2MSB, EM_PPC(20), ET_EXEC(2)/ET_DYN(3),
@@ -361,13 +292,13 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     if (ppc32_copyin_str(ctx, path_va, path, sizeof path) != 0) {
         return -EFAULT;
     }
-    rc = proc_copy_vec(ctx, argv_va, &args, &argc);
+    rc = ppc32_proc_copy_vec(ctx, argv_va, &args, &argc);
     if (rc != 0) {
         return rc;
     }
-    rc = proc_copy_vec(ctx, envp_va, &env, &envc);
+    rc = ppc32_proc_copy_vec(ctx, envp_va, &env, &envc);
     if (rc != 0) {
-        proc_free_vec(args, argc);
+        ppc32_proc_free_vec(args, argc);
         return rc;
     }
     /* Admission re-entry (SPEC 1.1): resolve through the sysroot, then
@@ -387,8 +318,8 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
             ep = ctx->guest_argv[0];
         }
         if (ep == NULL) {
-            proc_free_vec(args, argc);
-            proc_free_vec(env, envc);
+            ppc32_proc_free_vec(args, argc);
+            ppc32_proc_free_vec(env, envc);
             return -ENOENT;
         }
         {
@@ -396,8 +327,8 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
 
             for (i = 0U; ep[i] != '\0'; i++) {
                 if (i + 1U >= sizeof path) {
-                    proc_free_vec(args, argc);
-                    proc_free_vec(env, envc);
+                    ppc32_proc_free_vec(args, argc);
+                    ppc32_proc_free_vec(env, envc);
                     return -ENAMETOOLONG;
                 }
                 path[i] = ep[i];
@@ -408,8 +339,8 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     fd = ppc32_open_guest_ro(ctx, path);
     if (fd < 0) {
         rc = -(long)errno;
-        proc_free_vec(args, argc);
-        proc_free_vec(env, envc);
+        ppc32_proc_free_vec(args, argc);
+        ppc32_proc_free_vec(env, envc);
         return rc;
     }
     {
@@ -417,8 +348,8 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
 
         if (adm == 0) {
             close(fd);
-            proc_free_vec(args, argc);
-            proc_free_vec(env, envc);
+            ppc32_proc_free_vec(args, argc);
+            ppc32_proc_free_vec(env, envc);
             return -ENOEXEC;
         }
         if (adm < 0) {
@@ -436,16 +367,27 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
             if (pid < 0) {
                 int e = errno;
 
-                proc_free_vec(args, argc);
-                proc_free_vec(env, envc);
+                ppc32_proc_free_vec(args, argc);
+                ppc32_proc_free_vec(env, envc);
                 return -(long)e;
             }
             if (pid == 0) {
                 execve(path, args, env);
                 _exit(127);
             }
-            proc_free_vec(args, argc);
-            proc_free_vec(env, envc);
+            ppc32_proc_free_vec(args, argc);
+            ppc32_proc_free_vec(env, envc);
+            /* The caller may itself be a vfork/clone-fork child holding
+             * the VFORK rendezvous write end open (CLOEXEC): the
+             * grandchild's copy closes at execve, but ours stays open
+             * across waitpid, blocking the vfork parent for the whole
+             * shim lifetime (pipe-buffer deadlock when it writes more
+             * than the buffer). A vfork child execing drops its stack
+             * window first (the new image discards the old stack);
+             * then drop every CLOEXEC fd so the parent unblocks as
+             * soon as the shim launches. */
+            ppc32_proc_vfork_drop();
+            proc_close_cloexec(-1);
             while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
             }
             code = WIFEXITED(st) ? WEXITSTATUS(st) :
@@ -459,10 +401,14 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
     memset(&info, 0, sizeof info);
     ppc32_vm_reset_for_exec(ctx);
     ppc32_cache_invalidate_all(ctx);
+    /* A vfork child execing drops its stack window (the new image
+     * discards the old stack) before the CLOEXEC sweep seals the
+     * channel and unblocks the parent. */
+    ppc32_proc_vfork_drop();
     proc_close_cloexec(fd);
     if (ppc32_elf_load(ctx, fd, path, &info) != 0) {
-        proc_free_vec(args, argc);
-        proc_free_vec(env, envc);
+        ppc32_proc_free_vec(args, argc);
+        ppc32_proc_free_vec(env, envc);
         return -ENOEXEC;
     }
     /* Fresh process image: registers, heap/stack mirrors, and thread
@@ -538,8 +484,8 @@ long ppc32_proc_execve(ppc32_ctx_t *ctx, uint32_t path_va, uint32_t argv_va,
         ctx->is_spe = 1U;
     }
     if (ppc32_stack_setup(ctx, &info, (int)argc, args, use_env, &sp) != 0) {
-        proc_free_vec(args, argc);
-        proc_free_vec(env, envc);
+        ppc32_proc_free_vec(args, argc);
+        ppc32_proc_free_vec(env, envc);
         return -ENOMEM;
     }
     /* RC5: interpreter entry when PT_INTERP is present (see main.c). */
@@ -856,14 +802,15 @@ int ppc32_proc_dispatch(ppc32_ctx_t *ctx, uint32_t nr, uint32_t a0,
         ret = ppc32_proc_pipe2(ctx, a0, a1);
         break;
     case PPC32_NR_DUP:
-        if (a1 > 1024U) {
-            ret = -EINVAL;
-            break;
-        }
+        /* dup(41) is a 1-argument syscall (oldfd in r3 only); r4 is
+         * uninitialized caller garbage and must be ignored (T4 strip:
+         * copyfd = dup(3) failed with -EINVAL when a garbage a1 fed
+         * F_DUPFD). */
+        (void)a1;
         {
-            int r = fcntl((int)a0, F_DUPFD, (int)a1);
+            int r = dup((int)a0);
 
-            ret = (r < 0) ? -(long)errno : (long)r;
+            ret = (r < 0) ? -(long)ppc32_errno_map(errno) : (long)r;
             proc_invalidate_reservation(ctx);
         }
         break;

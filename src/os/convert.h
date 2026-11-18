@@ -218,6 +218,10 @@ int ppc32_flock_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
     const struct flock *hs);
 int ppc32_flock_from_guest(const ppc32_ctx_t *ctx, uint32_t va,
     struct flock *hs);
+/* Host errno -> guest Linux errno (POSIX codes match on Linux; Darwin
+ * maps known divergences, otherwise identity). */
+int ppc32_errno_map(int host_errno);
+
 /* 64-bit lock layout (F_GETLK64/F_SETLK64/F_SETLKW64 = 12/13/14). */
 int ppc32_flock64_to_guest(const ppc32_ctx_t *ctx, uint32_t va,
     const struct flock *hs);

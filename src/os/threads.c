@@ -50,6 +50,7 @@ static void thread_st32be(ppc32_ctx_t *ctx, uint32_t va, uint32_t v)
 
 /* P32-R6-1: release a ctx's cache sync slot before it is freed. */
 extern void ppc32_cache_forget_ctx(const ppc32_ctx_t *ctx);
+extern void ppc32_cache_unregister_ctx(ppc32_ctx_t *ctx);
 
 typedef struct {
     bool         used;
@@ -147,8 +148,7 @@ static long host_gettid(void)
     return (long)getpid();
 }
 #endif
-/* P32-R6-6 wake nudge: no-op handler without SA_RESTART, so a host
- * block fails EINTR and the syscall-tail pump serves the signal. */
+/* Wake nudge: no-op handler (no SA_RESTART) so host blocks fail EINTR. */
 static void thread_nudge_handle(int sig)
 {
     (void)sig;
@@ -231,10 +231,8 @@ uint32_t ppc32_thread_count(void)
     return n;
 }
 
-/* tkill/tgkill backend: signal a live sibling by guest TID (sig == 0
- * probes; sig > 0 pends via atomic OR; tgid != 0 needs a group match).
- * A pended sibling on another host thread gets a SIGURG wake nudge so
- * a host block fails EINTR into the syscall-tail pump. */
+/* tkill/tgkill: pend sig on a live sibling by guest TID (0 probes).
+ * A pended remote sibling gets a SIGURG nudge so host blocks fail EINTR. */
 long ppc32_thread_signal(uint32_t guest_tid, uint32_t tgid, int sig)
 {
     ppc32_ctx_t *target = NULL;
@@ -530,6 +528,8 @@ static void *thread_entry(void *arg)
     if (run != NULL) {
         run(child, opaque);
     }
+    /* Run loop exited: never returns to translated code; unregister. */
+    ppc32_cache_unregister_ctx(child);
     ppc32_thread_exit(child);
     return NULL;
 }
@@ -654,8 +654,7 @@ long ppc32_clone(ppc32_ctx_t *parent, uint32_t flags, uint32_t stack_va,
     return (long)(int32_t)child_tid;
 }
 
-/* The slot pins with joining under the first lock, so a concurrent
- * clone-reap can neither join the handle nor free the context twice. */
+/* Slot pins with joining under the first lock: no double join/free. */
 long ppc32_thread_join(uint32_t guest_tid)
 {
     ppc32_thread_slot_t *slot;
@@ -701,6 +700,8 @@ void ppc32_thread_exit(ppc32_ctx_t *child)
     if (child == NULL) {
         return;
     }
+    /* Teardown past the run loop: drop the cache sync slot (idempotent). */
+    ppc32_cache_unregister_ctx(child);
     clear_va = child->clear_child_tid;
     child->clear_child_tid = 0U;
     if (clear_va != 0U && thread_st32be_safe(child, clear_va, 0U) == 0) {
@@ -808,7 +809,6 @@ int main(void)
     if (tid <= 0 || parent.clear_child_tid != TEST_PARENT_TID_VA)
         return test_fail("set-tid-address", tid, 1);
 
-    /* Clone validation cases. */
     rc = ppc32_clone(&parent, PPC32_CLONE_FS, 0U, 0U, 0U, 0U, NULL,
         NULL, NULL);
     if (rc != -ENOSYS) return test_fail("clone-no-vm", rc, -ENOSYS);
@@ -861,7 +861,6 @@ int main(void)
     rc = ppc32_thread_join(child_tid);
     if (rc != -ESRCH) return test_fail("join-double", rc, -ESRCH);
 
-    /* Futex cases. */
     thread_st32be(&parent, TEST_UADDR, 5U);
     thread_st32be(&parent, TEST_TIMEOUT_VA, 0U);
     thread_st32be(&parent, TEST_TIMEOUT_VA + 4U, 50000000U);

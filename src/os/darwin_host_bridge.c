@@ -482,6 +482,7 @@ int bridge_handle_exit(ppc32_ctx_t *ctx, a32h_darwin_handler_fn fn,
                     memset(child->ibtc, 0, sizeof child->ibtc);
                     child->ras_top = 0U;
                     child->ibtc_synced_epoch = 0U;
+                    child->reclaim_synced_gen = 0U;
                     child->exit_reason = PPC32_EXIT_NONE;
                     child->nip = trap.spawn_pc;
                     child->gpr[PPC32_REG_SP] = trap.spawn_sp;

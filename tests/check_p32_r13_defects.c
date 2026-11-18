@@ -361,6 +361,52 @@ static void test_r15_2_inf_fprf(uint8_t *base)
     }
 }
 
+/* T14 s1 (fable_ppc32_v6_s1a/s1b): reclamation is quiescent-only.
+ * A lookup registers ctx (sync marks track the epoch); a range or
+ * full invalidation must advance neither mark — the flush waits for
+ * the next dispatch sync, never for a mid-block invalidation. */
+static void test_t14_cache_quiescent_reclaim(uint8_t *base)
+{
+    ppc32_ctx_t ctx;
+    uint32_t words[4] = {
+        0xd503201fU, 0xd503201fU, 0xd503201fU, 0xd503201fU,
+    };
+    uint32_t pc = 0x100000U;
+    uint32_t rgen0;
+    ppc32_block_t *e;
+
+    ctx_init_test(&ctx, base);
+    write_be32(base, pc, 0x60000000U);
+    e = ppc32_cache_install(&ctx, pc, words, 4U, NULL, 0U, false, 0U);
+    CHECK(e != NULL, "t14 install");
+    e = ppc32_cache_lookup(&ctx, pc);
+    CHECK(e != NULL, "t14 lookup hits");
+    CHECK(ctx.ibtc_synced_epoch == *ppc32_cache_epoch_ptr(),
+        "t14 lookup registers ctx");
+    rgen0 = ctx.reclaim_synced_gen;
+    ppc32_cache_invalidate_range(&ctx, 0x170000U, 0x171000U);
+    CHECK(ctx.reclaim_synced_gen == rgen0,
+        "t14 invalidate keeps reclaim mark");
+    CHECK(ctx.ibtc_synced_epoch != *ppc32_cache_epoch_ptr(),
+        "t14 invalidate leaves flush to dispatch");
+    /* No dispatch sync first: the lookup itself must register the
+     * stale ctx before filling its IBTC slot. */
+    e = ppc32_cache_lookup(&ctx, pc);
+    CHECK(e != NULL, "t14 disjoint invalidate keeps block");
+    CHECK(ctx.ibtc_synced_epoch == *ppc32_cache_epoch_ptr(),
+        "t14 lookup registers unsynced ctx");
+    ppc32_cache_sync_ctx(&ctx);
+    CHECK(ctx.ibtc_synced_epoch == *ppc32_cache_epoch_ptr(),
+        "t14 dispatch sync flushes");
+    ppc32_cache_invalidate_all(&ctx);
+    CHECK(ctx.ibtc_synced_epoch != *ppc32_cache_epoch_ptr(),
+        "t14 invalidate-all leaves flush to dispatch");
+    ppc32_cache_sync_ctx(&ctx);
+    CHECK(ctx.ibtc_synced_epoch == *ppc32_cache_epoch_ptr(),
+        "t14 dispatch sync flushes after all");
+    ppc32_cache_unregister_ctx(&ctx);
+}
+
 int main(void)
 {
     uint8_t *base = (uint8_t *)mmap(NULL, 0x200000U, PROT_READ | PROT_WRITE,
@@ -369,6 +415,7 @@ int main(void)
         perror("mmap");
         return 1;
     }
+    test_t14_cache_quiescent_reclaim(base);
     test_r13_1_dbt_nx_fetch(base);
     test_r13_2_statx_bad_pointer(base);
     test_r14_1_addco_subfco(base);
